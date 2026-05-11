@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import AddPostModal from "./AddPostModal";
+import AddStatisticModal from "./AddStatisticModal";
+import ConditionBadge from "./ConditionBadge";
+import Sparkline from "./Sparkline";
+import { CONDITION_COLORS, TREND_ARROW, type Condition, type PostHMT } from "../../types/hmt";
 
 export interface Department {
   id: string;
@@ -58,6 +63,8 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
+  const [hmtMap, setHmtMap] = useState<Record<string, PostHMT>>({});
+  const [statPost, setStatPost] = useState<Post | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -65,6 +72,22 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
     try {
       const list = await invoke<Post[]>("list_posts_by_dept", { departmentId: dept.id });
       setPosts(list);
+      // Подгружаем HMT-карточку для каждого поста параллельно.
+      const hmtPairs = await Promise.all(
+        list.map(async (p) => {
+          try {
+            const h = await invoke<PostHMT>("get_post_hmt", { input: { post_id: p.id } });
+            return [p.id, h] as const;
+          } catch {
+            return null;
+          }
+        }),
+      );
+      const next: Record<string, PostHMT> = {};
+      for (const pair of hmtPairs) {
+        if (pair) next[pair[0]] = pair[1];
+      }
+      setHmtMap(next);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -78,9 +101,29 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
     }
   }, [open]);
 
+  // Подписка на live-обновления HMT — любые добавления статистик (UI/WS) обновят бейдж/spark.
+  useEffect(() => {
+    if (!open) return;
+    let unlisten: UnlistenFn | null = null;
+    (async () => {
+      unlisten = await listen<PostHMT>("post-hmt-changed", (event) => {
+        const h = event.payload;
+        setHmtMap((prev) => ({ ...prev, [h.post_id]: h }));
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [open]);
+
   function onCreated(post: Post) {
     setPosts((prev) => [...prev, post]);
     setShowAddModal(false);
+  }
+
+  function onStatSaved(hmt: PostHMT) {
+    setHmtMap((prev) => ({ ...prev, [hmt.post_id]: hmt }));
+    setStatPost(null);
   }
 
   return (
@@ -150,6 +193,47 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
                       📊 {p.main_statistic_metric}
                     </div>
                   )}
+                  {(() => {
+                    const h = hmtMap[p.id];
+                    const cond: Condition = h?.condition ?? "NonExistence";
+                    const color = CONDITION_COLORS[cond].fg;
+                    const arrow = h?.trend_direction ? TREND_ARROW[h.trend_direction] : "";
+                    return (
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          marginTop: 8,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <ConditionBadge condition={cond} />
+                        <Sparkline values={h?.sparkline_values ?? []} color={color} />
+                        {h?.last_value != null && (
+                          <span style={{ fontSize: 12, color: "#555", fontFamily: "ui-monospace, monospace" }}>
+                            {h.last_value.toFixed(1)} {arrow}
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setStatPost(p)}
+                          style={{
+                            marginLeft: "auto",
+                            padding: "4px 10px",
+                            background: "#fff",
+                            border: "1px solid #ccc",
+                            borderRadius: 4,
+                            cursor: "pointer",
+                            fontSize: 12,
+                          }}
+                          title="Добавить значение статистики"
+                        >
+                          📊 +
+                        </button>
+                      </div>
+                    );
+                  })()}
                 </li>
               ))}
             </ul>
@@ -179,6 +263,16 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
           departmentName={dept.name}
           onClose={() => setShowAddModal(false)}
           onCreated={onCreated}
+        />
+      )}
+
+      {statPost && (
+        <AddStatisticModal
+          postId={statPost.id}
+          postTitle={statPost.title}
+          metric={statPost.main_statistic_metric}
+          onClose={() => setStatPost(null)}
+          onSaved={onStatSaved}
         />
       )}
     </div>

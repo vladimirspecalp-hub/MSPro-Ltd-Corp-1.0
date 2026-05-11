@@ -43,6 +43,12 @@ fn migrations() -> Vec<Migration> {
             sql: include_str!("../migrations/02_chat_messages.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 3,
+            description: "Step 6: HMT-engine — statistics + condition_logs",
+            sql: include_str!("../migrations/03_hmt_engine.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -205,6 +211,10 @@ pub fn run() {
             commands::dispatcher::fail_task,
             commands::dispatcher::list_active_tasks,
             commands::dispatcher::list_recent_tasks,
+            // Step 6 — HMT-engine (statistics + Hubbard conditions)
+            commands::hmt::add_statistic_value,
+            commands::hmt::get_post_hmt,
+            commands::hmt::list_post_statistics,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");
