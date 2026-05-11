@@ -50,7 +50,7 @@ export default function Sidebar({ current, onChange }: SidebarProps) {
     <nav style={containerStyle} aria-label="Главная навигация">
       <div style={headerStyle}>
         <div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>MSPro-Ltd Corp</div>
-        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.3 · Шаг 6</div>
+        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.4 · Шаг 6</div>
       </div>
       {ITEMS.map((item) => (
         <button

@@ -136,6 +136,38 @@ pub fn run() {
                 match db::open_write_pool(&db_path).await {
                     Ok(pool) => {
                         log::info!("WritePool attached on {}", db_path.display());
+
+                        // ----- Self-healing миграция v3 (Step 6 HMT) -----
+                        // tauri-plugin-sql иногда не догоняет новые миграции при
+                        // обновлении установленного MSI. Раннее принудительное
+                        // создание HMT-таблиц через WritePool гарантирует что
+                        // chat.rs::build_ceo_system_prompt не падает с
+                        // "no such table: statistics".
+                        let healing = "\
+CREATE TABLE IF NOT EXISTS statistics ( \
+    id TEXT PRIMARY KEY, \
+    post_id TEXT NOT NULL, \
+    value REAL NOT NULL, \
+    recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+    FOREIGN KEY (post_id) REFERENCES posts(id) \
+); \
+CREATE INDEX IF NOT EXISTS idx_statistics_post_time \
+    ON statistics(post_id, recorded_at DESC); \
+CREATE TABLE IF NOT EXISTS condition_logs ( \
+    id TEXT PRIMARY KEY, \
+    post_id TEXT NOT NULL, \
+    condition TEXT NOT NULL, \
+    assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+    FOREIGN KEY (post_id) REFERENCES posts(id), \
+    CHECK (condition IN ('NonExistence','Danger','Emergency','Normal','Affluence','Power')) \
+); \
+CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
+    ON condition_logs(post_id, assigned_at DESC);";
+                        match sqlx::raw_sql(healing).execute(&pool.0).await {
+                            Ok(_) => log::info!("HMT self-healing ensured statistics + condition_logs"),
+                            Err(e) => log::warn!("HMT self-healing skipped: {e}"),
+                        }
+
                         app_handle_for_db.manage(pool);
                     }
                     Err(e) => log::error!("open_write_pool: {e}"),
