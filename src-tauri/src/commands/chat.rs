@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 
 use serde::Serialize;
 use sqlx::FromRow;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use std::time::Duration;
 
@@ -66,8 +66,13 @@ struct PostRow {
 
 /// Builds the system prompt the CEO sees on every turn. The body lists all
 /// departments and the posts within them so Hermes can reason about the
-/// company by name without external lookups.
-async fn build_ceo_system_prompt(db: &WritePool) -> Result<String, String> {
+/// company by name without external lookups. Also injects:
+///  - HMT-engine: текущие Состояния постов (Step 6)
+///  - Vault: накопленный опыт компании из файловой памяти (Step 7 Этап 1)
+async fn build_ceo_system_prompt(
+    db: &WritePool,
+    app: &AppHandle,
+) -> Result<String, String> {
     let depts: Vec<DepartmentRow> = sqlx::query_as(
         "SELECT id, dept_number, name, description
          FROM departments
@@ -126,6 +131,19 @@ async fn build_ceo_system_prompt(db: &WritePool) -> Result<String, String> {
             sb.push_str(&format!(
                 "- `{slug}` ({title}) — Статистика: {val} | Тренд: {trend_str} | Состояние: **{cond_ru}**\n"
             ));
+        }
+    }
+
+    // --- Step 7 Этап 1: Vault — накопленный опыт компании ---
+    if let Some(vault_state) = app.try_state::<crate::vault::VaultState>() {
+        match crate::vault::read_vault_context(vault_state.root.clone()).await {
+            Ok(block) if !block.trim().is_empty() => {
+                sb.push_str("\n## Опыт компании (Vault)\n\n");
+                sb.push_str(&block);
+                sb.push('\n');
+            }
+            Ok(_) => { /* Vault пустой — заголовок не выводим, чтобы не дезориентировать CEO */ }
+            Err(e) => log::warn!("vault read failed: {e}"),
         }
     }
 
@@ -202,8 +220,8 @@ pub async fn send_chat_message(
     .await
     .map_err(|e| format!("read owner msg: {e}"))?;
 
-    // 2. System prompt built fresh per turn — picks up new posts immediately.
-    let system_prompt = build_ceo_system_prompt(&db).await?;
+    // 2. System prompt built fresh per turn — picks up new posts, conditions, vault.
+    let system_prompt = build_ceo_system_prompt(&db, &app).await?;
 
     // 3. Branch on brain_mode.
     let snapshot = settings.data.lock().unwrap().clone();

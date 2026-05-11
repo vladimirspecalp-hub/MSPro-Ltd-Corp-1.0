@@ -5,3 +5,4 @@ pub mod hmt;
 pub mod ping;
 pub mod posts;
 pub mod vault;
+pub mod vault_io;

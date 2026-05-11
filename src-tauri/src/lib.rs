@@ -12,6 +12,7 @@ mod external_agent;
 mod secrets;
 mod settings;
 mod updater;
+mod vault;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -133,6 +134,19 @@ pub fn run() {
                     return;
                 }
 
+                // ----- Step 7 Этап 1: Vault Manager (knowledge base) -----
+                // Создаём <app_data_dir>/Vault/{02-Patterns, 04-Wins} рядом
+                // с app.db. Идемпотентно, не блокирует startup при ошибке.
+                if let Some(data_dir) = db_path.parent() {
+                    let vault_root = data_dir.join("Vault");
+                    if let Err(e) = vault::ensure_vault_dirs(&vault_root) {
+                        log::warn!("vault dirs init: {e}");
+                    } else {
+                        log::info!("Vault ready at {}", vault_root.display());
+                    }
+                    app_handle_for_db.manage(vault::VaultState { root: vault_root });
+                }
+
                 match db::open_write_pool(&db_path).await {
                     Ok(pool) => {
                         log::info!("WritePool attached on {}", db_path.display());
@@ -247,6 +261,10 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
             commands::hmt::add_statistic_value,
             commands::hmt::get_post_hmt,
             commands::hmt::list_post_statistics,
+            // Step 7 Этап 1 — Vault Manager (filesystem-backed memory)
+            commands::vault_io::save_pattern,
+            commands::vault_io::save_win,
+            commands::vault_io::get_vault_preview,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");
