@@ -1,0 +1,73 @@
+name: Tauri Desktop Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+concurrency:
+  group: tauri-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-msi:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Sync version from tag
+        run: node scripts/sync-version.mjs ${{ github.ref_name }}
+
+      - name: Install Node.js dependencies
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Build and bundle MSI
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: MSPro-Ltd Corp ${{ github.ref_name }}
+          releaseBody: |
+            ## MSPro-Ltd Corp Desktop ${{ github.ref_name }}
+
+            ### Установка
+            Скачайте `.msi` файл ниже и запустите установщик.
+
+            ### Авто-обновление
+            Установленное приложение проверяет обновления по кнопке в Настройках.
+          releaseDraft: false
+          prerelease: false
+          updaterJsonPreferNsis: false
+          includeUpdaterJson: true
+          args: --bundles msi --target x86_64-pc-windows-msvc
