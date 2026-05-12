@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import HermesStatusBadge from "../chat/HermesStatusBadge";
+import MessageActions from "../chat/MessageActions";
+import VaultSaveModal, { type VaultKind } from "../chat/VaultSaveModal";
 
 type BrainMode = "hermes" | "claude_external";
 
@@ -146,6 +148,10 @@ export default function CeoChat() {
   const [hermesReady, setHermesReady] = useState(false);
   const [brainMode, setBrainMode] = useState<BrainMode>("hermes");
   const [externalAgentOn, setExternalAgentOn] = useState(false);
+  // Step 7 Этап 2: модалка сохранения сообщения в файловую память Vault
+  const [vaultModal, setVaultModal] = useState<
+    { kind: VaultKind; content: string } | null
+  >(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const streamingRef = useRef<StreamingState | null>(null);
 
@@ -355,26 +361,36 @@ export default function CeoChat() {
           </p>
         )}
         <div style={{ display: "flex", flexDirection: "column" }}>
-          {messages.map((m) => (
-            <div
-              key={m.id}
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                alignItems: m.role === "owner" ? "flex-end" : "flex-start",
-              }}
-            >
-              <div style={bubbleStyle(m.role)}>{m.content}</div>
+          {messages.map((m) => {
+            const isCeo = m.role === "ceo";
+            return (
               <div
+                key={m.id}
+                className={isCeo ? "msg-row" : undefined}
                 style={{
-                  ...timestampStyle,
-                  alignSelf: m.role === "owner" ? "flex-end" : "flex-start",
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: m.role === "owner" ? "flex-end" : "flex-start",
+                  marginBottom: 4,
                 }}
               >
-                {formatTime(m.created_at)}
+                <div style={bubbleStyle(m.role)}>{m.content}</div>
+                <div
+                  style={{
+                    ...timestampStyle,
+                    alignSelf: m.role === "owner" ? "flex-end" : "flex-start",
+                  }}
+                >
+                  {formatTime(m.created_at)}
+                </div>
+                {isCeo && (
+                  <MessageActions
+                    onPick={(kind) => setVaultModal({ kind, content: m.content })}
+                  />
+                )}
               </div>
-            </div>
-          ))}
+            );
+          })}
           {streaming && (
             <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-start" }}>
               <div style={bubbleStyle("ceo", true)}>
@@ -427,6 +443,14 @@ export default function CeoChat() {
           </button>
         )}
       </div>
+
+      {vaultModal && (
+        <VaultSaveModal
+          initialKind={vaultModal.kind}
+          initialContent={vaultModal.content}
+          onClose={() => setVaultModal(null)}
+        />
+      )}
     </div>
   );
 }

@@ -95,6 +95,39 @@ button {
   margin-right: 5px;
 }
 
+/* === Step 7 Этап 2: hover-actions для CEO сообщений === */
+.msg-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  position: relative;
+}
+.msg-row .msg-actions {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.15s ease-out;
+}
+.msg-row:hover .msg-actions,
+.msg-row:focus-within .msg-actions {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Спиннер для Loader2 из lucide-react */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+
+/* Plain animation toast slide-in (используется в Toast.tsx) */
+@keyframes toast-slide-in {
+  from { transform: translateY(8px); opacity: 0; }
+  to   { transform: translateY(0);    opacity: 1; }
+}
+
 @media (prefers-color-scheme: dark) {
   :root {
     color: #f6f6f6;
