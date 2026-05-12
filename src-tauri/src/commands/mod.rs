@@ -4,5 +4,6 @@ pub mod hermes_bridge;
 pub mod hmt;
 pub mod ping;
 pub mod posts;
+pub mod tool_calls;
 pub mod vault;
 pub mod vault_io;

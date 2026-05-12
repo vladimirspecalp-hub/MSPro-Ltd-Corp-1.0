@@ -119,6 +119,30 @@ const bubbleStyle = (role: "owner" | "ceo", streaming = false): React.CSSPropert
   border: streaming ? "1px dashed #1a73e8" : undefined,
 });
 
+/// Step 7 Этап 3 — отличает системное сообщение от обычной реплики CEO.
+function isSystemMessage(m: ChatMessage): "success" | "error" | null {
+  if (m.role !== "ceo") return null;
+  if (m.content.startsWith("⚡")) return "success";
+  if (m.content.startsWith("⚠️")) return "error";
+  return null;
+}
+
+const systemBubbleStyle = (variant: "success" | "error"): React.CSSProperties => ({
+  maxWidth: "90%",
+  padding: "10px 14px",
+  borderRadius: 8,
+  fontSize: 13,
+  lineHeight: 1.45,
+  marginBottom: 4,
+  whiteSpace: "pre-wrap",
+  wordBreak: "break-word",
+  alignSelf: "stretch",
+  background: variant === "success" ? "#fff8e1" : "#ffebee",
+  color: variant === "success" ? "#e65100" : "#b71c1c",
+  border: `1px solid ${variant === "success" ? "#ffb300" : "#ef5350"}`,
+  fontWeight: 500,
+});
+
 const timestampStyle: React.CSSProperties = {
   fontSize: 10,
   color: "#999",
@@ -216,13 +240,20 @@ export default function CeoChat() {
       });
       setStreaming(null);
     });
-    // Same handler also fires when the Rust send_chat_message resolves (the
-    // emit happens just before the command returns). Belt-and-braces: if the
-    // event misses, the optimistic-flow Promise resolution will still update.
+    // Step 7 Этап 3: системные сообщения о выполнении инструментов
+    // (⚡ задача поставлена / ⚠️ ошибка инструмента). Эмитятся отдельно
+    // от ceo-done, по одному на каждый tool_call.
+    const offToolP = listen<ChatMessage>("ceo-tool-result", (e) => {
+      setMessages((prev) => {
+        if (prev.some((m) => m.id === e.payload.id)) return prev;
+        return [...prev, e.payload];
+      });
+    });
     return () => {
       offStartP.then((f) => f());
       offChunkP.then((f) => f());
       offDoneP.then((f) => f());
+      offToolP.then((f) => f());
     };
   }, []);
 
@@ -362,6 +393,27 @@ export default function CeoChat() {
         )}
         <div style={{ display: "flex", flexDirection: "column" }}>
           {messages.map((m) => {
+            const sysVariant = isSystemMessage(m);
+            if (sysVariant) {
+              // Step 7 Этап 3: системное сообщение (⚡/⚠️) — отдельная плашка
+              // на всю ширину, без bubble-стиля, без MessageActions.
+              return (
+                <div
+                  key={m.id}
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "stretch",
+                    marginBottom: 6,
+                  }}
+                >
+                  <div style={systemBubbleStyle(sysVariant)}>{m.content}</div>
+                  <div style={{ ...timestampStyle, alignSelf: "flex-start" }}>
+                    {formatTime(m.created_at)}
+                  </div>
+                </div>
+              );
+            }
             const isCeo = m.role === "ceo";
             return (
               <div

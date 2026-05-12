@@ -147,6 +147,9 @@ async fn build_ceo_system_prompt(
         }
     }
 
+    // --- Step 7 Этап 3: Tool Calling — «руки Гендира» ---
+    sb.push_str(crate::commands::tool_calls::TOOLS_PREAMBLE);
+
     sb.push_str(HMT_PREAMBLE);
     sb.push_str(
         "\nОтвечай по-русски, конкретно, опираясь на данные оргструктуры выше. \
@@ -241,14 +244,29 @@ pub async fn send_chat_message(
         run_hermes(trimmed, &system_prompt, &snapshot, &lifecycle, &app).await
     };
 
-    let final_text = match final_text {
+    let raw_text = match final_text {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => "⚠️ Брейн вернул пустой ответ.".to_string(),
         Err(e) if e.contains("cancelled") => "⏹ Прервано пользователем.".to_string(),
         Err(e) => format!("⚠️ Ошибка: {e}"),
     };
 
-    // 4. Persist the CEO turn under a new id and finalize.
+    // 4. Step 7 Этап 3 — tool-call interception.
+    // Вынимаем <tool_call>...</tool_call> и <think>...</think> блоки, исполняем
+    // инструменты атомарно через WritePool. Возвращается:
+    //   - cleaned_text   — текст, который увидит Владелец как реплику CEO
+    //   - executions     — список результатов (по одному системному сообщению)
+    let (cleaned_text, tool_executions) =
+        crate::commands::tool_calls::intercept_and_execute(&raw_text, &db, &app).await;
+    let final_text = if cleaned_text.is_empty() && !tool_executions.is_empty() {
+        // Если модель выдала только tool_call без сопровождающего текста,
+        // показываем минимальный плейсхолдер вместо пустой реплики.
+        "Применяю инструменты…".to_string()
+    } else {
+        cleaned_text
+    };
+
+    // 5. Persist the CEO turn under a new id and finalize.
     let ceo_id = format!("msg-{}", uuid::Uuid::new_v4());
     sqlx::query("INSERT INTO chat_messages (id, role, content) VALUES (?, 'ceo', ?)")
         .bind(&ceo_id)
@@ -280,6 +298,49 @@ pub async fn send_chat_message(
     };
 
     let _ = app.emit("ceo-done", &turn.ceo);
+
+    // 6. Step 7 Этап 3 — каждое выполнение инструмента → отдельное системное
+    // сообщение в чате (роль 'ceo' + префикс ⚡/⚠️ позволяет UI отрисовать его
+    // как плашку action'а без миграции CHECK constraint на role).
+    for exec in tool_executions {
+        let sys_id = format!("msg-{}", uuid::Uuid::new_v4());
+        // Если ui_message сама уже начинается с эмодзи-маркера — не дублируем.
+        let body = if exec.ui_message.starts_with("⚡") || exec.ui_message.starts_with("⚠️") {
+            exec.ui_message.clone()
+        } else if exec.success {
+            format!("⚡ {}", exec.ui_message)
+        } else {
+            format!("⚠️ {}", exec.ui_message)
+        };
+        if let Err(e) =
+            sqlx::query("INSERT INTO chat_messages (id, role, content) VALUES (?, 'ceo', ?)")
+                .bind(&sys_id)
+                .bind(&body)
+                .execute(&db.0)
+                .await
+        {
+            log::warn!("insert tool exec msg: {e}");
+            continue;
+        }
+        if let Ok(row) = sqlx::query_as::<_, ChatMessage>(
+            "SELECT id, role, content, created_at FROM chat_messages WHERE id = ?",
+        )
+        .bind(&sys_id)
+        .fetch_one(&db.0)
+        .await
+        {
+            let _ = app.emit(
+                "ceo-tool-result",
+                ChatMessageOut {
+                    id: row.id,
+                    role: row.role,
+                    content: row.content,
+                    created_at: row.created_at,
+                },
+            );
+        }
+    }
+
     Ok(turn)
 }
 
