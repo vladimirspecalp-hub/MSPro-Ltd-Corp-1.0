@@ -64,7 +64,7 @@ fn default_claude_timeout() -> u64 { 600 }
 
 fn default_hermes_distro() -> String { "Ubuntu".to_string() }
 fn default_hermes_skill() -> String { "/ceo".to_string() }
-fn default_hermes_timeout() -> u64 { 120 }
+fn default_hermes_timeout() -> u64 { 300 }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -107,13 +107,23 @@ pub struct SettingsStore {
 impl SettingsStore {
     pub fn load(app: &AppHandle) -> Self {
         let path = settings_path(app);
-        let data = match std::fs::read_to_string(&path) {
+        let mut data = match std::fs::read_to_string(&path) {
             Ok(json) => serde_json::from_str(&json).unwrap_or_else(|e| {
                 log::warn!("settings.json corrupt ({e}); falling back to defaults");
                 AppSettings::default()
             }),
             Err(_) => AppSettings::default(),
         };
+        // Step 7 Этап 1: clamp hermes timeout — DeepSeek-Reasoner с расширенным
+        // system prompt (HMT + Vault) часто думает дольше 2 минут. Старые
+        // settings.json могут иметь 120, поднимаем до 300 принудительно.
+        if data.hermes_timeout_sec < 240 {
+            log::info!(
+                "settings: bumping hermes_timeout_sec {} → 300",
+                data.hermes_timeout_sec
+            );
+            data.hermes_timeout_sec = 300;
+        }
         log::info!("settings loaded from {}", path.display());
         Self {
             data: Mutex::new(data),

@@ -14,7 +14,8 @@ export default function App() {
     <div
       style={{
         display: "flex",
-        minHeight: "100vh",
+        height: "100vh",
+        overflow: "hidden",
         fontFamily: "system-ui, -apple-system, sans-serif",
         color: "#1a1a1a",
         background: "#f9f9f9",

@@ -24,12 +24,15 @@ const containerStyle: CSSProperties = {
   flexDirection: "column",
   padding: "20px 0",
   fontFamily: "system-ui, -apple-system, sans-serif",
+  height: "100vh",
+  overflowY: "auto",
 };
 
 const headerStyle: CSSProperties = {
   padding: "0 20px 20px",
   borderBottom: "1px solid #333",
   marginBottom: 12,
+  flexShrink: 0,
 };
 
 const itemStyle = (active: boolean): CSSProperties => ({
@@ -50,7 +53,7 @@ export default function Sidebar({ current, onChange }: SidebarProps) {
     <nav style={containerStyle} aria-label="Главная навигация">
       <div style={headerStyle}>
         <div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>MSPro-Ltd Corp</div>
-        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.5 · Шаг 7.1</div>
+        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.6 · Шаг 7.1</div>
       </div>
       {ITEMS.map((item) => (
         <button

@@ -28,19 +28,22 @@ const containerStyle: React.CSSProperties = {
   flexDirection: "column",
   flex: 1,
   background: "#f9f9f9",
-  height: "100vh",
+  height: "100%",
+  minHeight: 0, // критично для корректного flex-shrink дочернего messagesStyle
 };
 
 const headerStyle: React.CSSProperties = {
   padding: "16px 32px",
   borderBottom: "1px solid #ddd",
   background: "#fff",
+  flexShrink: 0,
 };
 
 const messagesStyle: React.CSSProperties = {
   flex: 1,
   overflowY: "auto",
   padding: "20px 32px",
+  minHeight: 0,
 };
 
 const inputBarStyle: React.CSSProperties = {
@@ -50,6 +53,7 @@ const inputBarStyle: React.CSSProperties = {
   display: "flex",
   gap: 12,
   alignItems: "flex-end",
+  flexShrink: 0,
 };
 
 const inputStyle: React.CSSProperties = {
