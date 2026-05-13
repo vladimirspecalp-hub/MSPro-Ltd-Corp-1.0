@@ -203,9 +203,12 @@ pub struct AttachmentItem {
 }
 
 const ATTACHMENTS_MAX_COUNT: usize = 50;
-const ATTACHMENTS_TOTAL_MAX: usize = 1024 * 1024;       // 1 MB
-const ATTACHMENT_PER_FILE_MAX: usize = 200 * 1024;      // 200 KB
-const MESSAGE_MAX_CHARS: usize = 300_000;               // poднял с 4000 ради attachments
+const ATTACHMENTS_TOTAL_MAX: usize = 1024 * 1024;       // 1 MB attachments суммарно
+const ATTACHMENT_PER_FILE_MAX: usize = 200 * 1024;      // 200 KB на файл
+/// 1.5M chars даёт запас: 1 MB UTF-8 кириллицы ≈ 524K chars + XML обёртки
+/// `<attachments>...</attachments><user_message>...</user_message>` + сам
+/// текст в textarea (включая случай когда Владелец paste'ит большой ТЗ).
+const MESSAGE_MAX_CHARS: usize = 1_500_000;
 
 fn validate_attachments(items: &[AttachmentItem]) -> Result<(), String> {
     if items.len() > ATTACHMENTS_MAX_COUNT {
@@ -284,6 +287,16 @@ pub async fn send_chat_message(
         return Err(format!("message too long (>{MESSAGE_MAX_CHARS} chars)"));
     }
     validate_attachments(&attachments)?;
+    // Дополнительная проверка финального brain-prompt'а после оборачивания
+    // в <attachments>/<user_message> теги — на случай если суммарно
+    // (текст + attachments + обёртки) кириллица всё-таки перевалит лимит.
+    // Делаем оценку до build_extended_content по char count attachment_text.
+    let extra_chars: usize = attachments.iter().map(|a| a.text_content.chars().count()).sum();
+    if trimmed.chars().count() + extra_chars > MESSAGE_MAX_CHARS {
+        return Err(format!(
+            "общий объём (текст + вложения) превышает {MESSAGE_MAX_CHARS} символов"
+        ));
+    }
 
     // Текст для brain'а (с приложениями) vs текст для БД (только original)
     let brain_content = build_extended_content(trimmed, &attachments);
