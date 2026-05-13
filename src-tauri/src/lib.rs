@@ -50,6 +50,12 @@ fn migrations() -> Vec<Migration> {
             sql: include_str!("../migrations/03_hmt_engine.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 4,
+            description: "Step 9: fix empty-slug Frontend post (historic UI bug)",
+            sql: include_str!("../migrations/04_fix_empty_slug.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -180,6 +186,24 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                         match sqlx::raw_sql(healing).execute(&pool.0).await {
                             Ok(_) => log::info!("HMT self-healing ensured statistics + condition_logs"),
                             Err(e) => log::warn!("HMT self-healing skipped: {e}"),
+                        }
+
+                        // ----- Step 9: Migration v4 self-healing fallback -----
+                        // tauri-plugin-sql иногда не догоняет миграции при
+                        // installer-upgrade. Идемпотентный UPDATE на случай
+                        // если v4 не применилась автоматически.
+                        let fix_slug = "UPDATE posts SET slug='frontend', \
+                                        department_id='dept-4-tech' \
+                                        WHERE slug='' AND title LIKE 'Frontend%';";
+                        match sqlx::raw_sql(fix_slug).execute(&pool.0).await {
+                            Ok(r) if r.rows_affected() > 0 => {
+                                log::info!(
+                                    "Step 9 self-healing: patched empty-slug Frontend post ({} rows)",
+                                    r.rows_affected()
+                                )
+                            }
+                            Ok(_) => { /* nothing to fix — idempotent */ }
+                            Err(e) => log::warn!("Step 9 self-healing skipped: {e}"),
                         }
 
                         app_handle_for_db.manage(pool);

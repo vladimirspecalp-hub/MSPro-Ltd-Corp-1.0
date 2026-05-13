@@ -116,6 +116,34 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
     };
   }, [open]);
 
+  // Step 9: live-обновление списка постов после Гендир-CRUD (create / update / archive).
+  // Emit-ится из src-tauri/src/commands/tool_calls.rs::execute_*_post.
+  useEffect(() => {
+    if (!open) return;
+    let unlisten: UnlistenFn | null = null;
+    (async () => {
+      unlisten = await listen<{
+        kind: "created" | "updated" | "archived";
+        department_id?: string;
+        old_department_id?: string;
+      }>("posts-changed", (event) => {
+        const p = event.payload;
+        // Перерисовываем если событие касается нашего отделения (в том числе
+        // если пост переезжает «оттуда» или «сюда»).
+        if (
+          !p.department_id ||
+          p.department_id === dept.id ||
+          p.old_department_id === dept.id
+        ) {
+          refresh();
+        }
+      });
+    })();
+    return () => {
+      if (unlisten) unlisten();
+    };
+  }, [open, dept.id]);
+
   function onCreated(post: Post) {
     setPosts((prev) => [...prev, post]);
     setShowAddModal(false);

@@ -23,7 +23,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 use crate::db::WritePool;
 
@@ -38,8 +38,8 @@ pub const TOOLS_PREAMBLE: &str = r#"
 ## Инструменты (Tool Calling)
 
 У тебя есть исполнительные инструменты — ты можешь не только советовать, но и
-физически выполнять действия в системе. Когда нужно поставить задачу,
-выведи блок tool_call с валидным JSON. Формат и схемы:
+физически выполнять действия в системе. Когда нужно действие — выведи блок
+tool_call с валидным JSON. Формат и схемы:
 
 <tools>
 [
@@ -55,31 +55,87 @@ pub const TOOLS_PREAMBLE: &str = r#"
       },
       "required": ["title", "assignee_post_slug", "description"]
     }
+  },
+  {
+    "name": "create_post",
+    "description": "Создать новый пост в одном из 8 отделений Хаббарда. Используй ТОЛЬКО когда Владелец явно попросил создать или добавить пост — не выдумывай посты сам по контексту разговора.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "dept_number": {"type": "integer", "description": "Номер отделения 0-7 (0 Офис Владельца, 1 HCO, 2 Распространение, 3 Финансы, 4 Техническое, 5 Квалификация, 6 PR, 7 Исполнительное)"},
+        "slug": {"type": "string", "description": "Уникальный идентификатор латиницей: 2-40 символов, [a-z0-9-], без пробелов и кириллицы"},
+        "title": {"type": "string", "description": "Название поста на русском (2-200 символов)"},
+        "central_product": {"type": "string", "description": "ЦКП поста — что конкретно производит (5-500 символов)"},
+        "main_statistic_metric": {"type": "string", "description": "Опционально — имя главной метрики, например «лидов в день»"}
+      },
+      "required": ["dept_number", "slug", "title", "central_product"]
+    }
+  },
+  {
+    "name": "update_post",
+    "description": "Изменить существующий пост: переименовать slug, обновить название, ЦКП, метрику, перенести в другое отделение или сменить статус (active/paused/archived).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "slug": {"type": "string", "description": "ТЕКУЩИЙ slug поста — ключ для поиска"},
+        "new_slug": {"type": "string", "description": "Опц. новый slug (тот же regex что у create_post)"},
+        "new_title": {"type": "string"},
+        "new_dept_number": {"type": "integer", "description": "0-7, перенос в другое отделение"},
+        "new_central_product": {"type": "string"},
+        "new_metric": {"type": "string"},
+        "status": {"type": "string", "enum": ["active", "paused", "archived"]}
+      },
+      "required": ["slug"]
+    }
+  },
+  {
+    "name": "archive_post",
+    "description": "Перевести пост в архив (soft-delete). Пост исчезает с Главной, но вся история статистик и задач сохраняется. Возврат — через update_post со status=active.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "slug": {"type": "string"}
+      },
+      "required": ["slug"]
+    }
   }
 ]
 </tools>
 
 ### Правила использования инструментов
 
-1. КОГДА ПРИМЕНЯТЬ. Если в обсуждении созрело конкретное действие (поставить
-   задачу, организовать работу поста, передать поручение) — выведи tool_call.
-   Если разговор информационный (объясни, дай совет) — инструмент не нужен.
+1. КОГДА ПРИМЕНЯТЬ. Если в обсуждении созрело конкретное действие — выведи
+   tool_call. Информационный разговор (объясни, дай совет) — инструмент не нужен.
 2. ФОРМАТ. ОДИН JSON в ОДНОМ блоке tool_call. Без markdown-кодовой разметки,
    без комментариев внутри JSON, без trailing commas. Пример вывода:
 
 <tool_call>
-{"name": "dispatch_task", "arguments": {"title": "Подготовить ответ на претензию", "assignee_post_slug": "frontend", "description": "Сформировать черновик ответа, согласовать с юристом, выложить в Vault."}}
+{"name": "dispatch_task", "arguments": {"title": "Подготовить ответ на претензию", "assignee_post_slug": "frontend", "description": "Сформировать черновик, согласовать с юристом, выложить в Vault."}}
 </tool_call>
 
 3. ГДЕ РАЗМЕСТИТЬ. Можно сначала текстом объяснить Владельцу что собираешься
    сделать, затем выдать блок tool_call. После выполнения система ответит
    системным сообщением (Владелец увидит зелёный или красный блок).
 4. НЕСКОЛЬКО ИНСТРУМЕНТОВ. Выводи несколько tool_call блоков подряд —
-   каждый исполняется атомарно.
+   каждый исполняется атомарно sequentially.
 5. REASONING. Если хочешь подумать — оборачивай в think-блоки (XML-теги
    think...). Эти блоки тоже скрываются от Владельца.
 6. SLUG ПОСТОВ. Бери ровно из блока «Текущие Состояния Постов» выше —
    не выдумывай несуществующие slug, иначе инструмент вернёт ошибку.
+
+### Правила административных tool (create_post / update_post / archive_post)
+
+7. НИКАКИХ ФАНТАЗИЙ. Создавай посты ТОЛЬКО когда Владелец явно сказал
+   «создай пост X», «добавь пост Y». Не создавай посты по своему усмотрению
+   «потому что в разговоре зашла речь».
+8. ПЕРЕД UPDATE — найди существующий slug в блоке «Текущие Состояния Постов»
+   выше. Не редактируй то чего нет — получишь ошибку.
+9. АРХИВ. archive_post скрывает пост с Главной. Если Владелец просит
+   «удалить» — это archive_post (мы НЕ делаем физическое удаление).
+10. SLUG NAMING. Короткий латинский, через дефис: office-manager,
+    sales-lead, qa-controller. НЕ создавай slug с кириллицей или пробелами.
+11. dept_number 0-7. Если Владелец говорит «в HCO» — это 1. «в Техническое» — 4.
+    «в Финансовый» — 3. Если не уверен — спроси Владельца.
 "#;
 
 // ---------------------------------------------------------------------------
@@ -213,6 +269,9 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
 
     match call.name.as_str() {
         "dispatch_task" => execute_dispatch_task(call.effective_args(), db, app).await,
+        "create_post" => execute_create_post(call.effective_args(), db, app).await,
+        "update_post" => execute_update_post(call.effective_args(), db, app).await,
+        "archive_post" => execute_archive_post(call.effective_args(), db, app).await,
         unknown => ToolExecution {
             ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
             success: false,
@@ -307,6 +366,372 @@ async fn execute_dispatch_task(
 }
 
 // ---------------------------------------------------------------------------
+// Step 9: Executive CRUD — create_post / update_post / archive_post
+// ---------------------------------------------------------------------------
+
+use crate::commands::posts;
+
+fn dept_name(n: i64) -> &'static str {
+    match n {
+        0 => "Офис Владельца",
+        1 => "Отделение Построения (HCO)",
+        2 => "Отделение Распространения",
+        3 => "Финансовое Отделение",
+        4 => "Техническое Отделение",
+        5 => "Отделение Квалификации",
+        6 => "Отделение по связям",
+        7 => "Исполнительное Отделение",
+        _ => "?",
+    }
+}
+
+async fn execute_create_post(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let dept_number = match args.get("dept_number").and_then(Value::as_i64) {
+        Some(n) if (0..=7).contains(&n) => n,
+        _ => return tool_err("create_post: dept_number должен быть целым числом 0-7"),
+    };
+    let slug = match args.get("slug").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_post: slug обязателен"),
+    };
+    if let Err(e) = posts::validate_slug(&slug) {
+        return tool_err(&format!("create_post: {e}"));
+    }
+    let title = match args.get("title").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_post: title обязателен"),
+    };
+    if let Err(e) = posts::validate_text("title", &title, 2, 200) {
+        return tool_err(&format!("create_post: {e}"));
+    }
+    let central_product = match args
+        .get("central_product")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_post: central_product обязателен"),
+    };
+    if let Err(e) = posts::validate_text("central_product", &central_product, 5, 500) {
+        return tool_err(&format!("create_post: {e}"));
+    }
+    let metric = args
+        .get("main_statistic_metric")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Lookup department_id
+    let dept_id = match posts::dept_id_from_number(db, dept_number).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return tool_err(&format!("create_post: отделение {dept_number} не найдено")),
+        Err(e) => return tool_err(&format!("create_post: {e}")),
+    };
+
+    let id = format!("post-{}", uuid::Uuid::new_v4());
+    let res = sqlx::query(
+        "INSERT INTO posts (id, department_id, slug, title, central_product, main_statistic_metric)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&dept_id)
+    .bind(&slug)
+    .bind(&title)
+    .bind(&central_product)
+    .bind(&metric)
+    .execute(&db.0)
+    .await;
+
+    match res {
+        Ok(_) => {
+            let _ = app.emit(
+                "posts-changed",
+                serde_json::json!({
+                    "kind": "created",
+                    "id": id,
+                    "slug": slug,
+                    "department_id": dept_id,
+                }),
+            );
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Гендир создал пост **{title}** (slug `{slug}`) в Отделении {dept_number} — {dept}",
+                    title = title,
+                    slug = slug,
+                    dept_number = dept_number,
+                    dept = dept_name(dept_number),
+                ),
+                success: true,
+            }
+        }
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("2067") => {
+            tool_err(&format!("create_post: slug '{slug}' уже занят"))
+        }
+        Err(e) => tool_err(&format!("create_post: insert: {e}")),
+    }
+}
+
+async fn execute_update_post(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let slug = match args.get("slug").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("update_post: slug обязателен (ключ поиска)"),
+    };
+
+    // 1. Найти пост
+    let row: Option<(String, String)> =
+        match sqlx::query_as("SELECT id, department_id FROM posts WHERE slug = ?")
+            .bind(&slug)
+            .fetch_optional(&db.0)
+            .await
+        {
+            Ok(v) => v,
+            Err(e) => return tool_err(&format!("update_post: lookup: {e}")),
+        };
+    let (post_id, old_dept_id) = match row {
+        Some(r) => r,
+        None => return tool_err(&format!("update_post: пост со slug `{slug}` не найден")),
+    };
+
+    // 2. Собрать перечень изменений
+    let new_slug = args
+        .get("new_slug")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let new_title = args
+        .get("new_title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let new_dept_number = args.get("new_dept_number").and_then(Value::as_i64);
+    let new_cp = args
+        .get("new_central_product")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let new_metric = args
+        .get("new_metric")
+        .and_then(Value::as_str)
+        .map(str::trim);
+    let new_status = args.get("status").and_then(Value::as_str).map(str::trim);
+
+    if new_slug.is_none()
+        && new_title.is_none()
+        && new_dept_number.is_none()
+        && new_cp.is_none()
+        && new_metric.is_none()
+        && new_status.is_none()
+    {
+        return tool_err("update_post: нет полей для обновления");
+    }
+
+    // 3. Валидация каждого
+    if let Some(s) = new_slug {
+        if let Err(e) = posts::validate_slug(s) {
+            return tool_err(&format!("update_post: {e}"));
+        }
+        // Проверка коллизии с другим постом
+        let collision: Option<(String,)> =
+            match sqlx::query_as("SELECT id FROM posts WHERE slug = ? AND id != ?")
+                .bind(s)
+                .bind(&post_id)
+                .fetch_optional(&db.0)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => return tool_err(&format!("update_post: slug check: {e}")),
+            };
+        if collision.is_some() {
+            return tool_err(&format!("update_post: slug `{s}` уже занят другим постом"));
+        }
+    }
+    if let Some(t) = new_title {
+        if let Err(e) = posts::validate_text("title", t, 2, 200) {
+            return tool_err(&format!("update_post: {e}"));
+        }
+    }
+    if let Some(cp) = new_cp {
+        if let Err(e) = posts::validate_text("central_product", cp, 5, 500) {
+            return tool_err(&format!("update_post: {e}"));
+        }
+    }
+    let new_dept_id: Option<String> = match new_dept_number {
+        Some(n) if (0..=7).contains(&n) => match posts::dept_id_from_number(db, n).await {
+            Ok(Some(id)) => Some(id),
+            Ok(None) => return tool_err(&format!("update_post: отделение {n} не найдено")),
+            Err(e) => return tool_err(&format!("update_post: {e}")),
+        },
+        Some(n) => return tool_err(&format!("update_post: new_dept_number {n} вне 0-7")),
+        None => None,
+    };
+    if let Some(s) = new_status {
+        if !matches!(s, "active" | "paused" | "archived") {
+            return tool_err(&format!(
+                "update_post: status `{s}` вне списка active|paused|archived"
+            ));
+        }
+    }
+
+    // 4. Динамический UPDATE — собираем set-clause из непустых изменений
+    let mut sets: Vec<&str> = Vec::new();
+    if new_slug.is_some() {
+        sets.push("slug = ?");
+    }
+    if new_title.is_some() {
+        sets.push("title = ?");
+    }
+    if new_dept_id.is_some() {
+        sets.push("department_id = ?");
+    }
+    if new_cp.is_some() {
+        sets.push("central_product = ?");
+    }
+    if new_metric.is_some() {
+        sets.push("main_statistic_metric = ?");
+    }
+    if new_status.is_some() {
+        sets.push("status = ?");
+    }
+    let sql = format!("UPDATE posts SET {} WHERE id = ?", sets.join(", "));
+    let mut q = sqlx::query(&sql);
+    if let Some(s) = new_slug {
+        q = q.bind(s);
+    }
+    if let Some(t) = new_title {
+        q = q.bind(t);
+    }
+    if let Some(d) = &new_dept_id {
+        q = q.bind(d);
+    }
+    if let Some(c) = new_cp {
+        q = q.bind(c);
+    }
+    if let Some(m) = new_metric {
+        q = q.bind(m);
+    }
+    if let Some(s) = new_status {
+        q = q.bind(s);
+    }
+    q = q.bind(&post_id);
+
+    if let Err(e) = q.execute(&db.0).await {
+        return tool_err(&format!("update_post: {e}"));
+    }
+
+    let _ = app.emit(
+        "posts-changed",
+        serde_json::json!({
+            "kind": "updated",
+            "id": post_id,
+            "slug": new_slug.unwrap_or(&slug),
+            "old_department_id": old_dept_id,
+            "department_id": new_dept_id.clone().unwrap_or_else(|| "".to_string()),
+        }),
+    );
+
+    let mut changes: Vec<String> = Vec::new();
+    if let Some(s) = new_slug {
+        changes.push(format!("slug → `{s}`"));
+    }
+    if let Some(t) = new_title {
+        changes.push(format!("title → «{t}»"));
+    }
+    if let Some(n) = new_dept_number {
+        changes.push(format!("dept → {n} ({})", dept_name(n)));
+    }
+    if new_cp.is_some() {
+        changes.push("ЦКП обновлён".into());
+    }
+    if new_metric.is_some() {
+        changes.push("метрика обновлена".into());
+    }
+    if let Some(s) = new_status {
+        changes.push(format!("status → {s}"));
+    }
+    ToolExecution {
+        ui_message: format!(
+            "⚡ Пост `{slug}` обновлён: {}",
+            changes.join(", ")
+        ),
+        success: true,
+    }
+}
+
+async fn execute_archive_post(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let slug = match args.get("slug").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("archive_post: slug обязателен"),
+    };
+
+    let row: Option<(String, String, String)> = match sqlx::query_as(
+        "SELECT id, department_id, status FROM posts WHERE slug = ?",
+    )
+    .bind(&slug)
+    .fetch_optional(&db.0)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return tool_err(&format!("archive_post: lookup: {e}")),
+    };
+    let (post_id, dept_id, status) = match row {
+        Some(r) => r,
+        None => return tool_err(&format!("archive_post: пост `{slug}` не найден")),
+    };
+
+    if status == "archived" {
+        return ToolExecution {
+            ui_message: format!("⚡ Пост `{slug}` уже в архиве"),
+            success: true,
+        };
+    }
+
+    if let Err(e) = sqlx::query("UPDATE posts SET status = 'archived' WHERE id = ?")
+        .bind(&post_id)
+        .execute(&db.0)
+        .await
+    {
+        return tool_err(&format!("archive_post: {e}"));
+    }
+
+    let _ = app.emit(
+        "posts-changed",
+        serde_json::json!({
+            "kind": "archived",
+            "id": post_id,
+            "slug": slug,
+            "department_id": dept_id,
+        }),
+    );
+
+    ToolExecution {
+        ui_message: format!(
+            "⚡ Пост `{slug}` переведён в архив. История статистик и задач сохранена."
+        ),
+        success: true,
+    }
+}
+
+fn tool_err(msg: &str) -> ToolExecution {
+    ToolExecution {
+        ui_message: format!("⚠️ {msg}"),
+        success: false,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -391,5 +816,62 @@ mod tests {
         let (cleaned, calls) = parse_tool_calls("");
         assert!(calls.is_empty());
         assert!(cleaned.is_empty());
+    }
+
+    // Step 9 — Executive CRUD tools
+
+    #[test]
+    fn parse_create_post_block() {
+        let raw = r#"Создаю пост.
+<tool_call>{"name":"create_post","arguments":{"dept_number":1,"slug":"office-manager","title":"Офис-менеджер","central_product":"Готовый деловой документ MSPro","main_statistic_metric":"документов/день"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "create_post");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("dept_number").and_then(Value::as_i64), Some(1));
+        assert_eq!(args.get("slug").and_then(Value::as_str), Some("office-manager"));
+    }
+
+    #[test]
+    fn parse_update_post_partial_fields() {
+        let raw = r#"<tool_call>{"name":"update_post","arguments":{"slug":"frontend","new_dept_number":4,"status":"paused"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "update_post");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("slug").and_then(Value::as_str), Some("frontend"));
+        assert_eq!(args.get("new_dept_number").and_then(Value::as_i64), Some(4));
+        assert_eq!(args.get("status").and_then(Value::as_str), Some("paused"));
+        assert!(args.get("new_title").is_none());
+    }
+
+    #[test]
+    fn parse_archive_post_minimal() {
+        let raw = r#"<tool_call>{"name":"archive_post","arguments":{"slug":"deprecated-post"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "archive_post");
+        assert_eq!(
+            calls[0].effective_args().get("slug").and_then(Value::as_str),
+            Some("deprecated-post")
+        );
+    }
+
+    #[test]
+    fn multiple_admin_tools_in_one_response() {
+        // Реалистичный сценарий: Гендир в одном ответе создаёт + переносит + архивирует
+        let raw = r#"Делаю реорганизацию.
+<tool_call>{"name":"create_post","arguments":{"dept_number":1,"slug":"office-manager","title":"Офис-менеджер","central_product":"Готовые документы"}}</tool_call>
+<tool_call>{"name":"update_post","arguments":{"slug":"frontend","new_dept_number":4}}</tool_call>
+<tool_call>{"name":"archive_post","arguments":{"slug":"old-post"}}</tool_call>
+Готово."#;
+        let (cleaned, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].name, "create_post");
+        assert_eq!(calls[1].name, "update_post");
+        assert_eq!(calls[2].name, "archive_post");
+        assert!(cleaned.contains("Делаю реорганизацию."));
+        assert!(cleaned.contains("Готово."));
+        assert!(!cleaned.contains("tool_call"));
     }
 }

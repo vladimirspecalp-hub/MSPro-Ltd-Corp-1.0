@@ -37,7 +37,8 @@ pub struct Post {
 static SLUG_RE: Lazy<Regex> =
     Lazy::new(|| Regex::new(r"^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?$").unwrap());
 
-fn validate_slug(slug: &str) -> Result<(), String> {
+/// Шаг 9: pub для re-use в `commands/tool_calls.rs` при `create_post` / `update_post`.
+pub fn validate_slug(slug: &str) -> Result<(), String> {
     if !SLUG_RE.is_match(slug) {
         return Err(format!(
             "slug '{slug}' invalid (allowed: a-z 0-9 -, 2-40 chars, no leading/trailing dash)"
@@ -46,7 +47,8 @@ fn validate_slug(slug: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_text(field: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
+/// Шаг 9: pub для re-use в `commands/tool_calls.rs`.
+pub fn validate_text(field: &str, value: &str, min: usize, max: usize) -> Result<(), String> {
     let len = value.chars().count();
     if len < min || len > max {
         return Err(format!(
@@ -54,6 +56,21 @@ fn validate_text(field: &str, value: &str, min: usize, max: usize) -> Result<(),
         ));
     }
     Ok(())
+}
+
+/// Шаг 9: маппинг dept_number (0..7) → department_id (`dept-N-...`).
+/// Возвращает None если отделения с таким номером нет (не должно случаться —
+/// 8 отделений захардкожены в миграции 01_init.sql).
+pub async fn dept_id_from_number(
+    db: &WritePool,
+    dept_number: i64,
+) -> Result<Option<String>, String> {
+    sqlx::query_as::<_, (String,)>("SELECT id FROM departments WHERE dept_number = ?")
+        .bind(dept_number)
+        .fetch_optional(&db.0)
+        .await
+        .map(|opt| opt.map(|(id,)| id))
+        .map_err(|e| format!("dept lookup: {e}"))
 }
 
 #[tauri::command]
@@ -115,7 +132,7 @@ pub async fn list_posts_by_dept(
         "SELECT id, department_id, slug, title, central_product, main_statistic_metric, status,
                 created_at
          FROM posts
-         WHERE department_id = ?
+         WHERE department_id = ? AND status != 'archived'
          ORDER BY created_at ASC",
     )
     .bind(&department_id)
