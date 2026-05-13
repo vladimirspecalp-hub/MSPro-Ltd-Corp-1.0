@@ -4,6 +4,16 @@ import { listen } from "@tauri-apps/api/event";
 import HermesStatusBadge from "../chat/HermesStatusBadge";
 import MessageActions from "../chat/MessageActions";
 import VaultSaveModal, { type VaultKind } from "../chat/VaultSaveModal";
+import AttachmentButtons from "../chat/AttachmentButtons";
+import AttachmentsArea from "../chat/AttachmentsArea";
+import {
+  readSingleFile,
+  validateAdd,
+  toPayload,
+  type AttachmentItem,
+  type FolderBundle,
+} from "../../lib/attachments";
+import { useToast } from "../common/Toast";
 
 type BrainMode = "hermes" | "claude_external";
 
@@ -32,6 +42,7 @@ const containerStyle: React.CSSProperties = {
   background: "#f9f9f9",
   height: "100%",
   minHeight: 0, // критично для корректного flex-shrink дочернего messagesStyle
+  position: "relative", // anchor для dropOverlayStyle absolute
 };
 
 const headerStyle: React.CSSProperties = {
@@ -102,6 +113,22 @@ const cancelBtnStyle: React.CSSProperties = {
   cursor: "pointer",
   fontSize: 13,
   fontWeight: 600,
+};
+
+const dropOverlayStyle: React.CSSProperties = {
+  position: "absolute",
+  inset: 0,
+  background: "rgba(26, 115, 232, 0.92)",
+  color: "#fff",
+  display: "flex",
+  alignItems: "center",
+  justifyContent: "center",
+  fontSize: 22,
+  fontWeight: 600,
+  zIndex: 50,
+  border: "4px dashed #fff",
+  borderRadius: 12,
+  pointerEvents: "none",
 };
 
 const bubbleStyle = (role: "owner" | "ceo", streaming = false): React.CSSProperties => ({
@@ -176,6 +203,11 @@ export default function CeoChat() {
   const [vaultModal, setVaultModal] = useState<
     { kind: VaultKind; content: string } | null
   >(null);
+  // Step 8: прикреплённые файлы/папки к следующему сообщению (не persist'ятся)
+  const [attachments, setAttachments] = useState<AttachmentItem[]>([]);
+  const [folders, setFolders] = useState<FolderBundle[]>([]);
+  const [isDraggingOver, setIsDraggingOver] = useState(false);
+  const { toast } = useToast();
   const scrollRef = useRef<HTMLDivElement>(null);
   const streamingRef = useRef<StreamingState | null>(null);
 
@@ -267,35 +299,92 @@ export default function CeoChat() {
 
   async function send() {
     const text = input.trim();
-    if (!text || sending) return;
+    if ((!text && attachments.length === 0) || sending) return;
     setSending(true);
     setError(null);
+
+    // Сохраняем snapshot текущих attachments для отправки + сразу очищаем UI
+    const attachmentsSnapshot = attachments;
     setInput("");
-    // Optimistic owner bubble — we'll dedupe when send_chat_message returns.
+    setAttachments([]);
+    setFolders([]);
+
+    // Optimistic owner bubble — показываем только текст, не attached content
     const optimisticUserId = `tmp-${Date.now()}`;
     setMessages((prev) => [
       ...prev,
       {
         id: optimisticUserId,
         role: "owner",
-        content: text,
+        content: text || "(только вложения)",
         created_at: new Date().toISOString(),
       },
     ]);
     try {
-      const turn = await invoke<ChatTurn>("send_chat_message", { content: text });
-      // Replace optimistic owner row with the persisted one (authoritative id+timestamp).
+      const payload = toPayload(attachmentsSnapshot);
+      const turn = await invoke<ChatTurn>("send_chat_message", {
+        content: text,
+        attachments: payload,
+      });
       setMessages((prev) =>
         prev.map((m) => (m.id === optimisticUserId ? turn.user : m))
       );
-      // ceo row is added by the ceo-done listener.
     } catch (e) {
       setError(String(e));
       setMessages((prev) => prev.filter((m) => m.id !== optimisticUserId));
       setInput(text);
+      // Восстановить attachments чтобы Владелец мог исправить и переотправить
+      setAttachments(attachmentsSnapshot);
     } finally {
       setSending(false);
     }
+  }
+
+  // Step 8: drag-and-drop из проводника + handler добавления через picker
+  function addAttachments(items: AttachmentItem[], bundle?: FolderBundle) {
+    setAttachments((prev) => [...prev, ...items]);
+    if (bundle) setFolders((prev) => [...prev, bundle]);
+  }
+  function removeAttachment(id: string) {
+    setAttachments((prev) => prev.filter((i) => i.id !== id));
+    // Если это файл из папки — обновить bundle
+    setFolders((prev) =>
+      prev
+        .map((b) => ({ ...b, itemIds: b.itemIds.filter((x) => x !== id) }))
+        .filter((b) => b.itemIds.length > 0),
+    );
+  }
+  function removeFolder(rootName: string) {
+    const bundle = folders.find((b) => b.rootName === rootName);
+    if (!bundle) return;
+    const idSet = new Set(bundle.itemIds);
+    setAttachments((prev) => prev.filter((i) => !idSet.has(i.id)));
+    setFolders((prev) => prev.filter((b) => b.rootName !== rootName));
+  }
+
+  async function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDraggingOver(false);
+    const files = e.dataTransfer?.files;
+    if (!files || files.length === 0) return;
+    const items: AttachmentItem[] = [];
+    for (let i = 0; i < files.length; i++) {
+      items.push(await readSingleFile(files[i]));
+    }
+    const v = validateAdd(attachments, items);
+    if (!v.ok) toast({ kind: "error", text: v.message ?? "Лимит превышен" });
+    addAttachments(items);
+  }
+  function handleDragOver(e: React.DragEvent<HTMLDivElement>) {
+    if (e.dataTransfer?.types?.includes("Files")) {
+      e.preventDefault();
+      setIsDraggingOver(true);
+    }
+  }
+  function handleDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    // Реагируем только на выход за пределы контейнера, не за пределы вложенных эл-тов
+    if (e.currentTarget === e.target) setIsDraggingOver(false);
   }
 
   async function cancel() {
@@ -327,7 +416,17 @@ export default function CeoChat() {
       : "Сообщение Гендиру… (Enter — отправить, Shift+Enter — перенос)";
 
   return (
-    <div style={containerStyle}>
+    <div
+      style={containerStyle}
+      onDrop={handleDrop}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+    >
+      {isDraggingOver && (
+        <div style={dropOverlayStyle}>
+          📂 Отпусти — приложу файлы к следующему сообщению
+        </div>
+      )}
       <div style={headerStyle}>
         <h1 style={{ margin: 0, fontSize: 22 }}>💬 Гендир (CEO)</h1>
         <p style={{ margin: "4px 0 8px", color: "#666", fontSize: 13 }}>
@@ -470,7 +569,19 @@ export default function CeoChat() {
         )}
       </div>
 
+      <AttachmentsArea
+        items={attachments}
+        folders={folders}
+        onRemove={removeAttachment}
+        onRemoveFolder={removeFolder}
+      />
+
       <div style={inputBarStyle}>
+        <AttachmentButtons
+          current={attachments}
+          onAdd={addAttachments}
+          disabled={inputDisabled}
+        />
         <textarea
           style={inputStyle}
           value={input}
@@ -488,8 +599,8 @@ export default function CeoChat() {
           <button
             type="button"
             onClick={send}
-            disabled={!input.trim() || inputDisabled}
-            style={sendBtnStyle(!input.trim() || inputDisabled)}
+            disabled={(!input.trim() && attachments.length === 0) || inputDisabled}
+            style={sendBtnStyle((!input.trim() && attachments.length === 0) || inputDisabled)}
           >
             {sending ? "…" : "Отправить"}
           </button>

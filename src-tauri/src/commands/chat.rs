@@ -14,7 +14,7 @@
 
 use std::sync::atomic::Ordering;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -189,9 +189,85 @@ const HMT_PREAMBLE: &str = r#"
 «не чини то, что не сломано». Фокус — на красных и оранжевых.
 "#;
 
+/// Step 8 «Глаза Гендира» — прикреплённые файлы/папки.
+/// Содержимое читается на фронте (File API), Rust только валидирует и
+/// форматирует extended content для brain'а. В БД сохраняется ТОЛЬКО
+/// оригинальный текст сообщения без attachments (одноразовое прикрепление).
+#[derive(Debug, Deserialize, Default)]
+pub struct AttachmentItem {
+    pub filename: String,
+    pub size_bytes: usize,
+    pub text_content: String,
+    #[serde(default)]
+    pub relative_path: Option<String>,
+}
+
+const ATTACHMENTS_MAX_COUNT: usize = 50;
+const ATTACHMENTS_TOTAL_MAX: usize = 1024 * 1024;       // 1 MB
+const ATTACHMENT_PER_FILE_MAX: usize = 200 * 1024;      // 200 KB
+const MESSAGE_MAX_CHARS: usize = 300_000;               // poднял с 4000 ради attachments
+
+fn validate_attachments(items: &[AttachmentItem]) -> Result<(), String> {
+    if items.len() > ATTACHMENTS_MAX_COUNT {
+        return Err(format!(
+            "слишком много вложений: {} (лимит {ATTACHMENTS_MAX_COUNT})",
+            items.len()
+        ));
+    }
+    let total: usize = items.iter().map(|a| a.text_content.len()).sum();
+    if total > ATTACHMENTS_TOTAL_MAX {
+        return Err(format!(
+            "вложения превышают суммарный лимит: {} B > {ATTACHMENTS_TOTAL_MAX} B",
+            total
+        ));
+    }
+    for a in items {
+        if a.text_content.len() > ATTACHMENT_PER_FILE_MAX {
+            return Err(format!(
+                "вложение '{}' превышает per-file лимит ({}B > {ATTACHMENT_PER_FILE_MAX}B)",
+                a.filename,
+                a.text_content.len()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Собирает финальное содержимое для brain'а: блок <attachments> +
+/// блок <user_message>. Если вложений нет — возвращает чистый текст
+/// (без обёрток) для обратной совместимости с Гендиром.
+fn build_extended_content(text: &str, items: &[AttachmentItem]) -> String {
+    if items.is_empty() {
+        return text.to_string();
+    }
+    let total: usize = items.iter().map(|a| a.text_content.len()).sum();
+    let mut sb = String::with_capacity(total + text.len() + 256);
+    sb.push_str(&format!(
+        "<attachments count=\"{}\" total_size=\"{}\">\n",
+        items.len(),
+        total
+    ));
+    for a in items {
+        let path = a.relative_path.as_deref().unwrap_or(&a.filename);
+        sb.push_str(&format!(
+            "\n=== file: {} ({} bytes) ===\n",
+            path, a.size_bytes
+        ));
+        sb.push_str(&a.text_content);
+        if !a.text_content.ends_with('\n') {
+            sb.push('\n');
+        }
+    }
+    sb.push_str("</attachments>\n\n<user_message>\n");
+    sb.push_str(text);
+    sb.push_str("\n</user_message>");
+    sb
+}
+
 #[tauri::command]
 pub async fn send_chat_message(
     content: String,
+    attachments: Option<Vec<AttachmentItem>>,
     db: State<'_, WritePool>,
     settings: State<'_, SettingsStore>,
     lifecycle: State<'_, ChatLifecycle>,
@@ -200,18 +276,28 @@ pub async fn send_chat_message(
     app: AppHandle,
 ) -> Result<ChatTurn, String> {
     let trimmed = content.trim();
-    if trimmed.is_empty() {
+    let attachments = attachments.unwrap_or_default();
+    if trimmed.is_empty() && attachments.is_empty() {
         return Err("message is empty".into());
     }
-    if trimmed.chars().count() > 4000 {
-        return Err("message too long (>4000 chars)".into());
+    if trimmed.chars().count() > MESSAGE_MAX_CHARS {
+        return Err(format!("message too long (>{MESSAGE_MAX_CHARS} chars)"));
     }
+    validate_attachments(&attachments)?;
+
+    // Текст для brain'а (с приложениями) vs текст для БД (только original)
+    let brain_content = build_extended_content(trimmed, &attachments);
+    let db_content = if trimmed.is_empty() {
+        format!("(только вложения, {} шт.)", attachments.len())
+    } else {
+        trimmed.to_string()
+    };
 
     // 1. Persist owner turn first so it survives even if the brain errors out.
     let user_id = format!("msg-{}", uuid::Uuid::new_v4());
     sqlx::query("INSERT INTO chat_messages (id, role, content) VALUES (?, 'owner', ?)")
         .bind(&user_id)
-        .bind(trimmed)
+        .bind(&db_content)
         .execute(&db.0)
         .await
         .map_err(|e| format!("insert owner msg: {e}"))?;
@@ -232,7 +318,7 @@ pub async fn send_chat_message(
     let final_text = if snapshot.brain_mode == "claude_external" {
         run_claude_external(
             &user_id,
-            trimmed,
+            &brain_content,
             &system_prompt,
             &snapshot,
             &pending,
@@ -241,7 +327,7 @@ pub async fn send_chat_message(
         )
         .await
     } else {
-        run_hermes(trimmed, &system_prompt, &snapshot, &lifecycle, &app).await
+        run_hermes(&brain_content, &system_prompt, &snapshot, &lifecycle, &app).await
     };
 
     let raw_text = match final_text {
