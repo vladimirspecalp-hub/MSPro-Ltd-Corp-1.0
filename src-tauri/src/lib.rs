@@ -188,22 +188,38 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             Err(e) => log::warn!("HMT self-healing skipped: {e}"),
                         }
 
-                        // ----- Step 9: Migration v4 self-healing fallback -----
+                        // ----- Step 9 + v1.0.13: Migration v4 self-healing fallback -----
                         // tauri-plugin-sql иногда не догоняет миграции при
-                        // installer-upgrade. Идемпотентный UPDATE на случай
-                        // если v4 не применилась автоматически.
+                        // installer-upgrade. Два идемпотентных UPDATE-а:
+                        // (a) основной — поправить пустой slug + перенести в Tech
+                        // (b) частичный fix — если slug уже стал 'frontend' но
+                        //     dept остался HCO (наблюдалось у Владельца в v1.0.12)
                         let fix_slug = "UPDATE posts SET slug='frontend', \
                                         department_id='dept-4-tech' \
                                         WHERE slug='' AND title LIKE 'Frontend%';";
                         match sqlx::raw_sql(fix_slug).execute(&pool.0).await {
                             Ok(r) if r.rows_affected() > 0 => {
                                 log::info!(
-                                    "Step 9 self-healing: patched empty-slug Frontend post ({} rows)",
+                                    "Step 9 self-healing (full): patched empty-slug Frontend post ({} rows)",
                                     r.rows_affected()
                                 )
                             }
                             Ok(_) => { /* nothing to fix — idempotent */ }
                             Err(e) => log::warn!("Step 9 self-healing skipped: {e}"),
+                        }
+
+                        // (b) v1.0.13 — если slug уже 'frontend' но dept остался hco
+                        let fix_dept_only = "UPDATE posts SET department_id='dept-4-tech' \
+                                              WHERE slug='frontend' AND department_id='dept-1-hco';";
+                        match sqlx::raw_sql(fix_dept_only).execute(&pool.0).await {
+                            Ok(r) if r.rows_affected() > 0 => {
+                                log::info!(
+                                    "v1.0.13 self-healing (dept-only): moved Frontend post HCO → Tech ({} rows)",
+                                    r.rows_affected()
+                                )
+                            }
+                            Ok(_) => { /* idempotent */ }
+                            Err(e) => log::warn!("v1.0.13 dept-fix skipped: {e}"),
                         }
 
                         app_handle_for_db.manage(pool);

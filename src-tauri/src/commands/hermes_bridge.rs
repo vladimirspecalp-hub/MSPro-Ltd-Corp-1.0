@@ -20,6 +20,24 @@
 //!   • `kill_on_drop(true)` ensures SIGKILL even if the await chain panics.
 
 use std::process::Stdio;
+
+/// Windows-only flag for CreateProcess: подавляет создание видимого консольного окна
+/// у дочернего процесса. На Unix не определён, на Windows импортируется через
+/// `os::windows::process::CommandExt::creation_flags`.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Скрывает console-окно при spawn'е `wsl.exe`. Без этого Windows показывает
+/// чёрное окно cmd.exe для каждого WSL-вызова (мерцает при каждом chat-turn).
+/// Tokio Command exposes `creation_flags` через windows-расширение CommandExt.
+fn hide_console(cmd: &mut Command) -> &mut Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -84,7 +102,9 @@ pub async fn detect_hermes_status(
 
 pub async fn detect_hermes_status_inner(settings: &AppSettings) -> HermesStatus {
     // 1. Is WSL itself reachable? `wsl --list --quiet` is fast and harmless.
-    let wsl_list = match Command::new(WSL_EXE)
+    let mut wsl_list_cmd = Command::new(WSL_EXE);
+    hide_console(&mut wsl_list_cmd);
+    let wsl_list = match wsl_list_cmd
         .args(["--list", "--quiet"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -223,6 +243,7 @@ pub async fn spawn_hermes(
     );
 
     let mut cmd = Command::new(WSL_EXE);
+    hide_console(&mut cmd);
     cmd.arg("-d")
         .arg(&settings.hermes_distro)
         .arg("--")
@@ -365,6 +386,7 @@ async fn wsl_run(distro: &str, args: &[&str]) -> WslRunOutput {
     }
 
     let mut cmd = Command::new(WSL_EXE);
+    hide_console(&mut cmd);
     cmd.arg("-d")
         .arg(distro)
         .arg("--")

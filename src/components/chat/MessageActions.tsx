@@ -11,12 +11,10 @@ interface Props {
 export default function MessageActions({ onPick }: Props) {
   return (
     <div
-      className="msg-actions"
       style={{
         display: "flex",
         gap: 6,
-        marginTop: 4,
-        alignSelf: "flex-start",
+        alignItems: "center",
       }}
       aria-label="Сохранить сообщение в память Гендира"
     >

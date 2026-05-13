@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import HermesStatusBadge from "../chat/HermesStatusBadge";
 import MessageActions from "../chat/MessageActions";
+import MessageHoverActions from "../chat/MessageHoverActions";
 import VaultSaveModal, { type VaultKind } from "../chat/VaultSaveModal";
 import AttachmentButtons from "../chat/AttachmentButtons";
 import AttachmentsArea from "../chat/AttachmentsArea";
@@ -340,6 +341,18 @@ export default function CeoChat() {
     }
   }
 
+  // v1.0.13: цитата сообщения в input bar (через MessageHoverActions)
+  function handleQuote(text: string) {
+    const quoted = text
+      .split("\n")
+      .map((line) => `> ${line}`)
+      .join("\n");
+    setInput((prev) => {
+      const sep = prev.trim() ? "\n\n" : "";
+      return prev + sep + quoted + "\n\n";
+    });
+  }
+
   // Step 8: drag-and-drop из проводника + handler добавления через picker
   function addAttachments(items: AttachmentItem[], bundle?: FolderBundle) {
     setAttachments((prev) => [...prev, ...items]);
@@ -517,7 +530,7 @@ export default function CeoChat() {
             return (
               <div
                 key={m.id}
-                className={isCeo ? "msg-row" : undefined}
+                className="msg-row"
                 style={{
                   display: "flex",
                   flexDirection: "column",
@@ -534,11 +547,24 @@ export default function CeoChat() {
                 >
                   {formatTime(m.created_at)}
                 </div>
-                {isCeo && (
-                  <MessageActions
-                    onPick={(kind) => setVaultModal({ kind, content: m.content })}
-                  />
-                )}
+                {/* v1.0.13: hover-actions для всех (copy/quote) + Vault только для CEO */}
+                <div
+                  className="msg-actions"
+                  style={{
+                    display: "flex",
+                    gap: 6,
+                    flexWrap: "wrap",
+                    marginTop: 4,
+                    alignSelf: m.role === "owner" ? "flex-end" : "flex-start",
+                  }}
+                >
+                  <MessageHoverActions content={m.content} onQuote={handleQuote} />
+                  {isCeo && (
+                    <MessageActions
+                      onPick={(kind) => setVaultModal({ kind, content: m.content })}
+                    />
+                  )}
+                </div>
               </div>
             );
           })}
