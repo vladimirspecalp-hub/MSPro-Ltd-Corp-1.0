@@ -201,7 +201,7 @@ pub struct AttachmentItem {
     pub relative_path: Option<String>,
 }
 
-const ATTACHMENTS_MAX_COUNT: usize = 50;
+const ATTACHMENTS_MAX_COUNT: usize = 200;
 const ATTACHMENTS_TOTAL_MAX: usize = 1024 * 1024;       // 1 MB attachments суммарно
 const ATTACHMENT_PER_FILE_MAX: usize = 200 * 1024;      // 200 KB на файл
 /// 1.5M chars даёт запас: 1 MB UTF-8 кириллицы ≈ 524K chars + XML обёртки
