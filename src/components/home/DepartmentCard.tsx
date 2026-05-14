@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import AddPostModal from "./AddPostModal";
 import AddStatisticModal from "./AddStatisticModal";
+import EditPostKnowledgeModal from "./EditPostKnowledgeModal";
 import ConditionBadge from "./ConditionBadge";
 import Sparkline from "./Sparkline";
 import { CONDITION_COLORS, TREND_ARROW, type Condition, type PostHMT } from "../../types/hmt";
@@ -65,6 +66,7 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
   const [showAddModal, setShowAddModal] = useState(false);
   const [hmtMap, setHmtMap] = useState<Record<string, PostHMT>>({});
   const [statPost, setStatPost] = useState<Post | null>(null);
+  const [knowledgePost, setKnowledgePost] = useState<Post | null>(null);
 
   async function refresh() {
     setLoading(true);
@@ -245,9 +247,24 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
                         )}
                         <button
                           type="button"
-                          onClick={() => setStatPost(p)}
+                          onClick={() => setKnowledgePost(p)}
                           style={{
                             marginLeft: "auto",
+                            padding: "4px 10px",
+                            background: "#fff",
+                            border: "1px solid #ccc",
+                            borderRadius: 4,
+                            cursor: "pointer",
+                            fontSize: 12,
+                          }}
+                          title="Системный промпт + Vault поста"
+                        >
+                          🧠
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setStatPost(p)}
+                          style={{
                             padding: "4px 10px",
                             background: "#fff",
                             border: "1px solid #ccc",
@@ -301,6 +318,14 @@ export default function DepartmentCard({ dept, defaultOpen = false }: Props) {
           metric={statPost.main_statistic_metric}
           onClose={() => setStatPost(null)}
           onSaved={onStatSaved}
+        />
+      )}
+
+      {knowledgePost && (
+        <EditPostKnowledgeModal
+          slug={knowledgePost.slug}
+          title={knowledgePost.title}
+          onClose={() => setKnowledgePost(null)}
         />
       )}
     </div>

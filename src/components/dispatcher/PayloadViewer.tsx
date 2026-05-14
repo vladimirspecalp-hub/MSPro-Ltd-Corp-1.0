@@ -1,3 +1,4 @@
+import { useState } from "react";
 import type { DispatcherTask } from "../views/Dispatcher";
 
 interface Props {
@@ -6,12 +7,27 @@ interface Props {
 }
 
 export default function PayloadViewer({ task, onClose }: Props) {
+  let parsed: Record<string, unknown> | null = null;
   let pretty = task.task_payload;
   try {
-    pretty = JSON.stringify(JSON.parse(task.task_payload), null, 2);
+    const obj = JSON.parse(task.task_payload) as unknown;
+    if (obj && typeof obj === "object") {
+      parsed = obj as Record<string, unknown>;
+    }
+    pretty = JSON.stringify(obj, null, 2);
   } catch {
     /* keep raw */
   }
+
+  // v1.0.19: вынимаем per-post knowledge из payload в отдельные раскрываемые блоки.
+  const postPrompt =
+    parsed && typeof parsed.post_system_prompt === "string"
+      ? (parsed.post_system_prompt as string)
+      : null;
+  const postVault =
+    parsed && typeof parsed.post_vault_context_first_kb === "string"
+      ? (parsed.post_vault_context_first_kb as string)
+      : null;
 
   return (
     <div style={overlay} onClick={onClose}>
@@ -31,6 +47,23 @@ export default function PayloadViewer({ task, onClose }: Props) {
           <Meta label="created" value={task.created_at} />
         </div>
 
+        {(postPrompt || postVault) && (
+          <div style={{ marginBottom: 12 }}>
+            {postPrompt && (
+              <Collapse
+                title={`🧠 Системный промпт поста (${postPrompt.length.toLocaleString("ru")} байт)`}
+                content={postPrompt}
+              />
+            )}
+            {postVault && (
+              <Collapse
+                title={`📚 Vault-опыт поста (первые ${postVault.length.toLocaleString("ru")} байт)`}
+                content={postVault}
+              />
+            )}
+          </div>
+        )}
+
         <label style={{ fontSize: 12, color: "#666", fontWeight: 600 }}>Payload</label>
         <pre style={pre}>{pretty}</pre>
 
@@ -45,6 +78,57 @@ export default function PayloadViewer({ task, onClose }: Props) {
           <button type="button" onClick={onClose} style={secondaryBtn}>Закрыть</button>
         </div>
       </div>
+    </div>
+  );
+}
+
+function Collapse({ title, content }: { title: string; content: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div
+      style={{
+        border: "1px solid #ddd",
+        borderRadius: 4,
+        marginBottom: 6,
+        background: "#fafafa",
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          width: "100%",
+          textAlign: "left",
+          padding: "8px 12px",
+          background: "transparent",
+          border: "none",
+          cursor: "pointer",
+          fontSize: 13,
+          fontWeight: 600,
+          color: "#333",
+        }}
+      >
+        {open ? "▼" : "▶"} {title}
+      </button>
+      {open && (
+        <pre
+          style={{
+            margin: 0,
+            padding: 12,
+            background: "#fff",
+            borderTop: "1px solid #eee",
+            fontSize: 12,
+            fontFamily: "ui-monospace, monospace",
+            whiteSpace: "pre-wrap",
+            wordBreak: "break-word",
+            maxHeight: 360,
+            overflowY: "auto",
+            color: "#222",
+          }}
+        >
+          {content}
+        </pre>
+      )}
     </div>
   );
 }

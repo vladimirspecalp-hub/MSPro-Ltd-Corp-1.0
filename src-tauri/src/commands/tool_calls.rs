@@ -106,7 +106,8 @@ tool_call с валидным JSON. Формат и схемы:
       "type": "object",
       "properties": {
         "title": {"type": "string", "description": "Короткое поисковое название (5-100 символов). Например 'Документооборот MSPro: создание договора'."},
-        "content": {"type": "string", "description": "Полный текст паттерна в markdown. Используй заголовки ## Шаги, списки, блоки кода — структурируй для будущего чтения."}
+        "content": {"type": "string", "description": "Полный текст паттерна в markdown. Используй заголовки ## Шаги, списки, блоки кода — структурируй для будущего чтения."},
+        "target_post": {"type": "string", "description": "Опционально: slug поста (manager, engineer, ...), чей собственный Vault обогатить. Если пропустить — паттерн пишется в общий Vault Гендира."}
       },
       "required": ["title", "content"]
     }
@@ -118,9 +119,21 @@ tool_call с валидным JSON. Формат и схемы:
       "type": "object",
       "properties": {
         "title": {"type": "string", "description": "Что именно достигнуто. Например '2026-05-13 — Шаг 10 закрыт, Claude CLI + Qwen 3 fallback работают'."},
-        "content": {"type": "string", "description": "Подробное описание победы: контекст, действия, результат, что сработало."}
+        "content": {"type": "string", "description": "Подробное описание победы: контекст, действия, результат, что сработало."},
+        "target_post": {"type": "string", "description": "Опционально: slug поста чьему Vault принадлежит победа. Без параметра — в общий Vault Гендира."}
       },
       "required": ["title", "content"]
+    }
+  },
+  {
+    "name": "read_post_knowledge",
+    "description": "Прочитать что у поста есть в плане инструкций и накопленного опыта. Используй ПЕРЕД dispatch_task если не уверен какие у поста знания/правила/паттерны. Возвращает системный промпт поста + первые ~5 KB Vault-контекста (паттерны + победы). Не вызывай на каждое сообщение — только когда реально планируешь поставить задачу.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "post_slug": {"type": "string", "description": "slug поста (manager, engineer, frontend, ...). Должен совпадать с одним из slug в блоке 'Текущие Состояния Постов' выше."}
+      },
+      "required": ["post_slug"]
     }
   }
 ]
@@ -175,6 +188,20 @@ tool_call с валидным JSON. Формат и схемы:
     инструкция). Win = «что получилось» (конкретный случай успеха, история).
 16. **Один Vault-файл = одна тема.** Не сваливай всё в один паттерн —
     несколько маленьких лучше одного огромного.
+
+### Правила работы со знаниями постов (read_post_knowledge / target_post)
+
+17. **Когда читать.** Вызывай `read_post_knowledge` ТОЛЬКО когда планируешь
+    `dispatch_task` посту и не знаешь чем он занимается / какие у него
+    паттерны / какие правила. На каждое сообщение Владельца — НЕ нужно.
+18. **Адресные save_pattern / save_win.** Если паттерн или победа касаются
+    конкретного поста (например «как менеджер пишет письма на пропуска»),
+    добавь параметр `target_post: "manager"` — файл уйдёт в его Vault,
+    а не в общий Гендиров. Без параметра — в общий Vault.
+19. **Что доступно постам.** У каждого поста может быть свой системный
+    промпт (инструкция Владельца — что пост умеет, в каком стиле работает)
+    и своя папка опыта. Если у поста ничего нет — `read_post_knowledge`
+    вернёт пустой результат, тогда формулируй задачу самостоятельно.
 
 ### КРИТИЧЕСКОЕ ПРАВИЛО — не используй внешние skills
 
@@ -374,6 +401,7 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
         "archive_post" => execute_archive_post(call.effective_args(), db, app).await,
         "save_pattern" => execute_save_vault(call.effective_args(), app, "02-Patterns").await,
         "save_win" => execute_save_vault(call.effective_args(), app, "04-Wins").await,
+        "read_post_knowledge" => execute_read_post_knowledge(call.effective_args(), db, app).await,
         unknown => ToolExecution {
             ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
             success: false,
@@ -414,9 +442,9 @@ async fn execute_dispatch_task(
         }
     };
 
-    // Проверка существования поста по slug — иначе шина задач засорится сиротами.
-    let post_exists: Option<(String,)> =
-        match sqlx::query_as("SELECT title FROM posts WHERE slug = ?")
+    // Проверка существования поста по slug + считывание его knowledge.
+    let post_row: Option<(String, Option<String>)> =
+        match sqlx::query_as("SELECT title, system_prompt_md FROM posts WHERE slug = ?")
             .bind(slug)
             .fetch_optional(&db.0)
             .await
@@ -429,7 +457,7 @@ async fn execute_dispatch_task(
                 };
             }
         };
-    let Some((post_title,)) = post_exists else {
+    let Some((post_title, post_system_prompt)) = post_row else {
         return ToolExecution {
             ui_message: format!(
                 "⚠️ Пост со slug `{slug}` не найден в оргсхеме — задача не поставлена."
@@ -438,10 +466,26 @@ async fn execute_dispatch_task(
         };
     };
 
+    // v1.0.19: инжектим пер-постовый системный промпт + Vault контекст в payload
+    // диспетчера. UI отобразит их раскрываемыми блоками, Владелец видит ровно
+    // что Гендир передал посту.
+    let post_vault_context = match app.try_state::<crate::vault::VaultState>() {
+        Some(vs) => crate::vault::read_post_context(
+            vs.root.clone(),
+            slug.to_string(),
+            crate::vault::POST_CONTEXT_BYTES,
+        )
+        .await
+        .unwrap_or_default(),
+        None => String::new(),
+    };
+
     // Формируем payload и пишем через Диспетчер (Step 5 infrastructure).
     let payload = serde_json::json!({
         "title": title,
         "description": description,
+        "post_system_prompt": post_system_prompt,
+        "post_vault_context_first_kb": post_vault_context,
     });
 
     match crate::commands::dispatcher::dispatch_task_inner(
@@ -858,18 +902,111 @@ async fn execute_save_vault(
         None => return tool_err("save_vault: VaultState не инициализирован (setup() не закончил)"),
     };
 
-    match crate::vault::save_to(&vault_state.root, subdir, &title, &content) {
+    // v1.0.19: опциональный target_post → пишем в Vault конкретного поста
+    let target_post = args
+        .get("target_post")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let kind_label = if subdir == "02-Patterns" { "🧠 паттерн" } else { "🏆 победу" };
+
+    let result = match target_post {
+        Some(slug) => crate::vault::save_to_post(&vault_state.root, slug, subdir, &title, &content),
+        None => crate::vault::save_to(&vault_state.root, subdir, &title, &content),
+    };
+
+    match result {
         Ok(path) => {
-            let kind_label = if subdir == "02-Patterns" { "🧠 паттерн" } else { "🏆 победу" };
+            let target_label = match target_post {
+                Some(slug) => format!(" поста `{slug}`"),
+                None => String::new(),
+            };
             ToolExecution {
                 ui_message: format!(
-                    "⚡ Гендир сохранил {kind_label} в Vault: **{title}**\n`{}`",
+                    "⚡ Гендир сохранил {kind_label}{target_label} в Vault: **{title}**\n`{}`",
                     short_vault_path(&path)
                 ),
                 success: true,
             }
         }
         Err(e) => tool_err(&format!("save_vault: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.19: read_post_knowledge — Гендир видит инструкции/опыт поста
+// ---------------------------------------------------------------------------
+
+async fn execute_read_post_knowledge(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let slug = match args.get("post_slug").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("read_post_knowledge: post_slug обязателен"),
+    };
+
+    // 1. system_prompt_md из БД
+    let row: Option<(String, Option<String>)> = match sqlx::query_as(
+        "SELECT title, system_prompt_md FROM posts WHERE slug = ?",
+    )
+    .bind(&slug)
+    .fetch_optional(&db.0)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return tool_err(&format!("read_post_knowledge: lookup: {e}")),
+    };
+    let (post_title, system_prompt) = match row {
+        Some(r) => r,
+        None => return tool_err(&format!("read_post_knowledge: пост `{slug}` не найден")),
+    };
+
+    // 2. Vault контекст поста
+    let vault_state = match app.try_state::<crate::vault::VaultState>() {
+        Some(s) => s,
+        None => {
+            return tool_err("read_post_knowledge: VaultState не инициализирован");
+        }
+    };
+    let vault_context = crate::vault::read_post_context(
+        vault_state.root.clone(),
+        slug.clone(),
+        crate::vault::POST_CONTEXT_BYTES,
+    )
+    .await
+    .unwrap_or_default();
+
+    let prompt_len = system_prompt.as_deref().map(str::len).unwrap_or(0);
+    let vault_len = vault_context.len();
+    let has_prompt = prompt_len > 0;
+    let has_vault = vault_len > 0;
+
+    let body = if !has_prompt && !has_vault {
+        format!(
+            "ℹ️ У поста **{post_title}** (`{slug}`) пока нет ни системного промпта, ни Vault-опыта. \
+             Формулируй задачу самостоятельно из общих знаний об отделении."
+        )
+    } else {
+        let prompt_block = match system_prompt.as_deref() {
+            Some(p) if !p.is_empty() => format!("\n\n**Системный промпт ({prompt_len} байт):**\n\n{p}"),
+            _ => "\n\n*(системный промпт не задан)*".to_string(),
+        };
+        let vault_block = if has_vault {
+            format!("\n\n**Vault-опыт (первые {vault_len} байт):**\n\n{vault_context}")
+        } else {
+            "\n\n*(Vault поста пуст)*".to_string()
+        };
+        format!(
+            "📖 Знания поста **{post_title}** (`{slug}`):{prompt_block}{vault_block}"
+        )
+    };
+
+    ToolExecution {
+        ui_message: body,
+        success: true,
     }
 }
 
@@ -1037,6 +1174,32 @@ mod tests {
         assert_eq!(
             calls[0].effective_args().get("title").and_then(Value::as_str),
             Some("Step 10 done")
+        );
+    }
+
+    // v1.0.19 — per-post knowledge tools
+
+    #[test]
+    fn parse_read_post_knowledge_block() {
+        let raw = "<tool_call>{\"name\":\"read_post_knowledge\",\"arguments\":{\"post_slug\":\"manager\"}}</tool_call>";
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_post_knowledge");
+        assert_eq!(
+            calls[0].effective_args().get("post_slug").and_then(Value::as_str),
+            Some("manager")
+        );
+    }
+
+    #[test]
+    fn parse_save_pattern_with_target_post() {
+        let raw = "<tool_call>{\"name\":\"save_pattern\",\"arguments\":{\"title\":\"Letter for permits\",\"content\":\"## Template\\nMSPro letterhead.\",\"target_post\":\"manager\"}}</tool_call>";
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "save_pattern");
+        assert_eq!(
+            calls[0].effective_args().get("target_post").and_then(Value::as_str),
+            Some("manager")
         );
     }
 

@@ -56,6 +56,12 @@ fn migrations() -> Vec<Migration> {
             sql: include_str!("../migrations/04_fix_empty_slug.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 5,
+            description: "v1.0.19: per-post knowledge (system_prompt_md, vault_subdir, ...)",
+            sql: include_str!("../migrations/05_post_knowledge.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -280,6 +286,11 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
             // Step 3 — posts CRUD
             commands::posts::create_post,
             commands::posts::list_posts_by_dept,
+            // v1.0.19 — per-post knowledge (system prompt + own Vault folder)
+            commands::posts::get_post_knowledge,
+            commands::posts::update_post_knowledge,
+            commands::posts::import_post_vault,
+            commands::posts::open_post_vault_in_explorer,
             // Step 3 — CEO chat (rewritten with real Hermes bridge in Step 4A)
             commands::chat::send_chat_message,
             commands::chat::list_chat_history,

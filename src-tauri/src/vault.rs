@@ -22,8 +22,22 @@ const PER_FILE_BYTES: usize = 8_000;
 /// Максимальная длина slug имени файла (без `.md`).
 const SLUG_MAX_LEN: usize = 80;
 
+/// v1.0.19: максимальная длина slug поста (директория `posts/<slug>/`).
+const POST_SLUG_MAX_LEN: usize = 64;
+
+/// v1.0.19: лимит контекста поста, инжектится в `dispatch_task` (≈ 1500 токенов).
+pub const POST_CONTEXT_BYTES: usize = 5_120;
+
+/// v1.0.19: максимум файлов которые `import_folder_to_post` копирует за раз.
+const IMPORT_MAX_FILES: usize = 500;
+
 pub const PATTERNS_DIR: &str = "02-Patterns";
 pub const WINS_DIR: &str = "04-Wins";
+
+/// v1.0.19: общий контейнер для пер-постовых Vault-ов. Изолирован от
+/// корневых `02-Patterns`/`04-Wins` Гендира — `read_vault_context` его не
+/// читает (он сканирует только конкретные плоские директории корня).
+pub const POSTS_DIR: &str = "posts";
 
 /// Managed Tauri state: корень Vault на диске. Создаётся один раз в `setup()`.
 #[derive(Debug, Clone)]
@@ -54,6 +68,12 @@ pub async fn read_vault_context(root: PathBuf) -> Result<String, String> {
 }
 
 fn build_context_blocking(root: &Path) -> Result<String, String> {
+    build_context_with_budget(root, VAULT_BLOCK_BYTES)
+}
+
+/// Параметризованная версия — используется и Гендиром (16 KB), и `read_post_context`
+/// (5 KB на пост).
+fn build_context_with_budget(root: &Path, max_bytes: usize) -> Result<String, String> {
     if !root.exists() {
         return Ok(String::new());
     }
@@ -66,7 +86,7 @@ fn build_context_blocking(root: &Path) -> Result<String, String> {
     }
 
     let mut out = String::new();
-    let mut budget = VAULT_BLOCK_BYTES;
+    let mut budget = max_bytes;
 
     append_section(&mut out, &mut budget, "### Паттерны (проверенные алгоритмы)\n", patterns);
     append_section(&mut out, &mut budget, "### Победы (что повторять)\n", wins);
@@ -265,6 +285,210 @@ pub fn save_to(
 }
 
 // ---------------------------------------------------------------------------
+// v1.0.19 — Per-post Vault (изолированная зона `posts/<slug>/`)
+// ---------------------------------------------------------------------------
+
+/// Возвращает `<root>/posts/` — общий контейнер для пер-постовых Vault.
+pub fn posts_root(root: &Path) -> PathBuf {
+    root.join(POSTS_DIR)
+}
+
+/// Возвращает `<root>/posts/<slug>/` без побочных эффектов на файловой системе.
+/// Slug должен быть уже санитизирован через `sanitize_post_slug`.
+pub fn post_vault_root(root: &Path, slug: &str) -> Result<PathBuf, String> {
+    let safe = sanitize_post_slug(slug)?;
+    Ok(posts_root(root).join(safe))
+}
+
+/// Идемпотентно создаёт `<root>/posts/<slug>/{02-Patterns,04-Wins}`.
+pub fn ensure_post_vault_dirs(root: &Path, slug: &str) -> Result<PathBuf, String> {
+    let pvr = post_vault_root(root, slug)?;
+    std::fs::create_dir_all(pvr.join(PATTERNS_DIR))
+        .map_err(|e| format!("ensure post patterns: {e}"))?;
+    std::fs::create_dir_all(pvr.join(WINS_DIR))
+        .map_err(|e| format!("ensure post wins: {e}"))?;
+    Ok(pvr)
+}
+
+/// Санитизирует slug поста для использования как имени директории.
+/// Разрешено: `a-z`, `0-9`, `-`, `_`. Всё остальное → `-`, схлопывается.
+/// Длина ≤ 64. Возвращает Err для пустого/полностью garbage slug.
+pub fn sanitize_post_slug(slug: &str) -> Result<String, String> {
+    let lower = slug.trim().to_lowercase();
+    if lower.is_empty() {
+        return Err("post slug пустой".into());
+    }
+    let mut buf = String::with_capacity(lower.len());
+    let mut last_dash = false;
+    for ch in lower.chars() {
+        let keep = ch.is_ascii_alphanumeric() || ch == '_' || ch == '-';
+        if keep {
+            buf.push(ch);
+            last_dash = ch == '-';
+        } else if !last_dash {
+            buf.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = buf.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        return Err("post slug не содержит ASCII букв/цифр".into());
+    }
+    let capped: String = trimmed.chars().take(POST_SLUG_MAX_LEN).collect();
+    if capped == ".." || capped == "." {
+        return Err("post slug == '.' / '..'".into());
+    }
+    Ok(capped)
+}
+
+/// Пишет в `<root>/posts/<slug>/<subdir>/<file>.md`. Канонизирует и проверяет,
+/// что результирующий путь не вышел за пределы `<root>/posts/<slug>/`.
+pub fn save_to_post(
+    root: &Path,
+    slug: &str,
+    subdir: &str,
+    title: &str,
+    content: &str,
+) -> Result<PathBuf, String> {
+    let pvr = ensure_post_vault_dirs(root, slug)?;
+    let saved = save_to(&pvr, subdir, title, content)?;
+
+    // Дополнительная проверка: canonical путь должен начинаться с canonical posts_root.
+    let canon_posts = posts_root(root)
+        .canonicalize()
+        .map_err(|e| format!("canonicalize posts_root: {e}"))?;
+    let canon_saved = saved
+        .canonicalize()
+        .map_err(|e| format!("canonicalize saved: {e}"))?;
+    if !canon_saved.starts_with(&canon_posts) {
+        // Откатываем подозрительный файл.
+        let _ = std::fs::remove_file(&saved);
+        return Err("post Vault escape detected".into());
+    }
+    Ok(saved)
+}
+
+/// Читает Vault-контекст конкретного поста (`<root>/posts/<slug>/`) с лимитом.
+pub async fn read_post_context(
+    root: PathBuf,
+    slug: String,
+    max_bytes: usize,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        let pvr = match post_vault_root(&root, &slug) {
+            Ok(p) => p,
+            Err(_) => return Ok(String::new()), // невалидный slug = пустой контекст
+        };
+        if !pvr.exists() {
+            return Ok(String::new());
+        }
+        build_context_with_budget(&pvr, max_bytes)
+    })
+    .await
+    .map_err(|e| format!("join: {e}"))?
+}
+
+/// Копирует `.md` файлы из произвольной директории Владельца в
+/// `<root>/posts/<slug>/`. Симлинки и не-md файлы игнорируются. Существующие
+/// файлы перезаписываются (последняя версия актуальна). Возвращает количество
+/// успешно скопированных файлов.
+pub fn import_folder_to_post(
+    root: &Path,
+    slug: &str,
+    src: &Path,
+) -> Result<usize, String> {
+    if !src.exists() {
+        return Err(format!("исходная папка не существует: {}", src.display()));
+    }
+    if !src.is_dir() {
+        return Err("источник не директория".into());
+    }
+    let pvr = ensure_post_vault_dirs(root, slug)?;
+    let mut copied = 0usize;
+    walk_copy_md(src, src, &pvr, &mut copied)?;
+    log::info!(
+        "vault: imported {copied} files from {} into {}",
+        src.display(),
+        pvr.display()
+    );
+    Ok(copied)
+}
+
+fn walk_copy_md(
+    src_root: &Path,
+    cur: &Path,
+    dst_root: &Path,
+    copied: &mut usize,
+) -> Result<(), String> {
+    if *copied >= IMPORT_MAX_FILES {
+        return Ok(());
+    }
+    let rd = match std::fs::read_dir(cur) {
+        Ok(rd) => rd,
+        Err(e) => return Err(format!("read_dir {}: {e}", cur.display())),
+    };
+    for entry in rd.flatten() {
+        if *copied >= IMPORT_MAX_FILES {
+            break;
+        }
+        let p = entry.path();
+        // Запрещаем симлинки явно — защита от escape через ссылки наружу.
+        let meta = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_symlink() {
+            log::warn!("vault import: skip symlink {}", p.display());
+            continue;
+        }
+        if meta.is_dir() {
+            walk_copy_md(src_root, &p, dst_root, copied)?;
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let ext_ok = p
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|e| e.eq_ignore_ascii_case("md"))
+            .unwrap_or(false);
+        if !ext_ok {
+            continue;
+        }
+        // Сохраняем относительный путь от src_root.
+        let rel = match p.strip_prefix(src_root) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let dst = dst_root.join(rel);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create_dir_all {}: {e}", parent.display()))?;
+        }
+        // Защита от выхода за dst_root через хитрые имена.
+        let canon_dst_root = dst_root
+            .canonicalize()
+            .map_err(|e| format!("canon dst_root: {e}"))?;
+        if let Some(parent) = dst.parent() {
+            let canon_parent = parent
+                .canonicalize()
+                .map_err(|e| format!("canon parent: {e}"))?;
+            if !canon_parent.starts_with(&canon_dst_root) {
+                log::warn!("vault import: skip escape {}", dst.display());
+                continue;
+            }
+        }
+        if let Err(e) = std::fs::copy(&p, &dst) {
+            log::warn!("vault import: copy fail {} -> {}: {e}", p.display(), dst.display());
+            continue;
+        }
+        *copied += 1;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -364,6 +588,103 @@ mod tests {
         ensure_vault_dirs(&tmp).unwrap();
         let block = build_context_blocking(&tmp).unwrap();
         assert!(block.is_empty());
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // v1.0.19 — per-post Vault tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sanitize_post_slug_basic() {
+        assert_eq!(sanitize_post_slug("manager").unwrap(), "manager");
+        assert_eq!(sanitize_post_slug("Manager 1").unwrap(), "manager-1");
+        assert_eq!(sanitize_post_slug("  foo_bar  ").unwrap(), "foo_bar");
+    }
+
+    #[test]
+    fn sanitize_post_slug_rejects_traversal() {
+        // "../" → схлопывается в "-", обрезается → "" → Err
+        assert!(sanitize_post_slug("../../etc/passwd").is_ok()); // станет "etc-passwd"
+        let s = sanitize_post_slug("../../etc/passwd").unwrap();
+        assert!(!s.contains('/'));
+        assert!(!s.contains(".."));
+
+        // Чистый ".." и "." должны падать
+        assert!(sanitize_post_slug("..").is_err());
+        assert!(sanitize_post_slug(".").is_err());
+
+        // Кириллица не ASCII alphanumeric, garbage → Err
+        assert!(sanitize_post_slug("Тест").is_err());
+        // Пустые
+        assert!(sanitize_post_slug("").is_err());
+        assert!(sanitize_post_slug("   ").is_err());
+    }
+
+    #[test]
+    fn sanitize_post_slug_length_capped() {
+        let long = "a".repeat(200);
+        let s = sanitize_post_slug(&long).unwrap();
+        assert!(s.len() <= POST_SLUG_MAX_LEN);
+    }
+
+    #[test]
+    fn post_vault_isolated_from_main() {
+        let tmp = std::env::temp_dir().join(format!("vault-iso-{}", uuid::Uuid::new_v4()));
+        ensure_vault_dirs(&tmp).unwrap();
+
+        // Корневой Vault Гендира получает паттерн
+        save_to(&tmp, PATTERNS_DIR, "Ceo Pattern", "ceo only").unwrap();
+        // Пост получает свой паттерн
+        save_to_post(&tmp, "manager", PATTERNS_DIR, "Manager Pattern", "manager only").unwrap();
+
+        // Корневой read должен видеть только ceo-pattern, не manager-pattern
+        let block = build_context_blocking(&tmp).unwrap();
+        assert!(block.contains("ceo only"));
+        assert!(!block.contains("manager only"), "корневой Vault не должен читать posts/");
+
+        // Per-post read должен видеть только свой паттерн
+        let pvr = post_vault_root(&tmp, "manager").unwrap();
+        let post_block = build_context_with_budget(&pvr, POST_CONTEXT_BYTES).unwrap();
+        assert!(post_block.contains("manager only"));
+        assert!(!post_block.contains("ceo only"));
+
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn save_to_post_path_inside_posts_root() {
+        let tmp = std::env::temp_dir().join(format!("vault-stp-{}", uuid::Uuid::new_v4()));
+        ensure_vault_dirs(&tmp).unwrap();
+        let saved =
+            save_to_post(&tmp, "engineer", PATTERNS_DIR, "Тест", "контент").unwrap();
+        let canon_posts = posts_root(&tmp).canonicalize().unwrap();
+        let canon_saved = saved.canonicalize().unwrap();
+        assert!(canon_saved.starts_with(&canon_posts));
+        assert!(saved.to_string_lossy().contains("engineer"));
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn import_folder_to_post_copies_md_skips_other() {
+        let tmp = std::env::temp_dir().join(format!("vault-imp-{}", uuid::Uuid::new_v4()));
+        ensure_vault_dirs(&tmp).unwrap();
+
+        // Подготовим источник с .md + .txt + nested
+        let src = tmp.join("src-folder");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.md"), "# A").unwrap();
+        std::fs::write(src.join("b.txt"), "skip me").unwrap();
+        std::fs::write(src.join("sub").join("c.md"), "# C").unwrap();
+
+        let n = import_folder_to_post(&tmp, "manager", &src).unwrap();
+        assert_eq!(n, 2, "должны скопироваться только .md");
+
+        let pvr = post_vault_root(&tmp, "manager").unwrap();
+        assert!(pvr.join("a.md").exists());
+        assert!(pvr.join("sub").join("c.md").exists());
+        assert!(!pvr.join("b.txt").exists());
+
         std::fs::remove_dir_all(&tmp).ok();
     }
 
