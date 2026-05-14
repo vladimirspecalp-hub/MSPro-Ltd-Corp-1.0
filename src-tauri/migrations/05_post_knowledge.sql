@@ -35,8 +35,6 @@ ALTER TABLE posts ADD COLUMN preferred_model TEXT DEFAULT NULL;
 --     «Недавно изменённые». На существующих строках = NULL (никогда не правились).
 ALTER TABLE posts ADD COLUMN updated_at TEXT DEFAULT NULL;
 
--- Индекс для быстрой выборки постов с заполненными знаниями (UI badge
--- «🧠 С памятью») и для сортировки по updated_at.
-CREATE INDEX IF NOT EXISTS idx_posts_knowledge ON posts(slug)
-    WHERE system_prompt_md IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_posts_updated_at ON posts(updated_at DESC);
+-- Индексы — без partial WHERE clause (в одной транзакции с ALTER TABLE
+-- sqlx-migrate откатывал миграцию целиком на partial indexes).
+CREATE INDEX IF NOT EXISTS idx_posts_updated_at ON posts(updated_at);
