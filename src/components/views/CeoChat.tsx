@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import HermesStatusBadge from "../chat/HermesStatusBadge";
+import BrainStatusBadges from "../chat/BrainStatusBadges";
 import MessageActions from "../chat/MessageActions";
 import MessageHoverActions from "../chat/MessageHoverActions";
 import VaultSaveModal, { type VaultKind } from "../chat/VaultSaveModal";
@@ -16,7 +16,7 @@ import {
 } from "../../lib/attachments";
 import { useToast } from "../common/Toast";
 
-type BrainMode = "hermes" | "claude_external";
+type BrainMode = "claude_cli" | "qwen_local" | "claude_external";
 
 interface AppSettings {
   brain_mode?: BrainMode;
@@ -197,8 +197,9 @@ export default function CeoChat() {
   const [sending, setSending] = useState(false);
   const [streaming, setStreaming] = useState<StreamingState | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [hermesReady, setHermesReady] = useState(false);
-  const [brainMode, setBrainMode] = useState<BrainMode>("hermes");
+  const [claudeReady, setClaudeReady] = useState(false);
+  const [qwenReady, setQwenReady] = useState(false);
+  const [brainMode, setBrainMode] = useState<BrainMode>("claude_cli");
   const [externalAgentOn, setExternalAgentOn] = useState(false);
   // Step 7 Этап 2: модалка сохранения сообщения в файловую память Vault
   const [vaultModal, setVaultModal] = useState<
@@ -224,7 +225,11 @@ export default function CeoChat() {
         const history = await invoke<ChatMessage[]>("list_chat_history", { limit: 200 });
         setMessages(history);
         const s = await invoke<AppSettings>("get_settings");
-        if (s.brain_mode === "claude_external" || s.brain_mode === "hermes") {
+        if (
+          s.brain_mode === "claude_cli" ||
+          s.brain_mode === "qwen_local" ||
+          s.brain_mode === "claude_external"
+        ) {
           setBrainMode(s.brain_mode);
         }
         setExternalAgentOn(!!s.external_agent_enabled);
@@ -239,6 +244,12 @@ export default function CeoChat() {
     if (next === "claude_external" && !externalAgentOn) {
       setError(
         "Сначала включи External Agent в Настройках — Claude (Architect) подключается через тот же WebSocket."
+      );
+      return;
+    }
+    if (next === "qwen_local" && !qwenReady) {
+      setError(
+        "Qwen 3 endpoint не отвечает. Запусти Ollama (`ollama serve`) или LM Studio и проверь endpoint в Настройках."
       );
       return;
     }
@@ -415,17 +426,25 @@ export default function CeoChat() {
     }
   }
 
+  // Шаг 10: ready = соответствующий контур доступен.
+  // claude_cli ready если CLI установлен ИЛИ включён auto-fallback (тогда Qwen
+  // подхватит). qwen_local ready если Qwen endpoint отвечает.
   const ready =
-    brainMode === "claude_external" ? externalAgentOn : hermesReady;
+    brainMode === "claude_external"
+      ? externalAgentOn
+      : brainMode === "qwen_local"
+        ? qwenReady
+        : claudeReady || qwenReady; // claude_cli: ok если хоть один из контуров жив
+
   const inputDisabled = sending || streaming !== null || !ready;
   const placeholder = !ready
     ? brainMode === "claude_external"
       ? "Включи External Agent в Настройках для Claude (Architect)"
-      : "Сначала установи Hermes ⬆️"
+      : brainMode === "qwen_local"
+        ? "Qwen 3 не отвечает — запусти Ollama / LM Studio (Настройки)"
+        : "Установи Claude CLI или запусти Qwen 3 (Настройки)"
     : streaming
-      ? brainMode === "claude_external"
-        ? "Жду Claude (Architect)…"
-        : "Гендир думает…"
+      ? "Гендир думает…"
       : "Сообщение Гендиру… (Enter — отправить, Shift+Enter — перенос)";
 
   return (
@@ -443,64 +462,42 @@ export default function CeoChat() {
       <div style={headerStyle}>
         <h1 style={{ margin: 0, fontSize: 22 }}>💬 Гендир (CEO)</h1>
         <p style={{ margin: "4px 0 8px", color: "#666", fontSize: 13 }}>
-          {brainMode === "claude_external"
-            ? "🧑‍💼 Мозг: Claude (Architect mode) — отвечает живой эксперт через External Agent WS"
-            : "🤖 Мозг: Hermes на WSL2 → DeepSeek-Reasoner"}
+          {brainMode === "claude_cli"
+            ? "⭐ Мозг: Claude 4.7 Opus локально через CLI (основной контур)"
+            : brainMode === "qwen_local"
+              ? "🐉 Мозг: Qwen 3 локально (автономный/офлайн)"
+              : "🧑‍💼 Мозг: Claude (Architect mode) через WS — legacy"}
         </p>
 
         <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
           <button
             type="button"
-            onClick={() => switchBrain("hermes")}
-            style={brainBtnStyle(brainMode === "hermes")}
+            onClick={() => switchBrain("claude_cli")}
+            style={brainBtnStyle(brainMode === "claude_cli")}
           >
-            🤖 Hermes (DeepSeek)
+            ⭐ Claude 4.7 Opus
           </button>
           <button
             type="button"
-            onClick={() => switchBrain("claude_external")}
-            style={brainBtnStyle(brainMode === "claude_external")}
+            onClick={() => switchBrain("qwen_local")}
+            style={brainBtnStyle(brainMode === "qwen_local")}
           >
-            🧑‍💼 Claude (Architect)
+            🐉 Qwen 3 (Автономный)
           </button>
         </div>
 
-        {brainMode === "hermes" && (
-          <HermesStatusBadge
-            onStatusChange={(s) => setHermesReady(s?.kind === "available")}
-          />
-        )}
-        {brainMode === "claude_external" && (
-          <div
-            style={{
-              padding: "8px 14px",
-              borderRadius: 6,
-              fontSize: 12,
-              border: "1px solid",
-              background: externalAgentOn ? "#e8f5e9" : "#fff8e1",
-              borderColor: externalAgentOn ? "#4caf50" : "#ffa000",
-              color: externalAgentOn ? "#1b5e20" : "#e65100",
-              display: "flex",
-              alignItems: "center",
-              gap: 10,
-            }}
-          >
-            {externalAgentOn ? "🟢" : "🟡"}
-            <span style={{ flex: 1 }}>
-              {externalAgentOn
-                ? "External Agent gateway включён — Claude (Architect) может подключиться и отвечать"
-                : "Включи External Agent в Настройках — Claude подключается через тот же WS"}
-            </span>
-          </div>
-        )}
+        <BrainStatusBadges
+          onClaudeReady={setClaudeReady}
+          onQwenReady={setQwenReady}
+        />
       </div>
 
       <div ref={scrollRef} style={messagesStyle}>
         {messages.length === 0 && !streaming && !error && (
           <p style={{ color: "#999", textAlign: "center", marginTop: 60 }}>
-            {hermesReady
+            {ready
               ? "Начни разговор. Гендир знает оргструктуру и ответит со ссылками на посты."
-              : "Установи Hermes по подсказке выше — Гендир оживёт."}
+              : "Запусти Claude CLI или Qwen 3 (Настройки → 🧠 Двухконтурный Мозг)."}
           </p>
         )}
         <div style={{ display: "flex", flexDirection: "column" }}>

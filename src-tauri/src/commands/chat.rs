@@ -1,26 +1,25 @@
-//! CEO chat: real Hermes bridge (Step 4A).
+//! CEO chat — двухконтурный мозг (Шаг 10).
 //!
 //! Flow per `send_chat_message`:
 //!   1. Validate + persist owner row.
-//!   2. Build CEO system prompt from departments + posts (Module 1).
-//!   3. Detect Hermes — if ≠ Available, fall back to a graceful diagnostic
-//!      response so the chat is never silently broken.
-//!   4. Reset cancel flag, spawn Hermes child (Module 2).
-//!   5. Emit `ceo-start` so the UI mounts a streaming bubble.
-//!   6. Read child stdout line-by-line, emit `ceo-chunk` per line.
-//!   7. On EOF: persist full ceo row, emit `ceo-done` with final payload.
-//!   8. On cancel/timeout/error: persist partial-or-error message, emit
-//!      `ceo-done` with the error envelope so the UI clears the loader.
+//!   2. Build CEO system prompt из departments + posts + HMT + Vault + tools.
+//!   3. Route по `brain_mode`:
+//!       • "claude_cli"      → Claude 4.7 Opus локально через CLI
+//!       • "qwen_local"      → Qwen 3 локально через HTTP (OAI-compat)
+//!       • "claude_external" → WS gateway (legacy, для меня через subscriber)
+//!   4. Auto-fallback: если Claude CLI упал и `auto_fallback_qwen=true` —
+//!      переключаемся на Qwen, в чате появляется ⚠️ системная плашка.
+//!   5. Intercept tool_calls (Шаг 7.3 + 9) — atomic SQLite ops + ⚡ плашки.
 
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use std::time::Duration;
-
-use crate::commands::hermes_bridge::{self, ChatLifecycle, HermesStatus};
+use crate::commands::claude_bridge::{self, ChatLifecycle};
+use crate::commands::qwen_bridge;
 use crate::db::WritePool;
 use crate::external_agent::{PendingCeoResponses, SharedGatewayState};
 use crate::settings::SettingsStore;
@@ -325,30 +324,83 @@ pub async fn send_chat_message(
     // 2. System prompt built fresh per turn — picks up new posts, conditions, vault.
     let system_prompt = build_ceo_system_prompt(&db, &app).await?;
 
-    // 3. Branch on brain_mode.
+    // 3. Branch on brain_mode (Step 10 — двухконтурный мозг).
     let snapshot = settings.data.lock().unwrap().clone();
 
-    let final_text = if snapshot.brain_mode == "claude_external" {
-        run_claude_external(
-            &user_id,
-            &brain_content,
-            &system_prompt,
-            &snapshot,
-            &pending,
-            &gateway,
-            &app,
-        )
-        .await
-    } else {
-        run_hermes(&brain_content, &system_prompt, &snapshot, &lifecycle, &app).await
+    // Для Claude CLI собираем prompt как один блок (system + user) — это
+    // подаётся в stdin. Структура: "# SYSTEM CONTEXT\n<system_prompt>\n\n# USER\n<user>"
+    let bundled_for_cli = format!(
+        "# SYSTEM CONTEXT (MSPro-Ltd Corp)\n\n{system_prompt}\n\n# USER\n\n{brain_content}"
+    );
+
+    let primary_result = match snapshot.brain_mode.as_str() {
+        "claude_external" => {
+            run_claude_external(
+                &user_id,
+                &brain_content,
+                &system_prompt,
+                &snapshot,
+                &pending,
+                &gateway,
+                &app,
+            )
+            .await
+        }
+        "qwen_local" => {
+            qwen_bridge::run_qwen(
+                &system_prompt,
+                &brain_content,
+                &snapshot,
+                &lifecycle,
+                &app,
+            )
+            .await
+        }
+        // Default → "claude_cli"
+        _ => {
+            claude_bridge::run_claude_cli(&bundled_for_cli, &snapshot, &lifecycle, &app).await
+        }
     };
 
-    let raw_text = match final_text {
+    // Auto-fallback: Claude CLI упал И auto_fallback_qwen включён → переходим
+    // на Qwen с системной плашкой в чате.
+    let final_text = match primary_result {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => "⚠️ Брейн вернул пустой ответ.".to_string(),
         Err(e) if e.contains("cancelled") => "⏹ Прервано пользователем.".to_string(),
+        Err(e) if snapshot.brain_mode == "claude_cli" && snapshot.auto_fallback_qwen => {
+            log::warn!("Step 10: Claude CLI failed ({e}), auto-fallback → Qwen 3");
+            emit_system_warning(
+                &db,
+                &app,
+                &format!(
+                    "⚠️ Связь с Claude потеряна ({}). Переход на резервный локальный контур Qwen 3.",
+                    truncate_error(&e, 120)
+                ),
+            )
+            .await;
+            match qwen_bridge::run_qwen(
+                &system_prompt,
+                &brain_content,
+                &snapshot,
+                &lifecycle,
+                &app,
+            )
+            .await
+            {
+                Ok(t) if !t.is_empty() => t,
+                Ok(_) => "⚠️ Qwen вернул пустой ответ.".to_string(),
+                Err(qe) => format!(
+                    "⚠️ Оба контура недоступны.\nClaude: {}\nQwen: {}",
+                    truncate_error(&e, 200),
+                    truncate_error(&qe, 200)
+                ),
+            }
+        }
         Err(e) => format!("⚠️ Ошибка: {e}"),
     };
+
+    let raw_text = final_text;
 
     // 4. Step 7 Этап 3 — tool-call interception.
     // Вынимаем <tool_call>...</tool_call> и <think>...</think> блоки, исполняем
@@ -443,35 +495,46 @@ pub async fn send_chat_message(
     Ok(turn)
 }
 
-/// Hermes-WSL2 path (Step 4A original).
-async fn run_hermes(
-    user_text: &str,
-    system_prompt: &str,
-    snapshot: &crate::settings::AppSettings,
-    lifecycle: &State<'_, ChatLifecycle>,
-    app: &AppHandle,
-) -> Result<String, String> {
-    let status = hermes_bridge::detect_hermes_status_inner(snapshot).await;
-    if !matches!(status, HermesStatus::Available { .. }) {
-        return Err(format!("Hermes недоступен: {status:?}"));
-    }
-
-    lifecycle.cancel.store(false, Ordering::Relaxed);
-    let cancel = lifecycle.cancel.clone();
-
-    let child = hermes_bridge::spawn_hermes(system_prompt, user_text, snapshot)
+/// Шаг 10: системное сообщение (⚠️ префикс) при auto-fallback Claude → Qwen.
+/// Пишется в `chat_messages` как обычная ceo-реплика и эмитится через
+/// `ceo-tool-result` event — UI рендерит как красную плашку
+/// (см. `CeoChat::isSystemMessage` в Шаге 7.3).
+async fn emit_system_warning(db: &State<'_, WritePool>, app: &AppHandle, text: &str) {
+    let id = format!("msg-{}", uuid::Uuid::new_v4());
+    if let Err(e) = sqlx::query("INSERT INTO chat_messages (id, role, content) VALUES (?, 'ceo', ?)")
+        .bind(&id)
+        .bind(text)
+        .execute(&db.0)
         .await
-        .map_err(|e| format!("spawn hermes: {e}"))?;
-    *lifecycle.current_child_pid.lock().await = child.id();
+    {
+        log::warn!("emit_system_warning insert: {e}");
+        return;
+    }
+    if let Ok(row) = sqlx::query_as::<_, ChatMessage>(
+        "SELECT id, role, content, created_at FROM chat_messages WHERE id = ?",
+    )
+    .bind(&id)
+    .fetch_one(&db.0)
+    .await
+    {
+        let _ = app.emit(
+            "ceo-tool-result",
+            ChatMessageOut {
+                id: row.id,
+                role: row.role,
+                content: row.content,
+                created_at: row.created_at,
+            },
+        );
+    }
+}
 
-    let placeholder_id = format!("msg-{}", uuid::Uuid::new_v4());
-    let _ = app.emit("ceo-start", &placeholder_id);
-
-    let result =
-        hermes_bridge::stream_hermes_response(child, app, cancel, snapshot.hermes_timeout_sec)
-            .await;
-    *lifecycle.current_child_pid.lock().await = None;
-    result
+fn truncate_error(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let truncated: String = s.chars().take(max).collect();
+    format!("{truncated}…")
 }
 
 /// Claude-as-Architect path: emit a `ceo-question` event over the WS gateway,

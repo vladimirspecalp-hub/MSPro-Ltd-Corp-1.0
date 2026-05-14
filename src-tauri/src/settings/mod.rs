@@ -24,60 +24,72 @@ pub struct AppSettings {
     /// User-friendly display name for the current Windows user (cosmetic).
     pub user_display_name: Option<String>,
 
-    // ─── Step 4A: Hermes WSL2 bridge ──────────────────────────────────────
-    /// Name of the WSL distribution that hosts Hermes. Default: "Ubuntu".
-    /// On user's machine `wsl --list --quiet` may show different names
-    /// (e.g. "Ubuntu-22.04") — Module 0 detection surfaces the actual list.
-    #[serde(default = "default_hermes_distro")]
-    pub hermes_distro: String,
-    /// Hermes skill identifier passed as the first argument. Default: "/ceo".
-    /// The leading slash matches Hermes' slash-command convention.
-    #[serde(default = "default_hermes_skill")]
-    pub hermes_skill_name: String,
-    /// Hard timeout (seconds) for a single Hermes response. Default: 120.
-    #[serde(default = "default_hermes_timeout")]
-    pub hermes_timeout_sec: u64,
-    /// LLM provider name passed to `hermes --provider`. Default: "deepseek".
-    /// Custom providers must also be declared in `~/.hermes/config.yaml` and
-    /// have an env var (e.g. DEEPSEEK_API_KEY) set in `~/.hermes/.env`.
-    #[serde(default)]
-    pub hermes_provider: Option<String>,
-    /// Model identifier passed to `hermes -m`. Default: "deepseek-reasoner".
-    #[serde(default)]
-    pub hermes_model: Option<String>,
+    // ─── Step 10: Two-circuit brain (Claude CLI + Qwen local) ─────────────
     /// Where the CEO chat routes its prompts:
-    ///   • "hermes" — through the WSL2 Hermes bridge (DeepSeek, Ollama, etc.)
-    ///   • "claude_external" — pushed over the External Agent WS gateway as
-    ///     a `ceo-question` event; reply must come back via `ceo/respond`
-    ///     RPC method within `claude_external_timeout_sec`.
+    ///   • "claude_cli"      — local Claude Code CLI (primary, since v1.0.15)
+    ///   • "qwen_local"      — local OpenAI-compat endpoint (Ollama / LM Studio)
+    ///   • "claude_external" — pushed over External Agent WS (legacy, hidden in UI)
     #[serde(default = "default_brain_mode")]
     pub brain_mode: String,
-    /// How long Rust waits for an external Claude reply before falling back
-    /// to an error message. Default: 600 s (10 min — Claude reasoning can be
-    /// slow when the human-in-the-loop is multitasking).
-    #[serde(default = "default_claude_timeout")]
+    /// How long Rust waits for an external Claude reply via WS before
+    /// falling back. Default: 600 s.
+    #[serde(default = "default_claude_external_timeout")]
     pub claude_external_timeout_sec: u64,
+
+    /// Path to the `claude` executable. Default: `"claude"` (PATH lookup).
+    /// If installed in WSL only, set to `"wsl claude"`.
+    #[serde(default = "default_claude_cli_path")]
+    pub claude_cli_path: String,
+    /// Claude model id passed via `--model`. Default: `claude-opus-4-7`.
+    #[serde(default = "default_claude_cli_model")]
+    pub claude_cli_model: String,
+    /// Hard timeout (seconds) for a single `claude --print` invocation.
+    #[serde(default = "default_claude_cli_timeout")]
+    pub claude_cli_timeout_sec: u64,
+
+    /// OpenAI-compatible endpoint for local Qwen 3 (Ollama default 11434, LM Studio 1234).
+    #[serde(default = "default_qwen_endpoint")]
+    pub qwen_endpoint: String,
+    /// Qwen model id. Ollama-style `qwen3:32b` by default.
+    #[serde(default = "default_qwen_model")]
+    pub qwen_model: String,
+    /// Hard timeout (seconds) for a single Qwen response.
+    #[serde(default = "default_qwen_timeout")]
+    pub qwen_timeout_sec: u64,
+
+    /// When true and `brain_mode == "claude_cli"`, on Claude failure auto-fall
+    /// back to Qwen with a system warning in chat.
+    #[serde(default = "default_auto_fallback_qwen")]
+    pub auto_fallback_qwen: bool,
 }
 
-fn default_brain_mode() -> String { "hermes".to_string() }
-fn default_claude_timeout() -> u64 { 600 }
+fn default_brain_mode() -> String { "claude_cli".to_string() }
+fn default_claude_external_timeout() -> u64 { 600 }
 
-fn default_hermes_distro() -> String { "Ubuntu".to_string() }
-fn default_hermes_skill() -> String { "/ceo".to_string() }
-fn default_hermes_timeout() -> u64 { 300 }
+fn default_claude_cli_path() -> String { "claude".to_string() }
+fn default_claude_cli_model() -> String { "claude-opus-4-7".to_string() }
+fn default_claude_cli_timeout() -> u64 { 180 }
+
+fn default_qwen_endpoint() -> String { "http://localhost:11434/v1".to_string() }
+fn default_qwen_model() -> String { "qwen3:32b".to_string() }
+fn default_qwen_timeout() -> u64 { 120 }
+
+fn default_auto_fallback_qwen() -> bool { true }
 
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
             external_agent_enabled: false,
             user_display_name: None,
-            hermes_distro: default_hermes_distro(),
-            hermes_skill_name: default_hermes_skill(),
-            hermes_timeout_sec: default_hermes_timeout(),
-            hermes_provider: None,
-            hermes_model: None,
             brain_mode: default_brain_mode(),
-            claude_external_timeout_sec: default_claude_timeout(),
+            claude_external_timeout_sec: default_claude_external_timeout(),
+            claude_cli_path: default_claude_cli_path(),
+            claude_cli_model: default_claude_cli_model(),
+            claude_cli_timeout_sec: default_claude_cli_timeout(),
+            qwen_endpoint: default_qwen_endpoint(),
+            qwen_model: default_qwen_model(),
+            qwen_timeout_sec: default_qwen_timeout(),
+            auto_fallback_qwen: default_auto_fallback_qwen(),
         }
     }
 }
@@ -87,12 +99,48 @@ pub async fn set_brain_mode(
     mode: String,
     state: tauri::State<'_, SettingsStore>,
 ) -> Result<(), String> {
-    if mode != "hermes" && mode != "claude_external" {
-        return Err(format!("invalid brain_mode '{mode}' (allowed: hermes, claude_external)"));
+    if !matches!(mode.as_str(), "claude_cli" | "qwen_local" | "claude_external") {
+        return Err(format!(
+            "invalid brain_mode '{mode}' (allowed: claude_cli, qwen_local, claude_external)"
+        ));
     }
     {
         let mut g = state.data.lock().unwrap();
         g.brain_mode = mode;
+    }
+    state.save().map_err(|e| format!("settings save: {e}"))
+}
+
+/// Шаг 10: универсальный setter для любого скалярного string-поля настроек.
+/// UI-Settings экран его вызывает для claude_cli_path / claude_cli_model /
+/// qwen_endpoint / qwen_model. Это дешевле чем плодить 6 отдельных Tauri-команд.
+#[tauri::command]
+pub async fn set_brain_string_field(
+    field: String,
+    value: String,
+    state: tauri::State<'_, SettingsStore>,
+) -> Result<(), String> {
+    {
+        let mut g = state.data.lock().unwrap();
+        match field.as_str() {
+            "claude_cli_path" => g.claude_cli_path = value,
+            "claude_cli_model" => g.claude_cli_model = value,
+            "qwen_endpoint" => g.qwen_endpoint = value,
+            "qwen_model" => g.qwen_model = value,
+            _ => return Err(format!("unknown field '{field}'")),
+        }
+    }
+    state.save().map_err(|e| format!("settings save: {e}"))
+}
+
+#[tauri::command]
+pub async fn set_auto_fallback_qwen(
+    enabled: bool,
+    state: tauri::State<'_, SettingsStore>,
+) -> Result<(), String> {
+    {
+        let mut g = state.data.lock().unwrap();
+        g.auto_fallback_qwen = enabled;
     }
     state.save().map_err(|e| format!("settings save: {e}"))
 }
@@ -114,15 +162,12 @@ impl SettingsStore {
             }),
             Err(_) => AppSettings::default(),
         };
-        // Step 7 Этап 1: clamp hermes timeout — DeepSeek-Reasoner с расширенным
-        // system prompt (HMT + Vault) часто думает дольше 2 минут. Старые
-        // settings.json могут иметь 120, поднимаем до 300 принудительно.
-        if data.hermes_timeout_sec < 240 {
-            log::info!(
-                "settings: bumping hermes_timeout_sec {} → 300",
-                data.hermes_timeout_sec
-            );
-            data.hermes_timeout_sec = 300;
+        // Step 10 migration: legacy brain_mode="hermes" → "claude_cli".
+        // Old settings.json with hermes_* fields загружается серде'м мягко
+        // (поля просто игнорируются — их больше нет в struct).
+        if data.brain_mode == "hermes" {
+            log::info!("Settings migration: brain_mode 'hermes' → 'claude_cli'");
+            data.brain_mode = default_brain_mode();
         }
         log::info!("settings loaded from {}", path.display());
         Self {

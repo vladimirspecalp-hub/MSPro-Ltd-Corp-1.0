@@ -1,9 +1,10 @@
 pub mod chat;
+pub mod claude_bridge;
 pub mod dispatcher;
-pub mod hermes_bridge;
 pub mod hmt;
 pub mod ping;
 pub mod posts;
+pub mod qwen_bridge;
 pub mod tool_calls;
 pub mod vault;
 pub mod vault_io;

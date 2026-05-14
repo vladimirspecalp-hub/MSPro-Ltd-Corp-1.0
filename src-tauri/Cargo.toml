@@ -1,6 +1,6 @@
 [package]
 name = "mspro-ltd-corp"
-version = "1.0.14"
+version = "1.0.15"
 description = "MSPro-Ltd Corp — Hubbard-based AI company OS"
 authors = ["Бровяков В.А."]
 edition = "2021"
@@ -38,6 +38,10 @@ regex = "1"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "macros"] }
 once_cell = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+# Step 10 — Qwen 3 local HTTP bridge (OpenAI-compatible streaming)
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+dirs = "5"
 
 # Windows-only: secure secret storage backed by DPAPI / Credential Manager.
 [target.'cfg(windows)'.dependencies]

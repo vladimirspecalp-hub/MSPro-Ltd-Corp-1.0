@@ -20,7 +20,7 @@ use std::time::Instant;
 use tauri::Manager;
 use tauri_plugin_sql::{Builder as SqlBuilder, Migration, MigrationKind};
 
-use commands::hermes_bridge::ChatLifecycle;
+use commands::claude_bridge::ChatLifecycle;
 use external_agent::{gateway::ProcessStart, GatewayState, PendingCeoResponses, SharedGatewayState};
 use settings::SettingsStore;
 
@@ -284,8 +284,12 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
             commands::chat::send_chat_message,
             commands::chat::list_chat_history,
             // Step 4A — Hermes WSL2 bridge
-            commands::hermes_bridge::detect_hermes_status,
-            commands::hermes_bridge::cancel_chat_response,
+            // Step 10 — двухконтурный мозг (Claude CLI + Qwen 3 local)
+            commands::claude_bridge::detect_claude_cli,
+            commands::claude_bridge::cancel_chat_response,
+            commands::qwen_bridge::detect_qwen,
+            settings::set_brain_string_field,
+            settings::set_auto_fallback_qwen,
             // Step 5 — Security Vault (UI for DPAPI-backed secrets)
             commands::vault::vault_list_secrets,
             commands::vault::vault_add_secret,
