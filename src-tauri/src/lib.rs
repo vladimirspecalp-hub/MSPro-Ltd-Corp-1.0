@@ -228,6 +228,41 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             Err(e) => log::warn!("v1.0.13 dept-fix skipped: {e}"),
                         }
 
+                        // ----- v1.0.21 self-healing: per-post knowledge columns -----
+                        // У Владельца миграция 05 откатывалась (partial index), а
+                        // tauri-plugin-sql закэшировал version=5 как «уже пробовал»
+                        // и больше не пытается её применить. Идемпотентно добавляем
+                        // колонки через PRAGMA + ALTER. Если колонка уже есть —
+                        // ALTER упадёт с "duplicate column" и мы тихо игнорируем.
+                        let post_knowledge_alters: &[(&str, &str)] = &[
+                            ("system_prompt_md", "ALTER TABLE posts ADD COLUMN system_prompt_md TEXT DEFAULT NULL"),
+                            ("vault_subdir",     "ALTER TABLE posts ADD COLUMN vault_subdir TEXT DEFAULT NULL"),
+                            ("claude_agent_name", "ALTER TABLE posts ADD COLUMN claude_agent_name TEXT DEFAULT NULL"),
+                            ("preferred_model",  "ALTER TABLE posts ADD COLUMN preferred_model TEXT DEFAULT NULL"),
+                            ("updated_at",       "ALTER TABLE posts ADD COLUMN updated_at TEXT DEFAULT NULL"),
+                        ];
+                        // Получаем существующие колонки одним PRAGMA вместо try/catch на каждую.
+                        let cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                            sqlx::query_as("PRAGMA table_info(posts)")
+                                .fetch_all(&pool.0)
+                                .await
+                                .unwrap_or_default();
+                        let existing: std::collections::HashSet<String> =
+                            cols.into_iter().map(|c| c.1).collect();
+                        for (col, sql) in post_knowledge_alters {
+                            if existing.contains(*col) {
+                                continue;
+                            }
+                            match sqlx::raw_sql(sql).execute(&pool.0).await {
+                                Ok(_) => log::info!(
+                                    "v1.0.21 self-healing: added posts.{col}"
+                                ),
+                                Err(e) => log::warn!(
+                                    "v1.0.21 self-healing: posts.{col} ALTER failed: {e}"
+                                ),
+                            }
+                        }
+
                         app_handle_for_db.manage(pool);
                     }
                     Err(e) => log::error!("open_write_pool: {e}"),
