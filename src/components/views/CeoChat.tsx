@@ -79,8 +79,10 @@ const inputStyle: React.CSSProperties = {
   fontFamily: "inherit",
   resize: "none",
   minHeight: 38,
-  maxHeight: 120,
+  maxHeight: 140, // ≈5 строк при line-height 1.4 + padding
+  lineHeight: 1.4,
   boxSizing: "border-box",
+  overflowY: "auto",
 };
 
 const sendBtnStyle = (disabled: boolean): React.CSSProperties => ({
@@ -212,6 +214,15 @@ export default function CeoChat() {
   const { toast } = useToast();
   const scrollRef = useRef<HTMLDivElement>(null);
   const streamingRef = useRef<StreamingState | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  // v1.0.16: автоувеличение высоты textarea по содержимому до ~5 строк (capped maxHeight).
+  useEffect(() => {
+    const el = textareaRef.current;
+    if (!el) return;
+    el.style.height = "auto";
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`;
+  }, [input]);
 
   // Keep a ref in sync so the listen callbacks always see latest streaming state
   useEffect(() => {
@@ -606,6 +617,7 @@ export default function CeoChat() {
           disabled={inputDisabled}
         />
         <textarea
+          ref={textareaRef}
           style={inputStyle}
           value={input}
           onChange={(e) => setInput(e.target.value)}

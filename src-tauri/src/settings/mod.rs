@@ -71,7 +71,7 @@ fn default_claude_cli_model() -> String { "claude-opus-4-7".to_string() }
 fn default_claude_cli_timeout() -> u64 { 180 }
 
 fn default_qwen_endpoint() -> String { "http://localhost:11434/v1".to_string() }
-fn default_qwen_model() -> String { "qwen3:32b".to_string() }
+fn default_qwen_model() -> String { "qwen3:14b".to_string() }
 fn default_qwen_timeout() -> u64 { 120 }
 
 fn default_auto_fallback_qwen() -> bool { true }
