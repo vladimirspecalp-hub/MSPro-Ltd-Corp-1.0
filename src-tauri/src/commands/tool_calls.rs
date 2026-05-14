@@ -98,6 +98,30 @@ tool_call с валидным JSON. Формат и схемы:
       },
       "required": ["slug"]
     }
+  },
+  {
+    "name": "save_pattern",
+    "description": "Сохранить опыт/инструкцию в долговременную память (Vault/02-Patterns). Используй когда из разговора или вложений извлёк ценный паттерн — повторяемый алгоритм/playbook полезный для будущих сессий Гендира. Файл доступен на следующем chat-запросе через read_vault.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "description": "Короткое поисковое название (5-100 символов). Например 'Документооборот MSPro: создание договора'."},
+        "content": {"type": "string", "description": "Полный текст паттерна в markdown. Используй заголовки ## Шаги, списки, блоки кода — структурируй для будущего чтения."}
+      },
+      "required": ["title", "content"]
+    }
+  },
+  {
+    "name": "save_win",
+    "description": "Сохранить конкретную победу/успех в Vault/04-Wins. Используй когда команда добилась результата — закрыли сделку, сдали проект, выиграли спор. Win = что получилось (история случая), Pattern = как делать (алгоритм).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string", "description": "Что именно достигнуто. Например '2026-05-13 — Шаг 10 закрыт, Claude CLI + Qwen 3 fallback работают'."},
+        "content": {"type": "string", "description": "Подробное описание победы: контекст, действия, результат, что сработало."}
+      },
+      "required": ["title", "content"]
+    }
   }
 ]
 </tools>
@@ -136,6 +160,21 @@ tool_call с валидным JSON. Формат и схемы:
     sales-lead, qa-controller. НЕ создавай slug с кириллицей или пробелами.
 11. dept_number 0-7. Если Владелец говорит «в HCO» — это 1. «в Техническое» — 4.
     «в Финансовый» — 3. Если не уверен — спроси Владельца.
+
+### Правила работы с долговременной памятью (save_pattern / save_win)
+
+12. **Когда сохранять.** Если Владелец явно попросил «запомни», «сохрани
+    как паттерн», «отметь победу» — выполни немедленно. Также инициативно
+    если из вложений (прикреплённой папки или файла) извлёк структурированный
+    playbook / инструкцию реально полезные для будущих сессий.
+13. **Title — короткий и поисковый.** «Документооборот MSPro: создание
+    договора с приложениями» лучше чем «Заметка про договор».
+14. **Content в markdown.** Используй заголовки ## Шаги, списки, блоки кода.
+    Чтобы при чтении Vault обратно — было структурировано.
+15. **Pattern vs Win.** Pattern = «как делать» (повторяемый алгоритм,
+    инструкция). Win = «что получилось» (конкретный случай успеха, история).
+16. **Один Vault-файл = одна тема.** Не сваливай всё в один паттерн —
+    несколько маленьких лучше одного огромного.
 
 ### КРИТИЧЕСКОЕ ПРАВИЛО — не используй внешние skills
 
@@ -333,6 +372,8 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
         "create_post" => execute_create_post(call.effective_args(), db, app).await,
         "update_post" => execute_update_post(call.effective_args(), db, app).await,
         "archive_post" => execute_archive_post(call.effective_args(), db, app).await,
+        "save_pattern" => execute_save_vault(call.effective_args(), app, "02-Patterns").await,
+        "save_win" => execute_save_vault(call.effective_args(), app, "04-Wins").await,
         unknown => ToolExecution {
             ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
             success: false,
@@ -793,6 +834,56 @@ fn tool_err(msg: &str) -> ToolExecution {
 }
 
 // ---------------------------------------------------------------------------
+// v1.0.17: Vault write tools (save_pattern / save_win)
+// ---------------------------------------------------------------------------
+
+use tauri::Manager;
+
+async fn execute_save_vault(
+    args: &Value,
+    app: &AppHandle,
+    subdir: &str,
+) -> ToolExecution {
+    let title = match args.get("title").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("save_vault: title обязателен"),
+    };
+    let content = match args.get("content").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s.to_string(),
+        _ => return tool_err("save_vault: content обязателен (не пустой)"),
+    };
+
+    let vault_state = match app.try_state::<crate::vault::VaultState>() {
+        Some(s) => s,
+        None => return tool_err("save_vault: VaultState не инициализирован (setup() не закончил)"),
+    };
+
+    match crate::vault::save_to(&vault_state.root, subdir, &title, &content) {
+        Ok(path) => {
+            let kind_label = if subdir == "02-Patterns" { "🧠 паттерн" } else { "🏆 победу" };
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Гендир сохранил {kind_label} в Vault: **{title}**\n`{}`",
+                    short_vault_path(&path)
+                ),
+                success: true,
+            }
+        }
+        Err(e) => tool_err(&format!("save_vault: {e}")),
+    }
+}
+
+fn short_vault_path(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    let idx = s.to_lowercase().rfind("vault");
+    if let Some(i) = idx {
+        s[i..].to_string()
+    } else {
+        s
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -915,6 +1006,37 @@ mod tests {
         assert_eq!(
             calls[0].effective_args().get("slug").and_then(Value::as_str),
             Some("deprecated-post")
+        );
+    }
+
+    #[test]
+    fn parse_save_pattern_block() {
+        // Используем обычную строку (не raw) чтобы spacing внутри JSON не путал лексер.
+        let raw = "<tool_call>{\"name\":\"save_pattern\",\"arguments\":{\"title\":\"MS Office: dogovor flow\",\"content\":\"## Steps\\n1. open template\\n2. fill fields\"}}</tool_call>";
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "save_pattern");
+        let args = calls[0].effective_args();
+        assert_eq!(
+            args.get("title").and_then(Value::as_str),
+            Some("MS Office: dogovor flow")
+        );
+        assert!(args
+            .get("content")
+            .and_then(Value::as_str)
+            .unwrap()
+            .contains("## Steps"));
+    }
+
+    #[test]
+    fn parse_save_win_block() {
+        let raw = "<tool_call>{\"name\":\"save_win\",\"arguments\":{\"title\":\"Step 10 done\",\"content\":\"Claude CLI + Qwen 3 fallback deployed.\"}}</tool_call>";
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "save_win");
+        assert_eq!(
+            calls[0].effective_args().get("title").and_then(Value::as_str),
+            Some("Step 10 done")
         );
     }
 

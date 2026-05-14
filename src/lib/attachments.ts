@@ -24,7 +24,16 @@ const IGNORE_SEGMENTS = new Set<string>([
 
 export const PER_FILE_MAX = 200 * 1024;    // 200 KB
 export const TOTAL_MAX = 1024 * 1024;      // 1 MB total
-export const MAX_FILES = 50;
+export const MAX_FILES = 200;
+
+/** Имена которые всегда должны быть первыми при cap-обрезке —
+ * это «индексные» файлы дающие контекст всей папки. */
+const PRIORITY_FILENAMES = new Set<string>([
+  "CLAUDE.md",
+  "README.md",
+  "SKILL.md",
+  "AGENTS.md",
+]);
 
 export type AttachmentKind = "file" | "folder-file" | "unsupported";
 
@@ -138,8 +147,13 @@ export async function readFolderFiles(
     candidates.push(f);
   }
 
-  // 2) Лексикографически по relPath чтобы Гендиру было приятно читать
+  // 2) Сортировка с приоритетом: CLAUDE.md / README.md / SKILL.md / AGENTS.md
+  // наверх — чтобы при cap-обрезке заглавные документы папки всегда доходили.
+  // Внутри priority-группы и не-priority — алфавитно по relPath.
   candidates.sort((a, b) => {
+    const aP = PRIORITY_FILENAMES.has(a.name) ? 0 : 1;
+    const bP = PRIORITY_FILENAMES.has(b.name) ? 0 : 1;
+    if (aP !== bP) return aP - bP;
     const ap = (a as File & { webkitRelativePath?: string }).webkitRelativePath || a.name;
     const bp = (b as File & { webkitRelativePath?: string }).webkitRelativePath || b.name;
     return ap.localeCompare(bp);
