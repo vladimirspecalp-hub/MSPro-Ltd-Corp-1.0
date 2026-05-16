@@ -44,16 +44,17 @@ tool_call с валидным JSON. Формат и схемы:
 <tools>
 [
   {
-    "name": "dispatch_task",
-    "description": "Поставить задачу посту через Диспетчер. Появится в шине задач и у владельца поста.",
+    "name": "send_to_dispatcher",
+    "description": "Передать задачу Диспетчеру (Hub-and-Spoke архитектура). Диспетчер сам выберет исполнителя, переформулирует prompt с учётом инструкций поста и накопленного опыта, и поставит задачу. ТЫ НЕ АДРЕСУЕШЬ ПОСТУ НАПРЯМУЮ — это запрещено архитектурой v1.0.22. Прямого dispatch_task больше нет.",
     "parameters": {
       "type": "object",
       "properties": {
-        "title": {"type": "string", "description": "Короткое название задачи (5-80 символов)"},
-        "assignee_post_slug": {"type": "string", "description": "slug целевого поста, например frontend"},
-        "description": {"type": "string", "description": "Подробности задачи: что и зачем сделать"}
+        "raw_prompt": {"type": "string", "description": "Сырое описание задачи как ты её понял от Владельца. Можно неотшлифованным — Диспетчер допишет."},
+        "target_hint": {"type": "string", "description": "Опционально: slug поста которого ты предлагаешь как исполнителя (manager / engineer / frontend / ...). Если не указано — Диспетчер выберет сам по содержанию."},
+        "expected_artifact": {"type": "string", "description": "Опционально: что должно получиться (docx / xlsx / pdf / plain-answer / sldprt)."},
+        "deadline_hint": {"type": "string", "description": "Опционально: 'сегодня' / 'к концу недели' / 'срочно'."}
       },
-      "required": ["title", "assignee_post_slug", "description"]
+      "required": ["raw_prompt"]
     }
   },
   {
@@ -147,7 +148,7 @@ tool_call с валидным JSON. Формат и схемы:
    без комментариев внутри JSON, без trailing commas. Пример вывода:
 
 <tool_call>
-{"name": "dispatch_task", "arguments": {"title": "Подготовить ответ на претензию", "assignee_post_slug": "frontend", "description": "Сформировать черновик, согласовать с юристом, выложить в Vault."}}
+{"name": "send_to_dispatcher", "arguments": {"raw_prompt": "Подготовить ответ на претензию от ООО Промтехкор. Сформировать черновик, согласовать с юристом, выложить в Vault.", "target_hint": "manager", "expected_artifact": "docx"}}
 </tool_call>
 
 3. ГДЕ РАЗМЕСТИТЬ. Можно сначала текстом объяснить Владельцу что собираешься
@@ -188,6 +189,21 @@ tool_call с валидным JSON. Формат и схемы:
     инструкция). Win = «что получилось» (конкретный случай успеха, история).
 16. **Один Vault-файл = одна тема.** Не сваливай всё в один паттерн —
     несколько маленьких лучше одного огромного.
+
+### Правила Hub-and-Spoke архитектуры (v1.0.22)
+
+H1. **Прямого dispatch_task БОЛЬШЕ НЕТ.** В v1.0.21 у тебя был tool
+    `dispatch_task` который писал напрямую в очередь поста. В v1.0.22 это
+    запрещено архитектурой — все межагентские задачи идут через Диспетчер.
+H2. **Единственный канал** — `send_to_dispatcher(raw_prompt, target_hint?, expected_artifact?, deadline_hint?)`.
+H3. **Что делает Диспетчер.** Получает твой raw_prompt, читает знания
+    предложенного поста (его CLAUDE.md + Vault), переписывает в развернутый
+    refined_prompt, и сам адресует посту. Ты видишь это в UI Диспетчера
+    как цепочку: твой raw_request → refined Диспетчером.
+H4. **Если ошибся посылая старый dispatch_task** — система автоматически
+    замапит на send_to_dispatcher с warning. Но лучше сразу новый формат.
+H5. **Posts не общаются друг с другом напрямую** — когда посты-агенты
+    появятся (Phase 11B), у них тоже будет только send_to_dispatcher.
 
 ### Правила работы со знаниями постов (read_post_knowledge / target_post)
 
@@ -395,7 +411,31 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
     }
 
     match call.name.as_str() {
-        "dispatch_task" => execute_dispatch_task(call.effective_args(), db, app).await,
+        "send_to_dispatcher" => execute_send_to_dispatcher(call.effective_args(), db, app).await,
+        // v1.0.22: legacy dispatch_task auto-mapping (Гендир по старой памяти).
+        "dispatch_task" => {
+            log::warn!("Гендир вызвал legacy dispatch_task — automap на send_to_dispatcher");
+            // Маппим title+description → raw_prompt, assignee_post_slug → target_hint
+            let legacy = call.effective_args();
+            let title = legacy.get("title").and_then(Value::as_str).unwrap_or("");
+            let descr = legacy.get("description").and_then(Value::as_str).unwrap_or("");
+            let target = legacy
+                .get("assignee_post_slug")
+                .and_then(Value::as_str)
+                .map(|s| s.to_string());
+            let raw_prompt = if title.is_empty() {
+                descr.to_string()
+            } else if descr.is_empty() {
+                title.to_string()
+            } else {
+                format!("{title}\n\n{descr}")
+            };
+            let mapped = serde_json::json!({
+                "raw_prompt": raw_prompt,
+                "target_hint": target,
+            });
+            execute_send_to_dispatcher(&mapped, db, app).await
+        }
         "create_post" => execute_create_post(call.effective_args(), db, app).await,
         "update_post" => execute_update_post(call.effective_args(), db, app).await,
         "archive_post" => execute_archive_post(call.effective_args(), db, app).await,
@@ -409,7 +449,143 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
     }
 }
 
-async fn execute_dispatch_task(
+/// v1.0.22 Phase 11C — Hub-and-Spoke entry point для Гендира.
+/// Гендир выводит сырой запрос → мы пишем raw_request в dispatcher_logs →
+/// `tokio::spawn(dispatcher_brain::process_pending)` для AI-обогащения и
+/// маршрутизации. Tool возвращает плашку Владельцу немедленно.
+async fn execute_send_to_dispatcher(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let raw_prompt = match args.get("raw_prompt").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("send_to_dispatcher: raw_prompt обязателен"),
+    };
+    let target_hint = args
+        .get("target_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let expected_artifact = args
+        .get("expected_artifact")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    let deadline_hint = args
+        .get("deadline_hint")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    // Пишем raw_request row в dispatcher_logs
+    let payload = serde_json::json!({
+        "raw_prompt": raw_prompt,
+        "target_hint": target_hint,
+        "expected_artifact": expected_artifact,
+        "deadline_hint": deadline_hint,
+    });
+    let task = match crate::commands::dispatcher::dispatch_task_inner_ex(
+        "ceo".to_string(),
+        "dispatcher".to_string(),
+        payload,
+        crate::commands::dispatcher::DispatchExtras {
+            parent_task_id: None,
+            hop_kind: Some("raw_request".to_string()),
+            routed_by_model: None,
+            refined_prompt: None,
+        },
+        db,
+        app,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => return tool_err(&format!("send_to_dispatcher: {e}")),
+    };
+
+    // Запускаем AI-Диспетчера в фоне — chat-stream Гендира не блокируется.
+    let settings = match app.try_state::<crate::settings::SettingsStore>() {
+        Some(s) => s.data.lock().unwrap().clone(),
+        None => {
+            log::warn!("send_to_dispatcher: SettingsStore not available, dispatcher not invoked");
+            return ToolExecution {
+                ui_message: format!(
+                    "⚡ Задача передана Диспетчеру (`{}`), но мозг Диспетчера ещё не инициализирован.",
+                    task.id
+                ),
+                success: true,
+            };
+        }
+    };
+
+    if !settings.dispatcher_enabled {
+        return ToolExecution {
+            ui_message: format!(
+                "⚡ Задача `{}` в Inbox Диспетчера. Auto-routing отключён — Владелец должен ручную маршрутизацию.",
+                task.id
+            ),
+            success: true,
+        };
+    }
+
+    let task_id = task.id.clone();
+    let db_clone = db.clone();
+    let app_clone = app.clone();
+    let lifecycle_arc = match app
+        .try_state::<std::sync::Arc<crate::commands::claude_bridge::DispatcherLifecycle>>(
+        ) {
+        Some(lc) => lc.inner().clone(),
+        None => {
+            log::warn!("DispatcherLifecycle not in state");
+            return ToolExecution {
+                ui_message: format!("⚡ Задача `{}` в Inbox, но lifecycle Диспетчера не готов.", task.id),
+                success: true,
+            };
+        }
+    };
+
+    tokio::spawn(async move {
+        if let Err(e) = crate::commands::dispatcher_brain::process_pending(
+            task_id.clone(),
+            db_clone,
+            settings,
+            lifecycle_arc,
+            app_clone,
+        )
+        .await
+        {
+            log::warn!("dispatcher_brain::process_pending failed for {task_id}: {e}");
+        }
+    });
+
+    let target_label = target_hint
+        .as_deref()
+        .map(|h| format!(" (предложен `{h}`)"))
+        .unwrap_or_default();
+    ToolExecution {
+        ui_message: format!(
+            "⚡ Гендир передал Диспетчеру задачу{target_label}: \"{}\"\n\n_task_id: `{}` — жду переформулировки..._",
+            truncate_for_ui(&raw_prompt, 200),
+            task.id
+        ),
+        success: true,
+    }
+}
+
+fn truncate_for_ui(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+#[allow(dead_code)] // Legacy: оставляем для возможного fallback / тестов
+async fn execute_dispatch_task_legacy(
     args: &Value,
     db: &WritePool,
     app: &AppHandle,

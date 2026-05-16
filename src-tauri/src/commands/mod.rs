@@ -1,6 +1,9 @@
 pub mod chat;
 pub mod claude_bridge;
 pub mod dispatcher;
+pub mod dispatcher_brain;
+pub mod dispatcher_tools;
+pub mod artifacts;
 pub mod hmt;
 pub mod ping;
 pub mod posts;

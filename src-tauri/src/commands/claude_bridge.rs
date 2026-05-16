@@ -166,6 +166,201 @@ pub fn ensure_mspro_ceo_agent() -> Result<PathBuf, String> {
 }
 
 // ---------------------------------------------------------------------------
+// v1.0.22 Фаза 11C — Dispatcher agent (отдельный agent.md + lifecycle)
+// ---------------------------------------------------------------------------
+
+pub const DISPATCHER_AGENT_NAME: &str = "mspro-dispatcher";
+
+const DISPATCHER_AGENT_MD: &str = r#"---
+name: mspro-dispatcher
+description: Интеллектуальный Диспетчер MSPro-Ltd Corp. Центральный Hub-and-Spoke брокер задач. Переписывает сырые запросы Гендира/постов в идеальные prompt'ы для исполнителей. Никаких native tools — только XML <tool_call>.
+tools: []
+model: claude-sonnet-4-7
+---
+
+# Интеллектуальный Диспетчер MSPro-Ltd Corp
+
+Ты — единый брокер задач между Гендиром и постами (Менеджер, Инженер,
+Главбух, ...). Прямое общение между ними **архитектурно запрещено** —
+всё проходит через тебя.
+
+На вход тебе придёт user-сообщение с блоком `# SYSTEM CONTEXT (DISPATCHER)`
+содержащим:
+- Сырой запрос от агента-источника (raw_prompt)
+- target_hint (опционально — кого предложили исполнителем)
+- expected_artifact (опционально — что должно получиться)
+- post_system_prompt + post_vault_context — знания целевого поста
+- JSON-схемы твоих собственных tools (forward_to_post, decompose_task, ...)
+
+## Твоя работа
+
+1. **Понять задачу.** Что именно хочет источник? Реально ли это? Кому
+   подходит лучше всего (если target_hint не задан)?
+2. **Переписать prompt.** Из сырого «составь письмо в Промтехкор» сделать
+   развернутый prompt с конкретными требованиями, форматом, шаблоном
+   (опираясь на post_system_prompt и post_vault_context).
+3. **Выдать tool_call.** Один из 5 вариантов:
+   - `forward_to_post(target_slug, refined_prompt, expected_artifact?, deadline_hint?)`
+   - `decompose_task({subtasks: [{target_slug, refined_prompt, ...}]})` — для сложного
+   - `escalate_to_ceo(reason)` — не могу разрулить, верни Гендиру
+   - `reject_task(reason)` — задача невыполнима / небезопасна
+   - `clarify(question_to_source)` — нужно уточнение у автора
+
+## Жёсткие правила
+
+1. **Один tool_call в ответе.** Не несколько последовательно — выбери что-то одно.
+2. **Никогда не выполняй задачу сам.** Ты — диспетчер, не исполнитель. Твоё
+   максимум — переписать prompt и адресовать. Документы пишут посты.
+3. **Никаких native tools.** `tools: []` отключает Read/Write/Bash/WebFetch.
+4. **refined_prompt — развернутый и конкретный.** Сырая задача от Гендира
+   часто короткая («сделай смету»). Твой refined_prompt должен включать:
+   - Контекст (для кого, зачем)
+   - Конкретные требования (формат, длина, стиль)
+   - Какие данные использовать из post_vault_context
+   - Какой артефакт ожидается (.docx / .xlsx / plain answer)
+5. **Reasoning** оборачивай в `<think>...</think>` — скрыт от UI.
+
+## Когда decompose_task vs forward_to_post
+
+- forward — один пост, одна задача, один артефакт
+- decompose — несколько постов работают параллельно/последовательно
+  (договор+смета+протокол разногласий = 3 subtask для одного menager поста ИЛИ
+   для разных постов).
+
+Подробные tool-схемы и формат XML — в `# SYSTEM CONTEXT (DISPATCHER)` блоке.
+"#;
+
+pub fn ensure_mspro_dispatcher_agent() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or_else(|| "cannot resolve home dir".to_string())?;
+    let dir = home.join(".claude").join("agents");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create agents dir: {e}"))?;
+    let path = dir.join(format!("{DISPATCHER_AGENT_NAME}.md"));
+    if !path.exists() {
+        std::fs::write(&path, DISPATCHER_AGENT_MD)
+            .map_err(|e| format!("write dispatcher agent: {e}"))?;
+        log::info!("v1.0.22: created Dispatcher agent file at {}", path.display());
+    }
+    Ok(path)
+}
+
+/// Отдельный lifecycle для Диспетчера — чтобы cancel-кнопка Гендира не
+/// убивала Claude-процесс Диспетчера и наоборот.
+#[derive(Default)]
+pub struct DispatcherLifecycle {
+    pub current_child_pid: AsyncMutex<Option<u32>>,
+    pub cancel: Arc<AtomicBool>,
+}
+
+/// Запускает Claude CLI для Диспетчера (другой agent + другая модель + свой lifecycle).
+/// Идентичен `run_claude_cli` но параметризован — без рефакторинга работающего
+/// CEO-runner'а. Streaming chunks emit-ятся как `dispatcher-chunk`, чтобы UI
+/// Диспетчера не путался с Гендиром.
+pub async fn run_claude_cli_for_dispatcher(
+    full_prompt: &str,
+    settings: &AppSettings,
+    lifecycle: &DispatcherLifecycle,
+    app: &AppHandle,
+) -> Result<String, String> {
+    let status = detect_claude_cli_inner(&settings.claude_cli_path).await;
+    if let ClaudeCliStatus::NotFound { error, .. } = &status {
+        return Err(format!("claude CLI недоступен: {error}"));
+    }
+
+    if let Err(e) = ensure_mspro_dispatcher_agent() {
+        log::warn!("could not ensure mspro-dispatcher agent: {e}");
+    }
+
+    let mut cmd = Command::new(&settings.claude_cli_path);
+    hide_console(&mut cmd);
+    cmd.arg("--print")
+        .arg("--output-format")
+        .arg("text")
+        .arg("--agent")
+        .arg(DISPATCHER_AGENT_NAME)
+        .arg("--model")
+        .arg(&settings.dispatcher_claude_model)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    log::info!(
+        "v1.0.22: spawning claude CLI for dispatcher (model={}, prompt_len={})",
+        settings.dispatcher_claude_model,
+        full_prompt.len()
+    );
+
+    let mut child: Child = cmd.spawn().map_err(|e| format!("claude spawn failed: {e}"))?;
+
+    if let Some(pid) = child.id() {
+        *lifecycle.current_child_pid.lock().await = Some(pid);
+    }
+    lifecycle.cancel.store(false, Ordering::Relaxed);
+
+    let mut stdin_pipe = child
+        .stdin
+        .take()
+        .ok_or_else(|| "could not open claude stdin".to_string())?;
+    if let Err(e) = stdin_pipe.write_all(full_prompt.as_bytes()).await {
+        return Err(format!("write to claude stdin: {e}"));
+    }
+    drop(stdin_pipe);
+
+    let cancel_flag = lifecycle.cancel.clone();
+    let timeout_secs = settings.dispatcher_routing_timeout_sec;
+
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not open claude stdout".to_string())?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not open claude stderr".to_string())?;
+
+    let app_for_chunk = app.clone();
+    let read_fut = async move {
+        let mut out = String::with_capacity(4096);
+        let mut buf = [0u8; 4096];
+        loop {
+            if cancel_flag.load(Ordering::Relaxed) {
+                return Err::<String, String>("cancelled".to_string());
+            }
+            match stdout_pipe.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let chunk = String::from_utf8_lossy(&buf[..n]);
+                    out.push_str(&chunk);
+                    let _ = tauri::Emitter::emit(&app_for_chunk, "dispatcher-chunk", chunk.to_string());
+                }
+                Err(e) => return Err(format!("stdout read: {e}")),
+            }
+        }
+        Ok(out)
+    };
+
+    let result = match timeout(Duration::from_secs(timeout_secs), read_fut).await {
+        Ok(Ok(text)) => Ok(text),
+        Ok(Err(e)) if e == "cancelled" => Err("cancelled".to_string()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!("dispatcher claude CLI timeout ({timeout_secs}s)")),
+    };
+
+    if result.is_err() {
+        let mut stderr_buf = String::new();
+        let _ = stderr_pipe.read_to_string(&mut stderr_buf).await;
+        if !stderr_buf.trim().is_empty() {
+            log::warn!("dispatcher claude stderr: {}", stderr_buf.trim());
+        }
+    }
+
+    let _ = child.kill().await;
+    *lifecycle.current_child_pid.lock().await = None;
+
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Main runner
 // ---------------------------------------------------------------------------
 

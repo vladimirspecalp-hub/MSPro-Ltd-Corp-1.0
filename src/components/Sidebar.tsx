@@ -53,7 +53,7 @@ export default function Sidebar({ current, onChange }: SidebarProps) {
     <nav style={containerStyle} aria-label="Главная навигация">
       <div style={headerStyle}>
         <div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>MSPro-Ltd Corp</div>
-        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.21 · Self-healing posts</div>
+        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.22 · Dispatcher Hub</div>
       </div>
       {ITEMS.map((item) => (
         <button

@@ -13,6 +13,7 @@ mod secrets;
 mod settings;
 mod updater;
 mod vault;
+mod outbox;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -62,6 +63,12 @@ fn migrations() -> Vec<Migration> {
             sql: include_str!("../migrations/05_post_knowledge.sql"),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 6,
+            description: "v1.0.22: dispatcher hub (parent_task_id, attempts_count, decisions, artifacts)",
+            sql: include_str!("../migrations/06_dispatcher_hub.sql"),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -82,6 +89,7 @@ pub fn run() {
         .manage(gateway_state.clone())
         .manage(ProcessStart(process_started))
         .manage(ChatLifecycle::default())
+        .manage(std::sync::Arc::new(commands::claude_bridge::DispatcherLifecycle::default()))
         .manage(PendingCeoResponses::default())
         .on_window_event(|window, event| {
             // Anti-zombie: when the user closes the window, set the cancel
@@ -263,6 +271,81 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             }
                         }
 
+                        // ----- v1.0.22 self-healing: dispatcher hub schema -----
+                        // Тот же шаблон что для post knowledge — bypass plugin-sql:
+                        // PRAGMA table_info + индивидуальные ALTER. Плюс CREATE TABLE
+                        // для двух новых таблиц (idempotent).
+                        let dispatcher_alters: &[(&str, &str)] = &[
+                            ("parent_task_id",  "ALTER TABLE dispatcher_logs ADD COLUMN parent_task_id TEXT DEFAULT NULL"),
+                            ("completed_at",    "ALTER TABLE dispatcher_logs ADD COLUMN completed_at DATETIME DEFAULT NULL"),
+                            ("attempts_count",  "ALTER TABLE dispatcher_logs ADD COLUMN attempts_count INTEGER NOT NULL DEFAULT 1"),
+                            ("hop_kind",        "ALTER TABLE dispatcher_logs ADD COLUMN hop_kind TEXT DEFAULT NULL"),
+                            ("routed_by_model", "ALTER TABLE dispatcher_logs ADD COLUMN routed_by_model TEXT DEFAULT NULL"),
+                            ("refined_prompt",  "ALTER TABLE dispatcher_logs ADD COLUMN refined_prompt TEXT DEFAULT NULL"),
+                            ("outbox_path",     "ALTER TABLE dispatcher_logs ADD COLUMN outbox_path TEXT DEFAULT NULL"),
+                        ];
+                        let dl_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                            sqlx::query_as("PRAGMA table_info(dispatcher_logs)")
+                                .fetch_all(&pool.0)
+                                .await
+                                .unwrap_or_default();
+                        let dl_existing: std::collections::HashSet<String> =
+                            dl_cols.into_iter().map(|c| c.1).collect();
+                        for (col, sql) in dispatcher_alters {
+                            if dl_existing.contains(*col) {
+                                continue;
+                            }
+                            match sqlx::raw_sql(sql).execute(&pool.0).await {
+                                Ok(_) => log::info!("v1.0.22 self-healing: added dispatcher_logs.{col}"),
+                                Err(e) => log::warn!("v1.0.22 self-healing: dispatcher_logs.{col} ALTER failed: {e}"),
+                            }
+                        }
+
+                        // CREATE TABLE IF NOT EXISTS для двух новых таблиц
+                        let new_tables = "\
+CREATE TABLE IF NOT EXISTS dispatcher_decisions ( \
+    id TEXT PRIMARY KEY, \
+    source_task_id TEXT NOT NULL REFERENCES dispatcher_logs(id), \
+    result_task_id TEXT REFERENCES dispatcher_logs(id), \
+    decision_kind TEXT NOT NULL CHECK (decision_kind IN ('forward','decompose','escalate','reject','clarify','retry')), \
+    reasoning TEXT, \
+    model_used TEXT NOT NULL, \
+    routing_complexity TEXT CHECK (routing_complexity IS NULL OR routing_complexity IN ('simple','complex')), \
+    elapsed_ms INTEGER, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP \
+); \
+CREATE INDEX IF NOT EXISTS idx_decisions_source ON dispatcher_decisions(source_task_id); \
+CREATE INDEX IF NOT EXISTS idx_decisions_model ON dispatcher_decisions(model_used, created_at DESC); \
+CREATE TABLE IF NOT EXISTS task_artifacts ( \
+    id TEXT PRIMARY KEY, \
+    task_id TEXT NOT NULL REFERENCES dispatcher_logs(id), \
+    rel_path TEXT NOT NULL, \
+    mime_type TEXT, \
+    size_bytes INTEGER, \
+    created_by TEXT NOT NULL, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+    approved_at DATETIME, \
+    rejected_at DATETIME, \
+    reject_reason TEXT, \
+    UNIQUE(task_id, rel_path) \
+); \
+CREATE INDEX IF NOT EXISTS idx_artifacts_task ON task_artifacts(task_id); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_parent ON dispatcher_logs(parent_task_id); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind);";
+                        match sqlx::raw_sql(new_tables).execute(&pool.0).await {
+                            Ok(_) => log::info!("v1.0.22 self-healing: dispatcher_decisions + task_artifacts ensured"),
+                            Err(e) => log::warn!("v1.0.22 self-healing: new tables: {e}"),
+                        }
+
+                        // ----- v1.0.22: Outbox directory init -----
+                        if let Some(data_dir) = db_path.parent() {
+                            let vault_root = data_dir.join("Vault");
+                            match outbox::ensure_outbox_root(&vault_root) {
+                                Ok(p) => log::info!("Outbox ready at {}", p.display()),
+                                Err(e) => log::warn!("outbox init: {e}"),
+                            }
+                        }
+
                         app_handle_for_db.manage(pool);
                     }
                     Err(e) => log::error!("open_write_pool: {e}"),
@@ -336,6 +419,9 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
             commands::qwen_bridge::detect_qwen,
             settings::set_brain_string_field,
             settings::set_auto_fallback_qwen,
+            // v1.0.22 — Dispatcher settings
+            settings::set_dispatcher_bool_field,
+            settings::set_dispatcher_max_attempts,
             // Step 5 — Security Vault (UI for DPAPI-backed secrets)
             commands::vault::vault_list_secrets,
             commands::vault::vault_add_secret,
@@ -347,6 +433,16 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
             commands::dispatcher::fail_task,
             commands::dispatcher::list_active_tasks,
             commands::dispatcher::list_recent_tasks,
+            // v1.0.22 Phase 11C — Dispatcher Hub
+            commands::dispatcher::get_task_chain,
+            commands::dispatcher::list_decisions_for_task,
+            // v1.0.22 Phase 11C — Artifacts (Outbox)
+            commands::artifacts::list_task_artifacts,
+            commands::artifacts::open_artifact_in_default_app,
+            commands::artifacts::approve_artifact,
+            commands::artifacts::reject_artifact,
+            commands::artifacts::register_external_artifact,
+            commands::artifacts::create_fake_artifact,
             // Step 6 — HMT-engine (statistics + Hubbard conditions)
             commands::hmt::add_statistic_value,
             commands::hmt::get_post_hmt,

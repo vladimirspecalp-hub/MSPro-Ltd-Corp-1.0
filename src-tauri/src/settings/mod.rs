@@ -61,6 +61,32 @@ pub struct AppSettings {
     /// back to Qwen with a system warning in chat.
     #[serde(default = "default_auto_fallback_qwen")]
     pub auto_fallback_qwen: bool,
+
+    // ─── v1.0.22 Фаза 11C: Intelligent Dispatcher Hub ─────────────────────
+    /// Master-toggle: Диспетчер активен и автоматически обрабатывает raw_request.
+    /// Если false — задачи копятся в Inbox, Владелец может ручную маршрутизацию.
+    #[serde(default = "default_dispatcher_enabled")]
+    pub dispatcher_enabled: bool,
+    /// "qwen_primary" (default — дёшево для простой маршрутизации) |
+    /// "claude_primary" (всегда Claude Sonnet — точнее, дороже).
+    #[serde(default = "default_dispatcher_brain_mode")]
+    pub dispatcher_brain_mode: String,
+    /// Qwen model для Диспетчера. Может быть та же что у Гендира (qwen3:14b).
+    #[serde(default = "default_dispatcher_qwen_model")]
+    pub dispatcher_qwen_model: String,
+    /// Claude model для Диспетчера. По умолчанию Sonnet — он дешевле Opus
+    /// и достаточно сильный для prompt rewriting / decomposition.
+    #[serde(default = "default_dispatcher_claude_model")]
+    pub dispatcher_claude_model: String,
+    /// При qwen_primary: если Qwen упал/выдал мусор — fallback на Claude.
+    #[serde(default = "default_dispatcher_auto_fallback")]
+    pub dispatcher_auto_fallback_claude: bool,
+    /// Cap на retry. После 3-й попытки Диспетчер автоматически reject_task.
+    #[serde(default = "default_dispatcher_max_attempts")]
+    pub dispatcher_max_attempts: u32,
+    /// Hard timeout (sec) на одну попытку routing-вызова.
+    #[serde(default = "default_dispatcher_routing_timeout")]
+    pub dispatcher_routing_timeout_sec: u64,
 }
 
 fn default_brain_mode() -> String { "claude_cli".to_string() }
@@ -76,6 +102,14 @@ fn default_qwen_timeout() -> u64 { 120 }
 
 fn default_auto_fallback_qwen() -> bool { true }
 
+fn default_dispatcher_enabled() -> bool { true }
+fn default_dispatcher_brain_mode() -> String { "qwen_primary".to_string() }
+fn default_dispatcher_qwen_model() -> String { "qwen3:14b".to_string() }
+fn default_dispatcher_claude_model() -> String { "claude-sonnet-4-7".to_string() }
+fn default_dispatcher_auto_fallback() -> bool { true }
+fn default_dispatcher_max_attempts() -> u32 { 3 }
+fn default_dispatcher_routing_timeout() -> u64 { 60 }
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -90,6 +124,13 @@ impl Default for AppSettings {
             qwen_model: default_qwen_model(),
             qwen_timeout_sec: default_qwen_timeout(),
             auto_fallback_qwen: default_auto_fallback_qwen(),
+            dispatcher_enabled: default_dispatcher_enabled(),
+            dispatcher_brain_mode: default_dispatcher_brain_mode(),
+            dispatcher_qwen_model: default_dispatcher_qwen_model(),
+            dispatcher_claude_model: default_dispatcher_claude_model(),
+            dispatcher_auto_fallback_claude: default_dispatcher_auto_fallback(),
+            dispatcher_max_attempts: default_dispatcher_max_attempts(),
+            dispatcher_routing_timeout_sec: default_dispatcher_routing_timeout(),
         }
     }
 }
@@ -127,6 +168,17 @@ pub async fn set_brain_string_field(
             "claude_cli_model" => g.claude_cli_model = value,
             "qwen_endpoint" => g.qwen_endpoint = value,
             "qwen_model" => g.qwen_model = value,
+            // v1.0.22 — dispatcher fields
+            "dispatcher_qwen_model" => g.dispatcher_qwen_model = value,
+            "dispatcher_claude_model" => g.dispatcher_claude_model = value,
+            "dispatcher_brain_mode" => {
+                if !matches!(value.as_str(), "qwen_primary" | "claude_primary") {
+                    return Err(format!(
+                        "invalid dispatcher_brain_mode '{value}' (allowed: qwen_primary, claude_primary)"
+                    ));
+                }
+                g.dispatcher_brain_mode = value;
+            }
             _ => return Err(format!("unknown field '{field}'")),
         }
     }
@@ -144,6 +196,41 @@ pub async fn set_auto_fallback_qwen(
     }
     state.save().map_err(|e| format!("settings save: {e}"))
 }
+
+/// v1.0.22 — универсальный setter для bool-полей Диспетчера.
+#[tauri::command]
+pub async fn set_dispatcher_bool_field(
+    field: String,
+    value: bool,
+    state: tauri::State<'_, SettingsStore>,
+) -> Result<(), String> {
+    {
+        let mut g = state.data.lock().unwrap();
+        match field.as_str() {
+            "dispatcher_enabled" => g.dispatcher_enabled = value,
+            "dispatcher_auto_fallback_claude" => g.dispatcher_auto_fallback_claude = value,
+            _ => return Err(format!("unknown bool field '{field}'")),
+        }
+    }
+    state.save().map_err(|e| format!("settings save: {e}"))
+}
+
+/// v1.0.22 — setter для max_attempts (1..=10).
+#[tauri::command]
+pub async fn set_dispatcher_max_attempts(
+    attempts: u32,
+    state: tauri::State<'_, SettingsStore>,
+) -> Result<(), String> {
+    if !(1..=10).contains(&attempts) {
+        return Err(format!("max_attempts {attempts} вне диапазона 1..=10"));
+    }
+    {
+        let mut g = state.data.lock().unwrap();
+        g.dispatcher_max_attempts = attempts;
+    }
+    state.save().map_err(|e| format!("settings save: {e}"))
+}
+
 
 /// Tauri-managed state holder so commands can mutate settings without
 /// re-reading the file each time.

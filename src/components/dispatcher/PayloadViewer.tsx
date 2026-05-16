@@ -1,5 +1,7 @@
 import { useState } from "react";
 import type { DispatcherTask } from "../views/Dispatcher";
+import ChainView from "./ChainView";
+import ArtifactsPanel from "./ArtifactsPanel";
 
 interface Props {
   task: DispatcherTask;
@@ -63,6 +65,26 @@ export default function PayloadViewer({ task, onClose }: Props) {
             )}
           </div>
         )}
+
+        {/* v1.0.22 — chain of hops */}
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 12, color: "#666", fontWeight: 600 }}>
+            🧩 Цепочка hop'ов (audit)
+          </label>
+          <div style={{ marginTop: 6 }}>
+            <ChainView taskId={task.id} />
+          </div>
+        </div>
+
+        {/* v1.0.22 — artifacts */}
+        <div style={{ marginBottom: 12 }}>
+          <label style={{ fontSize: 12, color: "#666", fontWeight: 600 }}>
+            📎 Артефакты задачи (Outbox)
+          </label>
+          <div style={{ marginTop: 6 }}>
+            <ArtifactsPanel taskId={task.id} />
+          </div>
+        </div>
 
         <label style={{ fontSize: 12, color: "#666", fontWeight: 600 }}>Payload</label>
         <pre style={pre}>{pretty}</pre>

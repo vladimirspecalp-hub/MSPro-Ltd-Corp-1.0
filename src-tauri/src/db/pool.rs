@@ -20,6 +20,7 @@ use std::path::Path;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 
+#[derive(Clone)]
 pub struct WritePool(pub SqlitePool);
 pub struct ReadonlyPool(pub SqlitePool);
 

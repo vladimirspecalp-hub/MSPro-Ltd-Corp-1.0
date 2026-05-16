@@ -12,12 +12,32 @@ export interface DispatcherTask {
   status: string;
   execution_time_ms: number | null;
   created_at: string;
+  // v1.0.22 Phase 11C — Hub-and-Spoke audit
+  parent_task_id?: string | null;
+  completed_at?: string | null;
+  attempts_count?: number | null;
+  hop_kind?: string | null;
+  routed_by_model?: string | null;
+  refined_prompt?: string | null;
+  outbox_path?: string | null;
 }
 
-type Tab = "active" | "all" | "failed";
+export interface DispatcherDecision {
+  id: string;
+  source_task_id: string;
+  result_task_id: string | null;
+  decision_kind: string;
+  reasoning: string | null;
+  model_used: string;
+  routing_complexity: string | null;
+  elapsed_ms: number | null;
+  created_at: string;
+}
+
+type Tab = "inbox" | "processing" | "awaiting" | "completed" | "failed" | "all";
 
 export default function Dispatcher() {
-  const [tab, setTab] = useState<Tab>("active");
+  const [tab, setTab] = useState<Tab>("inbox");
   const [tasks, setTasks] = useState<DispatcherTask[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -28,13 +48,25 @@ export default function Dispatcher() {
     setLoading(true);
     setError(null);
     try {
-      if (tab === "active") {
-        const list = await invoke<DispatcherTask[]>("list_active_tasks");
-        setTasks(list);
-      } else {
-        const list = await invoke<DispatcherTask[]>("list_recent_tasks", { limit: 500 });
-        setTasks(tab === "failed" ? list.filter((t) => t.status === "failed") : list);
-      }
+      // Все вкладки v1.0.22 фильтруют clientside из последних 500
+      const list = await invoke<DispatcherTask[]>("list_recent_tasks", { limit: 500 });
+      const filtered = list.filter((t) => {
+        switch (tab) {
+          case "inbox":
+            return t.hop_kind === "raw_request" && t.status === "in_progress";
+          case "processing":
+            return t.status === "in_progress" && t.hop_kind !== "raw_request";
+          case "awaiting":
+            return t.status === "in_progress" && (t.outbox_path != null && t.outbox_path !== "");
+          case "completed":
+            return t.status === "completed";
+          case "failed":
+            return t.status === "failed";
+          case "all":
+            return true;
+        }
+      });
+      setTasks(filtered);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -49,23 +81,15 @@ export default function Dispatcher() {
   useEffect(() => {
     let unlisten: UnlistenFn | null = null;
     (async () => {
-      unlisten = await listen<DispatcherTask>("dispatcher-task-changed", (event) => {
-        const t = event.payload;
-        setTasks((prev) => {
-          const matchesTab =
-            tab === "all" ||
-            (tab === "active" && (t.status === "in_progress" || t.status === "failed")) ||
-            (tab === "failed" && t.status === "failed");
-          const without = prev.filter((p) => p.id !== t.id);
-          return matchesTab ? [t, ...without] : without;
-        });
-        setOpened((cur) => (cur && cur.id === t.id ? t : cur));
+      unlisten = await listen<DispatcherTask>("dispatcher-task-changed", (_event) => {
+        // Простой refresh — фильтрация по вкладкам клиентская, проще перетянуть.
+        refresh();
       });
     })();
     return () => {
       if (unlisten) unlisten();
     };
-  }, [tab]);
+  }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const filtered = useMemo(() => {
     const q = filter.trim().toLowerCase();
@@ -88,24 +112,31 @@ export default function Dispatcher() {
         </p>
       </header>
 
-      <div style={{ display: "flex", gap: 6, marginBottom: 16 }}>
-        {(["active", "all", "failed"] as Tab[]).map((t) => (
+      <div style={{ display: "flex", gap: 6, marginBottom: 16, flexWrap: "wrap" }}>
+        {([
+          { id: "inbox" as Tab, label: "📥 Inbox" },
+          { id: "processing" as Tab, label: "⚙️ Processing" },
+          { id: "awaiting" as Tab, label: "👁 Awaiting" },
+          { id: "completed" as Tab, label: "✅ Completed" },
+          { id: "failed" as Tab, label: "❌ Failed" },
+          { id: "all" as Tab, label: "📋 Все" },
+        ]).map((t) => (
           <button
-            key={t}
+            key={t.id}
             type="button"
-            onClick={() => setTab(t)}
+            onClick={() => setTab(t.id)}
             style={{
               padding: "8px 16px",
-              background: tab === t ? "#1a1a1a" : "#fff",
-              color: tab === t ? "#fff" : "#1a1a1a",
-              border: "1px solid " + (tab === t ? "#1a1a1a" : "#ccc"),
+              background: tab === t.id ? "#1a1a1a" : "#fff",
+              color: tab === t.id ? "#fff" : "#1a1a1a",
+              border: "1px solid " + (tab === t.id ? "#1a1a1a" : "#ccc"),
               borderRadius: 6,
               cursor: "pointer",
               fontSize: 13,
               fontWeight: 600,
             }}
           >
-            {t === "active" ? "🟡 Активные" : t === "all" ? "📋 Все" : "❌ Failed"}
+            {t.label}
           </button>
         ))}
         <input
