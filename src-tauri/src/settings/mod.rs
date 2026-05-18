@@ -87,6 +87,16 @@ pub struct AppSettings {
     /// Hard timeout (sec) на одну попытку routing-вызова.
     #[serde(default = "default_dispatcher_routing_timeout")]
     pub dispatcher_routing_timeout_sec: u64,
+
+    // ---- v1.0.24 Phase 11B-1: Post Executor ----
+    /// Hard timeout (sec) на spawn пост-агента (claude.exe в Outbox sandbox).
+    /// Default 600 (10 минут) — Claude может думать + писать .docx/.xlsx через MCP.
+    #[serde(default = "default_post_executor_timeout")]
+    pub post_executor_timeout_sec: u64,
+    /// Сколько пост-агентов могут работать одновременно (per app).
+    /// Default 3 — каждый = отдельный claude.exe, RAM ~300-500 MB.
+    #[serde(default = "default_post_executor_max_concurrent")]
+    pub post_executor_max_concurrent: u32,
 }
 
 fn default_brain_mode() -> String { "claude_cli".to_string() }
@@ -110,6 +120,9 @@ fn default_dispatcher_auto_fallback() -> bool { true }
 fn default_dispatcher_max_attempts() -> u32 { 3 }
 fn default_dispatcher_routing_timeout() -> u64 { 60 }
 
+fn default_post_executor_timeout() -> u64 { 600 }
+fn default_post_executor_max_concurrent() -> u32 { 3 }
+
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
@@ -131,6 +144,8 @@ impl Default for AppSettings {
             dispatcher_auto_fallback_claude: default_dispatcher_auto_fallback(),
             dispatcher_max_attempts: default_dispatcher_max_attempts(),
             dispatcher_routing_timeout_sec: default_dispatcher_routing_timeout(),
+            post_executor_timeout_sec: default_post_executor_timeout(),
+            post_executor_max_concurrent: default_post_executor_max_concurrent(),
         }
     }
 }

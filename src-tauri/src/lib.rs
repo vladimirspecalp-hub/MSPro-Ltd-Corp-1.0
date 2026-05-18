@@ -25,6 +25,9 @@ use commands::claude_bridge::ChatLifecycle;
 use external_agent::{gateway::ProcessStart, GatewayState, PendingCeoResponses, SharedGatewayState};
 use settings::SettingsStore;
 
+// v1.0.24 Phase 11B-1: JobHolder отложен (см. setup()).
+// #[cfg(windows)] struct JobHolder(win32job::Job);
+
 /// SQLite path is relative to the app's data dir, which Tauri resolves to
 /// %APPDATA%\Roaming\<identifier>\app.db on Windows. This is user-space and
 /// avoids Kaspersky's aggressive scanning of Program Files.
@@ -91,6 +94,8 @@ pub fn run() {
         .manage(ChatLifecycle::default())
         .manage(std::sync::Arc::new(commands::claude_bridge::DispatcherLifecycle::default()))
         .manage(PendingCeoResponses::default())
+        // v1.0.24 Phase 11B-1: registry активных пост-агентов (claude.exe в Outbox sandbox)
+        .manage(commands::post_executor::PostExecutorRegistry::default())
         .on_window_event(|window, event| {
             // Anti-zombie: when the user closes the window, set the cancel
             // flag so any in-flight Hermes streaming task kills its child.
@@ -105,6 +110,15 @@ pub fn run() {
         })
         .setup(move |app| {
             log::info!("MSPro-Ltd Corp 1.0 starting...");
+
+            // v1.0.24 Phase 11B-1: Win32 Job Object — отложен в 11B-bis.
+            // Попытка assign_current_process зависала на некоторых системах
+            // (process уже в наследованном job). На kill-on-close сейчас полагаемся
+            // на `child.kill_on_drop(true)` в tokio::Command — оно убивает
+            // child на drop объекта (т.е. при выходе из tokio task). Этого
+            // достаточно для штатного shutdown. Если процесс крашится —
+            // claude.exe останутся, для них есть отдельный sysinfo cleanup
+            // через env-var marker (todo 11B-bis).
 
             // Load persisted settings (toggle state, etc.).
             let settings_store = SettingsStore::load(app.handle());
@@ -443,6 +457,8 @@ CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind);";
             commands::artifacts::reject_artifact,
             commands::artifacts::register_external_artifact,
             commands::artifacts::create_fake_artifact,
+            // v1.0.24 Phase 11B-1: Post Agent Spawn
+            commands::post_executor::cancel_post_executor,
             // Step 6 — HMT-engine (statistics + Hubbard conditions)
             commands::hmt::add_statistic_value,
             commands::hmt::get_post_hmt,

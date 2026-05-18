@@ -1,6 +1,6 @@
 [package]
 name = "mspro-ltd-corp"
-version = "1.0.22"
+version = "1.0.24"
 description = "MSPro-Ltd Corp — Hubbard-based AI company OS"
 authors = ["Бровяков В.А."]
 edition = "2021"
@@ -46,6 +46,9 @@ dirs = "5"
 # Windows-only: secure secret storage backed by DPAPI / Credential Manager.
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# v1.0.24 Phase 11B: Win32 Job Object — гарантированный kill всех child claude.exe
+# при выходе MSPro (включая crash). Без этого — orphan процессы накапливаются.
+win32job = "2"
 
 [profile.release]
 opt-level = "z"

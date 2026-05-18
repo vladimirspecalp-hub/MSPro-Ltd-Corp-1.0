@@ -406,6 +406,29 @@ pub async fn process_pending(
                 &db,
             )
             .await;
+            // v1.0.23: parent raw_request обработан — закрываем completed,
+            // дальнейшая работа продолжается в refined/subtask потомках.
+            // Исключение: clarify/escalate не закрывают (ждём ответа).
+            if matches!(*kind, "forward" | "decompose" | "reject") {
+                let close_msg = format!("dispatcher decision: {kind} ({reasoning})");
+                if *kind == "reject" {
+                    let _ = dispatcher::fail_task_inner(
+                        task.id.clone(),
+                        close_msg,
+                        &db,
+                        &app,
+                    )
+                    .await;
+                } else {
+                    let _ = dispatcher::complete_task_inner(
+                        task.id.clone(),
+                        Some(elapsed_ms as i64),
+                        &db,
+                        &app,
+                    )
+                    .await;
+                }
+            }
         }
         Err(e) => {
             let _ = dispatcher::record_decision(
@@ -417,6 +440,14 @@ pub async fn process_pending(
                 Some(complexity),
                 Some(elapsed_ms),
                 &db,
+            )
+            .await;
+            // v1.0.23: закрываем parent task (иначе застрянет in_progress навечно)
+            let _ = dispatcher::fail_task_inner(
+                task.id.clone(),
+                format!("dispatcher rejected: {e}"),
+                &db,
+                &app,
             )
             .await;
         }
@@ -436,14 +467,83 @@ async fn execute_forward(
     db: &WritePool,
     app: &AppHandle,
 ) -> Result<(&'static str, Option<String>, String), String> {
-    let target = args
-        .get("target_slug")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "forward_to_post: target_slug missing".to_string())?;
     let refined = args
         .get("refined_prompt")
         .and_then(Value::as_str)
         .ok_or_else(|| "forward_to_post: refined_prompt missing".to_string())?;
+
+    // v1.0.23: если Opus забыл target_slug — пробуем три fallback'а по очереди:
+    // 1) parent.payload.target_hint (если Гендир указал)
+    // 2) Любой реальный slug встретившийся в refined_prompt или raw_prompt
+    // 3) Если только один активный пост в БД — берём его
+    let target_owned: String;
+    let target: &str = match args.get("target_slug").and_then(Value::as_str) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => {
+            // 1) target_hint
+            let hint = serde_json::from_str::<Value>(&parent.task_payload)
+                .ok()
+                .and_then(|v| {
+                    v.get("target_hint")
+                        .and_then(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                });
+            if let Some(h) = hint {
+                log::warn!(
+                    "dispatcher: forward target_slug missing, fallback to parent target_hint='{h}'"
+                );
+                target_owned = h;
+                &target_owned
+            } else {
+                // 2) ищем слаг любого active поста в refined_prompt / raw_prompt
+                let raw = serde_json::from_str::<Value>(&parent.task_payload)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("raw_prompt")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                let haystack = format!("{} {}", refined.to_lowercase(), raw.to_lowercase());
+
+                let slugs: Vec<(String,)> =
+                    sqlx::query_as("SELECT slug FROM posts WHERE status = 'active'")
+                        .fetch_all(&db.0)
+                        .await
+                        .map_err(|e| format!("posts lookup: {e}"))?;
+
+                let mut matched: Option<String> = None;
+                for (s,) in &slugs {
+                    if haystack.contains(&s.to_lowercase()) {
+                        matched = Some(s.clone());
+                        break;
+                    }
+                }
+
+                if let Some(m) = matched {
+                    log::warn!(
+                        "dispatcher: forward target_slug missing, extracted slug='{m}' from prompts"
+                    );
+                    target_owned = m;
+                    &target_owned
+                } else if slugs.len() == 1 {
+                    // 3) одиночный пост → fallback на него
+                    log::warn!(
+                        "dispatcher: forward target_slug missing, only-one-post fallback to '{}'",
+                        slugs[0].0
+                    );
+                    target_owned = slugs[0].0.clone();
+                    &target_owned
+                } else {
+                    return Err(format!(
+                        "forward_to_post: target_slug missing; не нашёл ни target_hint, ни упоминание slug в prompts. Активных постов: {}",
+                        slugs.len()
+                    ));
+                }
+            }
+        }
+    };
     let expected_artifact = args.get("expected_artifact").and_then(Value::as_str);
 
     // Проверка существования поста
@@ -479,12 +579,21 @@ async fn execute_forward(
     )
     .await?;
 
-    // Обновляем parent — отмечаем что он принят в обработку (in_progress остаётся,
-    // но визуально UI поймёт по наличию refined-ребёнка что raw_request обработан).
+    // v1.0.24 Phase 11B-1: auto-trigger пост-агента. Non-blocking — refined task
+    // получает реальный мозг (claude.exe со своим agent.md в Outbox sandbox).
+    // Без этого refined task висел бы in_progress вечно (старый bug 11C).
+    crate::commands::post_executor::trigger_post_executor(
+        new_task.id.clone(),
+        target.to_string(),
+        refined.to_string(),
+        expected_artifact.map(str::to_string),
+        app.clone(),
+    );
+
     Ok((
         "forward",
         Some(new_task.id.clone()),
-        format!("forward → `{target}` (refined len {} chars)", refined.len()),
+        format!("forward → `{target}` + spawned post-agent (refined len {} chars)", refined.len()),
     ))
 }
 
@@ -539,6 +648,20 @@ async fn execute_decompose(
             app,
         )
         .await?;
+
+        // v1.0.24 Phase 11B-1: каждый subtask тоже spawn'ит реальный пост-агент.
+        let expected_artifact = st
+            .get("expected_artifact")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        crate::commands::post_executor::trigger_post_executor(
+            new_task.id.clone(),
+            target.to_string(),
+            refined.to_string(),
+            expected_artifact,
+            app.clone(),
+        );
+
         created_ids.push(new_task.id);
     }
 

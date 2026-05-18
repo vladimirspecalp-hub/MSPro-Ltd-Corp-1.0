@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "mspro-ltd-corp"
-version = "1.0.22"
+version = "1.0.24"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2239,6 +2239,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "uuid",
+ "win32job",
 ]
 
 [[package]]
@@ -5601,6 +5602,16 @@ checksum = "5d4a4db5077702ca3015d3d02d74974948aba2ad9e12ab7df718ee64ccd7e97d"
 dependencies = [
  "libredox",
  "wasite",
+]
+
+[[package]]
+name = "win32job"
+version = "2.0.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8c6a6724ccfbf34154a8691bd868b0fcd2be2ca3f7b47b32614654f1a01b191c"
+dependencies = [
+ "thiserror 1.0.69",
+ "windows 0.61.3",
 ]
 
 [[package]]

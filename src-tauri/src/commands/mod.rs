@@ -4,6 +4,7 @@ pub mod dispatcher;
 pub mod dispatcher_brain;
 pub mod dispatcher_tools;
 pub mod artifacts;
+pub mod post_executor;
 pub mod hmt;
 pub mod ping;
 pub mod posts;
