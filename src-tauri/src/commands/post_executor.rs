@@ -220,6 +220,10 @@ async fn run_claude_cli_for_post(
         .arg(&agent_name)
         .arg("--model")
         .arg(&model)
+        // v1.0.24-fix: без этого флага Claude CLI в --print режиме отказывается
+        // вызывать Write/Edit/Bash tools без интерактивного подтверждения.
+        // Безопасно — cwd жёстко ограничен sandbox-папкой Outbox/<task_id>/.
+        .arg("--dangerously-skip-permissions")
         .current_dir(&task_dir)
         .env("MSPRO_TASK_ID", task_id)
         .stdin(Stdio::piped())
