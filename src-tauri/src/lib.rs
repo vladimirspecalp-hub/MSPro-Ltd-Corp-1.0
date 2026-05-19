@@ -7,6 +7,8 @@
 //                CEO chat skeleton, sql/query RPC method.
 
 mod commands;
+#[cfg(windows)]
+mod com_server;
 mod db;
 mod external_agent;
 mod secrets;
@@ -106,6 +108,13 @@ pub fn run() {
                         .store(true, std::sync::atomic::Ordering::Relaxed);
                     log::info!("CloseRequested: ChatLifecycle.cancel set");
                 }
+                // v1.0.27 Phase 11D fix Bug A2: graceful shutdown COM server STA thread.
+                #[cfg(windows)]
+                {
+                    if let Some(state) = window.app_handle().try_state::<std::sync::Arc<com_server::ComServerThreadId>>() {
+                        com_server::post_shutdown(&state.0);
+                    }
+                }
             }
         })
         .setup(move |app| {
@@ -124,6 +133,28 @@ pub fn run() {
             let settings_store = SettingsStore::load(app.handle());
             let auto_start = settings_store.data.lock().unwrap().external_agent_enabled;
             app.manage(settings_store);
+
+            // ===== v1.0.27 Phase 11D Sub-D1 — COM Server foundation =====
+            // Запускаем STA thread с CoInitialize + message pump + WM_QUIT shutdown
+            // hook. Реальная IDispatch регистрация — Sub-D1b. Foundation позволяет:
+            //   * Cargo deps подтянуты ✓
+            //   * Thread lifecycle (start/stop) работает ✓
+            //   * post_shutdown через WM_QUIT при CloseRequested ✓
+            //   * Detect elevation + warning лог если MSPro `Run as Admin` ✓
+            #[cfg(windows)]
+            {
+                let com_thread_id = std::sync::Arc::new(com_server::ComServerThreadId::default());
+                let (com_cmd_tx, _com_cmd_rx) = std::sync::mpsc::channel::<com_server::ComCommand>();
+                let tid_slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+                let _com_join = com_server::spawn_com_server(com_cmd_tx, tid_slot.clone());
+                // Перекладываем shared TID в state structure для CloseRequested handler
+                if let Ok(s) = tid_slot.lock() {
+                    if let Ok(mut t) = com_thread_id.0.lock() {
+                        *t = *s;
+                    }
+                }
+                app.manage(com_thread_id);
+            }
 
             // ----- Step 3: open Rust-side sqlx pools -----
             //

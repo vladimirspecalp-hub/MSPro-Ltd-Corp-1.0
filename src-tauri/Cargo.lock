@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "mspro-ltd-corp"
-version = "1.0.24"
+version = "1.0.25"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2240,6 +2240,9 @@ dependencies = [
  "tokio-tungstenite",
  "uuid",
  "win32job",
+ "windows 0.61.3",
+ "windows-core 0.61.2",
+ "windows-implement 0.60.2",
 ]
 
 [[package]]

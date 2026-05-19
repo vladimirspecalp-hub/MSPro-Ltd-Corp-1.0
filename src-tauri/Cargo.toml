@@ -1,6 +1,6 @@
 [package]
 name = "mspro-ltd-corp"
-version = "1.0.25"
+version = "1.0.27"
 description = "MSPro-Ltd Corp — Hubbard-based AI company OS"
 authors = ["Бровяков В.А."]
 edition = "2021"
@@ -49,6 +49,22 @@ keyring = { version = "3", features = ["windows-native"] }
 # v1.0.24 Phase 11B: Win32 Job Object — гарантированный kill всех child claude.exe
 # при выходе MSPro (включая crash). Без этого — orphan процессы накапливаются.
 win32job = "2"
+# v1.0.27 Phase 11D: COM Server (Out-of-Process Local) — MSProLtdCorp.Application
+# для Dispatch из Python/VBA/PowerShell. См. план Фазы 11D.
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+    "Win32_UI_WindowsAndMessaging",
+] }
+# windows-implement crate выделен отдельно (не feature в windows 0.61+)
+windows-implement = "0.60"
+windows-core = "0.61"
 
 [profile.release]
 opt-level = "z"
