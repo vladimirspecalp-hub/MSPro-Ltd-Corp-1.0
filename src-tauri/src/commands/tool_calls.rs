@@ -136,6 +136,17 @@ tool_call с валидным JSON. Формат и схемы:
       },
       "required": ["post_slug"]
     }
+  },
+  {
+    "name": "read_hmt_topic",
+    "description": "Читает справочник HMT (Hubbard Management Technology) по теме. Вызывай когда нужна детальная справка по управлению: формулы состояний, оргсхема, ЦКП, статистики, обязанности, координация, планирование.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "topic": {"type": "string", "description": "Тема: оргсхема-8-отделений, цкп, обязанности-владельца, обязанности-руководителя, статистики, формулы-состояний, координация, стратегическое-планирование, финансовое-планирование"}
+      },
+      "required": ["topic"]
+    }
   }
 ]
 </tools>
@@ -375,22 +386,42 @@ fn strip_code_fence(s: &str) -> String {
 /// Перехватывает `<tool_call>` блоки из ответа Гендира, исполняет их,
 /// возвращает (cleaned_text, executions). Безопасно при отсутствии инструментов
 /// — просто вернёт оригинальный текст и пустой Vec.
+/// Returns (cleaned_text, executions, knowledge_appendix).
+/// `knowledge_appendix` contains read_hmt_topic results that should be appended
+/// to the CEO reply text (so it persists in chat history for future context).
 pub async fn intercept_and_execute(
     raw: &str,
     db: &WritePool,
     app: &AppHandle,
-) -> (String, Vec<ToolExecution>) {
+) -> (String, Vec<ToolExecution>, String) {
     let (cleaned, calls) = parse_tool_calls(raw);
     if calls.is_empty() {
-        return (cleaned, Vec::new());
+        return (cleaned, Vec::new(), String::new());
     }
 
     let mut executions = Vec::with_capacity(calls.len());
+    let mut knowledge = String::new();
     for call in calls {
-        let exec = execute(call, db, app).await;
-        executions.push(exec);
+        if call.name == "read_hmt_topic" {
+            let exec = execute_read_hmt_topic(call.effective_args(), app);
+            if exec.success {
+                knowledge.push_str("\n\n---\n📖 ");
+                knowledge.push_str(&exec.ui_message);
+                let topic = call.effective_args()
+                    .get("topic").and_then(Value::as_str).unwrap_or("?");
+                executions.push(ToolExecution {
+                    ui_message: format!("⚡ Справочник HMT «{topic}» загружен"),
+                    success: true,
+                });
+            } else {
+                executions.push(exec);
+            }
+        } else {
+            let exec = execute(call, db, app).await;
+            executions.push(exec);
+        }
     }
-    (cleaned, executions)
+    (cleaned, executions, knowledge)
 }
 
 async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecution {
@@ -1183,6 +1214,24 @@ async fn execute_read_post_knowledge(
     ToolExecution {
         ui_message: body,
         success: true,
+    }
+}
+
+fn execute_read_hmt_topic(args: &Value, app: &AppHandle) -> ToolExecution {
+    let topic = match args.get("topic").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("read_hmt_topic: topic обязателен"),
+    };
+    let vault_state = match app.try_state::<crate::vault::VaultState>() {
+        Some(s) => s,
+        None => return tool_err("read_hmt_topic: VaultState не инициализирован"),
+    };
+    match crate::vault::read_hmt_topic(&vault_state.root, &topic) {
+        Ok(content) => ToolExecution {
+            ui_message: format!("Справочник HMT «{topic}»:\n\n{content}"),
+            success: true,
+        },
+        Err(e) => tool_err(&format!("read_hmt_topic: {e}")),
     }
 }
 

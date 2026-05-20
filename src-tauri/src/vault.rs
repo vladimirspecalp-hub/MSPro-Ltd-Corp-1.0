@@ -34,6 +34,10 @@ const IMPORT_MAX_FILES: usize = 500;
 pub const PATTERNS_DIR: &str = "02-Patterns";
 pub const WINS_DIR: &str = "04-Wins";
 
+/// v1.0.30: база знаний HMT (Hubbard Management Technology).
+/// Seed-файлы вкомпилированы через `include_str!` и записываются при первом запуске.
+pub const KNOWLEDGE_DIR: &str = "01-HMT-Knowledge";
+
 /// v1.0.19: общий контейнер для пер-постовых Vault-ов. Изолирован от
 /// корневых `02-Patterns`/`04-Wins` Гендира — `read_vault_context` его не
 /// читает (он сканирует только конкретные плоские директории корня).
@@ -50,6 +54,8 @@ pub struct VaultState {
 pub fn ensure_vault_dirs(root: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(root.join(PATTERNS_DIR))?;
     std::fs::create_dir_all(root.join(WINS_DIR))?;
+    std::fs::create_dir_all(root.join(KNOWLEDGE_DIR))?;
+    seed_hmt_knowledge(&root.join(KNOWLEDGE_DIR));
     Ok(())
 }
 
@@ -486,6 +492,104 @@ fn walk_copy_md(
         *copied += 1;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// v1.0.30: HMT Knowledge Base — seed + read
+// ---------------------------------------------------------------------------
+
+const TOPIC_FILES: &[(&str, &str)] = &[
+    ("оргсхема-8-отделений", "01-оргсхема-8-отделений.md"),
+    ("цкп", "02-цкп.md"),
+    ("обязанности-владельца", "03-обязанности-владельца.md"),
+    ("обязанности-руководителя", "04-обязанности-руководителя.md"),
+    ("статистики", "05-статистики.md"),
+    ("формулы-состояний", "06-формулы-состояний.md"),
+    ("координация", "07-координация.md"),
+    ("стратегическое-планирование", "08-стратегическое-планирование.md"),
+    ("финансовое-планирование", "09-финансовое-планирование.md"),
+];
+
+const SEED_FILES: &[(&str, &str)] = &[
+    ("00-INDEX.md", include_str!("../resources/hmt/00-INDEX.md")),
+    ("01-оргсхема-8-отделений.md", include_str!("../resources/hmt/01-оргсхема-8-отделений.md")),
+    ("02-цкп.md", include_str!("../resources/hmt/02-цкп.md")),
+    ("03-обязанности-владельца.md", include_str!("../resources/hmt/03-обязанности-владельца.md")),
+    ("04-обязанности-руководителя.md", include_str!("../resources/hmt/04-обязанности-руководителя.md")),
+    ("05-статистики.md", include_str!("../resources/hmt/05-статистики.md")),
+    ("06-формулы-состояний.md", include_str!("../resources/hmt/06-формулы-состояний.md")),
+    ("07-координация.md", include_str!("../resources/hmt/07-координация.md")),
+    ("08-стратегическое-планирование.md", include_str!("../resources/hmt/08-стратегическое-планирование.md")),
+    ("09-финансовое-планирование.md", include_str!("../resources/hmt/09-финансовое-планирование.md")),
+];
+
+fn seed_hmt_knowledge(dir: &Path) {
+    let has_md = std::fs::read_dir(dir)
+        .ok()
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.path()
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|e| e.eq_ignore_ascii_case("md"))
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if has_md {
+        return;
+    }
+    log::info!("vault: seeding HMT knowledge ({} files)", SEED_FILES.len());
+    for (name, content) in SEED_FILES {
+        if let Err(e) = std::fs::write(dir.join(name), content) {
+            log::warn!("vault: seed write {name}: {e}");
+        }
+    }
+}
+
+/// Читает `01-HMT-Knowledge/00-INDEX.md` для инжекции в system prompt.
+pub fn read_knowledge_index(root: &Path) -> String {
+    let path = root.join(KNOWLEDGE_DIR).join("00-INDEX.md");
+    match std::fs::read_to_string(&path) {
+        Ok(s) => {
+            let limit = 2048;
+            if s.len() <= limit {
+                s
+            } else {
+                let end = floor_char_boundary(&s, limit);
+                format!("{}…[обрезано]", &s[..end])
+            }
+        }
+        Err(_) => String::new(),
+    }
+}
+
+/// Читает справочник HMT по slug. Slug → точный путь через TOPIC_FILES.
+pub fn read_hmt_topic(root: &Path, slug: &str) -> Result<String, String> {
+    let filename = TOPIC_FILES
+        .iter()
+        .find(|(s, _)| *s == slug)
+        .map(|(_, f)| *f)
+        .ok_or_else(|| format!("неизвестная тема: '{slug}'. Доступные: {}", available_topics()))?;
+
+    let path = root.join(KNOWLEDGE_DIR).join(filename);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| format!("не удалось прочитать {filename}: {e}"))?;
+
+    if content.len() <= PER_FILE_BYTES {
+        Ok(content)
+    } else {
+        let end = floor_char_boundary(&content, PER_FILE_BYTES);
+        Ok(format!("{}…[обрезано]", &content[..end]))
+    }
+}
+
+fn available_topics() -> String {
+    TOPIC_FILES
+        .iter()
+        .map(|(s, _)| *s)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 // ---------------------------------------------------------------------------

@@ -1,6 +1,6 @@
 [package]
 name = "mspro-ltd-corp"
-version = "1.0.28"
+version = "1.0.30"
 description = "MSPro-Ltd Corp — Hubbard-based AI company OS"
 authors = ["Бровяков В.А."]
 edition = "2021"
