@@ -266,6 +266,67 @@ fn build_extended_content(text: &str, items: &[AttachmentItem]) -> String {
     sb
 }
 
+// ---------------------------------------------------------------------------
+// Conversation history for brain context
+// ---------------------------------------------------------------------------
+
+/// Загружает последние N owner/ceo сообщений из БД (без системных плашек ⚡/⚠️/⏹),
+/// исключая только что вставленное owner-сообщение (оно уже в `# USER`).
+async fn fetch_chat_history(
+    db: &WritePool,
+    exclude_id: &str,
+    turns: u32,
+) -> Result<Vec<ChatMessage>, String> {
+    let turns = turns.min(100);
+    if turns == 0 {
+        return Ok(vec![]);
+    }
+    let max_messages = (turns as i64) * 2;
+    let rows: Vec<ChatMessage> = sqlx::query_as(
+        "SELECT id, role, content, created_at
+         FROM chat_messages
+         WHERE role IN ('owner', 'ceo') AND id != ?
+         ORDER BY created_at DESC
+         LIMIT ?",
+    )
+    .bind(exclude_id)
+    .bind(max_messages)
+    .fetch_all(&db.0)
+    .await
+    .map_err(|e| format!("fetch_chat_history: {e}"))?;
+
+    // Rust-side фильтр системных плашек (role='ceo' но content = ⚡/⚠️/⏹).
+    let mut filtered: Vec<ChatMessage> = rows
+        .into_iter()
+        .filter(|m| {
+            if m.role != "ceo" {
+                return true;
+            }
+            let c = m.content.trim_start();
+            !c.starts_with('⚡') && !c.starts_with('⚠') && !c.starts_with('⏹')
+        })
+        .collect();
+    filtered.reverse(); // хронологический порядок
+    Ok(filtered)
+}
+
+/// Форматирует историю как текстовый блок для Claude CLI prompt.
+fn format_history_for_cli(history: &[ChatMessage]) -> String {
+    if history.is_empty() {
+        return String::new();
+    }
+    let mut sb = String::from("# CONVERSATION HISTORY\n\n");
+    for msg in history {
+        let label = match msg.role.as_str() {
+            "owner" => "OWNER",
+            "ceo" => "CEO",
+            _ => continue,
+        };
+        sb.push_str(&format!("[{}]: {}\n\n", label, msg.content));
+    }
+    sb
+}
+
 #[tauri::command]
 pub async fn send_chat_message(
     content: String,
@@ -327,11 +388,34 @@ pub async fn send_chat_message(
     // 3. Branch on brain_mode (Step 10 — двухконтурный мозг).
     let snapshot = settings.data.lock().unwrap().clone();
 
-    // Для Claude CLI собираем prompt как один блок (system + user) — это
-    // подаётся в stdin. Структура: "# SYSTEM CONTEXT\n<system_prompt>\n\n# USER\n<user>"
-    let bundled_for_cli = format!(
-        "# SYSTEM CONTEXT (MSPro-Ltd Corp)\n\n{system_prompt}\n\n# USER\n\n{brain_content}"
+    // 2b. Conversation history — последние N turn'ов для контекста диалога.
+    let history = fetch_chat_history(&db, &user_id, snapshot.chat_history_turns).await?;
+    log::info!(
+        "CEO chat: history_msgs={}, turns_setting={}",
+        history.len(),
+        snapshot.chat_history_turns
     );
+
+    // Для Claude CLI собираем prompt как один блок (system + history + user).
+    let history_block = format_history_for_cli(&history);
+    let bundled_for_cli = if history_block.is_empty() {
+        format!(
+            "# SYSTEM CONTEXT (MSPro-Ltd Corp)\n\n{system_prompt}\n\n# USER\n\n{brain_content}"
+        )
+    } else {
+        format!(
+            "# SYSTEM CONTEXT (MSPro-Ltd Corp)\n\n{system_prompt}\n\n{history_block}# USER\n\n{brain_content}"
+        )
+    };
+
+    // Конвертация для Qwen (избегаем cyclic import — BrainHistoryMsg в qwen_bridge).
+    let history_for_qwen: Vec<qwen_bridge::BrainHistoryMsg> = history
+        .iter()
+        .map(|m| qwen_bridge::BrainHistoryMsg {
+            role: &m.role,
+            content: &m.content,
+        })
+        .collect();
 
     let primary_result = match snapshot.brain_mode.as_str() {
         "claude_external" => {
@@ -339,6 +423,7 @@ pub async fn send_chat_message(
                 &user_id,
                 &brain_content,
                 &system_prompt,
+                &history,
                 &snapshot,
                 &pending,
                 &gateway,
@@ -350,6 +435,7 @@ pub async fn send_chat_message(
             qwen_bridge::run_qwen(
                 &system_prompt,
                 &brain_content,
+                &history_for_qwen,
                 &snapshot,
                 &lifecycle,
                 &app,
@@ -382,6 +468,7 @@ pub async fn send_chat_message(
             match qwen_bridge::run_qwen(
                 &system_prompt,
                 &brain_content,
+                &history_for_qwen,
                 &snapshot,
                 &lifecycle,
                 &app,
@@ -545,6 +632,7 @@ async fn run_claude_external(
     user_id: &str,
     user_text: &str,
     system_prompt: &str,
+    history: &[ChatMessage],
     snapshot: &crate::settings::AppSettings,
     pending: &State<'_, PendingCeoResponses>,
     gateway: &State<'_, SharedGatewayState>,
@@ -568,12 +656,17 @@ async fn run_claude_external(
     //   { "event": "ceo-question", "id": "<placeholder_id>",
     //     "user_message_id": "<user_id>", "content": "<user_text>",
     //     "system": "<full org context>" }
+    let history_json: Vec<serde_json::Value> = history
+        .iter()
+        .map(|m| serde_json::json!({"role": &m.role, "content": &m.content}))
+        .collect();
     let envelope = serde_json::json!({
         "event": "ceo-question",
         "id": placeholder_id,
         "user_message_id": user_id,
         "content": user_text,
         "system": system_prompt,
+        "history": history_json,
     });
     let payload = envelope.to_string();
     let receivers = gateway.events.send(payload.clone()).unwrap_or(0);
@@ -660,10 +753,12 @@ pub async fn list_chat_history(
 ) -> Result<Vec<ChatMessage>, String> {
     let limit = limit.clamp(1, 1000) as i64;
     sqlx::query_as::<_, ChatMessage>(
-        "SELECT id, role, content, created_at
-         FROM chat_messages
-         ORDER BY created_at ASC
-         LIMIT ?",
+        "SELECT id, role, content, created_at FROM (
+             SELECT id, role, content, created_at
+             FROM chat_messages
+             ORDER BY created_at DESC
+             LIMIT ?
+         ) ORDER BY created_at ASC",
     )
     .bind(limit)
     .fetch_all(&db.0)

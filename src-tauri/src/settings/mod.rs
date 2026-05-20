@@ -62,6 +62,10 @@ pub struct AppSettings {
     #[serde(default = "default_auto_fallback_qwen")]
     pub auto_fallback_qwen: bool,
 
+    /// Сколько последних turn'ов диалога подмешивать в prompt CEO (0 = stateless).
+    #[serde(default = "default_chat_history_turns")]
+    pub chat_history_turns: u32,
+
     // ─── v1.0.22 Фаза 11C: Intelligent Dispatcher Hub ─────────────────────
     /// Master-toggle: Диспетчер активен и автоматически обрабатывает raw_request.
     /// Если false — задачи копятся в Inbox, Владелец может ручную маршрутизацию.
@@ -111,6 +115,7 @@ fn default_qwen_model() -> String { "qwen3:14b".to_string() }
 fn default_qwen_timeout() -> u64 { 120 }
 
 fn default_auto_fallback_qwen() -> bool { true }
+fn default_chat_history_turns() -> u32 { 20 }
 
 fn default_dispatcher_enabled() -> bool { true }
 fn default_dispatcher_brain_mode() -> String { "qwen_primary".to_string() }
@@ -137,6 +142,7 @@ impl Default for AppSettings {
             qwen_model: default_qwen_model(),
             qwen_timeout_sec: default_qwen_timeout(),
             auto_fallback_qwen: default_auto_fallback_qwen(),
+            chat_history_turns: default_chat_history_turns(),
             dispatcher_enabled: default_dispatcher_enabled(),
             dispatcher_brain_mode: default_dispatcher_brain_mode(),
             dispatcher_qwen_model: default_dispatcher_qwen_model(),

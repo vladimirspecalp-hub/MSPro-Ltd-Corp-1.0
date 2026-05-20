@@ -120,15 +120,25 @@ struct StreamDelta {
 }
 
 // ---------------------------------------------------------------------------
+// History type (defined here to avoid cyclic import chat ↔ qwen_bridge)
+// ---------------------------------------------------------------------------
+
+pub struct BrainHistoryMsg<'a> {
+    pub role: &'a str,    // "owner" | "ceo"
+    pub content: &'a str,
+}
+
+// ---------------------------------------------------------------------------
 // Main runner
 // ---------------------------------------------------------------------------
 
-/// Отправляет system + user prompt на локальный OpenAI-compat endpoint
+/// Отправляет system + history + user prompt на локальный OpenAI-compat endpoint
 /// (Ollama / LM Studio), стримит ответ через SSE, эмитит `ceo-chunk` для UI,
 /// возвращает полный текст ответа после `data: [DONE]`.
 pub async fn run_qwen(
     system_prompt: &str,
     user_text: &str,
+    history: &[BrainHistoryMsg<'_>],
     settings: &AppSettings,
     lifecycle: &ChatLifecycle,
     app: &AppHandle,
@@ -138,18 +148,27 @@ pub async fn run_qwen(
         settings.qwen_endpoint.trim_end_matches('/')
     );
 
+    let mut messages = vec![ChatMessage {
+        role: "system",
+        content: system_prompt,
+    }];
+    for msg in history {
+        messages.push(ChatMessage {
+            role: match msg.role {
+                "owner" => "user",
+                _ => "assistant",
+            },
+            content: msg.content,
+        });
+    }
+    messages.push(ChatMessage {
+        role: "user",
+        content: user_text,
+    });
+
     let body = ChatRequest {
         model: &settings.qwen_model,
-        messages: vec![
-            ChatMessage {
-                role: "system",
-                content: system_prompt,
-            },
-            ChatMessage {
-                role: "user",
-                content: user_text,
-            },
-        ],
+        messages,
         stream: true,
         temperature: 0.3,
         max_tokens: 4096,

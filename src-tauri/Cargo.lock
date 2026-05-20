@@ -2213,7 +2213,7 @@ dependencies = [
 
 [[package]]
 name = "mspro-ltd-corp"
-version = "1.0.25"
+version = "1.0.27"
 dependencies = [
  "base64 0.22.1",
  "chrono",
