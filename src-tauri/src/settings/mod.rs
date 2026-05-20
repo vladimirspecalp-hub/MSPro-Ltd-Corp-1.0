@@ -92,6 +92,15 @@ pub struct AppSettings {
     #[serde(default = "default_dispatcher_routing_timeout")]
     pub dispatcher_routing_timeout_sec: u64,
 
+    // ---- v1.0.30: Context window sizes for dynamic history budget ----
+    /// Claude context window size in tokens. Used by context_assembler to
+    /// calculate how much chat history fits alongside system prompt.
+    #[serde(default = "default_claude_context_tokens")]
+    pub claude_context_tokens: u32,
+    /// Qwen context window size in tokens.
+    #[serde(default = "default_qwen_context_tokens")]
+    pub qwen_context_tokens: u32,
+
     // ---- v1.0.24 Phase 11B-1: Post Executor ----
     /// Hard timeout (sec) на spawn пост-агента (claude.exe в Outbox sandbox).
     /// Default 600 (10 минут) — Claude может думать + писать .docx/.xlsx через MCP.
@@ -116,6 +125,9 @@ fn default_qwen_timeout() -> u64 { 120 }
 
 fn default_auto_fallback_qwen() -> bool { true }
 fn default_chat_history_turns() -> u32 { 20 }
+
+fn default_claude_context_tokens() -> u32 { 200_000 }
+fn default_qwen_context_tokens() -> u32 { 32_000 }
 
 fn default_dispatcher_enabled() -> bool { true }
 fn default_dispatcher_brain_mode() -> String { "qwen_primary".to_string() }
@@ -143,6 +155,8 @@ impl Default for AppSettings {
             qwen_timeout_sec: default_qwen_timeout(),
             auto_fallback_qwen: default_auto_fallback_qwen(),
             chat_history_turns: default_chat_history_turns(),
+            claude_context_tokens: default_claude_context_tokens(),
+            qwen_context_tokens: default_qwen_context_tokens(),
             dispatcher_enabled: default_dispatcher_enabled(),
             dispatcher_brain_mode: default_dispatcher_brain_mode(),
             dispatcher_qwen_model: default_dispatcher_qwen_model(),

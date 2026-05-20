@@ -9,6 +9,7 @@
 mod commands;
 #[cfg(windows)]
 mod com_server;
+mod context_assembler;
 mod db;
 mod external_agent;
 mod secrets;

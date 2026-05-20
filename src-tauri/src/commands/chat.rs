@@ -68,7 +68,7 @@ struct PostRow {
 /// company by name without external lookups. Also injects:
 ///  - HMT-engine: текущие Состояния постов (Step 6)
 ///  - Vault: накопленный опыт компании из файловой памяти (Step 7 Этап 1)
-async fn build_ceo_system_prompt(
+pub async fn build_ceo_system_prompt(
     db: &WritePool,
     app: &AppHandle,
 ) -> Result<String, String> {
@@ -266,67 +266,6 @@ fn build_extended_content(text: &str, items: &[AttachmentItem]) -> String {
     sb
 }
 
-// ---------------------------------------------------------------------------
-// Conversation history for brain context
-// ---------------------------------------------------------------------------
-
-/// Загружает последние N owner/ceo сообщений из БД (без системных плашек ⚡/⚠️/⏹),
-/// исключая только что вставленное owner-сообщение (оно уже в `# USER`).
-async fn fetch_chat_history(
-    db: &WritePool,
-    exclude_id: &str,
-    turns: u32,
-) -> Result<Vec<ChatMessage>, String> {
-    let turns = turns.min(100);
-    if turns == 0 {
-        return Ok(vec![]);
-    }
-    let max_messages = (turns as i64) * 2;
-    let rows: Vec<ChatMessage> = sqlx::query_as(
-        "SELECT id, role, content, created_at
-         FROM chat_messages
-         WHERE role IN ('owner', 'ceo') AND id != ?
-         ORDER BY created_at DESC
-         LIMIT ?",
-    )
-    .bind(exclude_id)
-    .bind(max_messages)
-    .fetch_all(&db.0)
-    .await
-    .map_err(|e| format!("fetch_chat_history: {e}"))?;
-
-    // Rust-side фильтр системных плашек (role='ceo' но content = ⚡/⚠️/⏹).
-    let mut filtered: Vec<ChatMessage> = rows
-        .into_iter()
-        .filter(|m| {
-            if m.role != "ceo" {
-                return true;
-            }
-            let c = m.content.trim_start();
-            !c.starts_with('⚡') && !c.starts_with('⚠') && !c.starts_with('⏹')
-        })
-        .collect();
-    filtered.reverse(); // хронологический порядок
-    Ok(filtered)
-}
-
-/// Форматирует историю как текстовый блок для Claude CLI prompt.
-fn format_history_for_cli(history: &[ChatMessage]) -> String {
-    if history.is_empty() {
-        return String::new();
-    }
-    let mut sb = String::from("# CONVERSATION HISTORY\n\n");
-    for msg in history {
-        let label = match msg.role.as_str() {
-            "owner" => "OWNER",
-            "ceo" => "CEO",
-            _ => continue,
-        };
-        sb.push_str(&format!("[{}]: {}\n\n", label, msg.content));
-    }
-    sb
-}
-
 #[tauri::command]
 pub async fn send_chat_message(
     content: String,
@@ -382,34 +321,15 @@ pub async fn send_chat_message(
     .await
     .map_err(|e| format!("read owner msg: {e}"))?;
 
-    // 2. System prompt built fresh per turn — picks up new posts, conditions, vault.
-    let system_prompt = build_ceo_system_prompt(&db, &app).await?;
-
-    // 3. Branch on brain_mode (Step 10 — двухконтурный мозг).
+    // 2. System prompt + history + user assembled with dynamic window budget.
     let snapshot = settings.data.lock().unwrap().clone();
-
-    // 2b. Conversation history — последние N turn'ов для контекста диалога.
-    let history = fetch_chat_history(&db, &user_id, snapshot.chat_history_turns).await?;
-    log::info!(
-        "CEO chat: history_msgs={}, turns_setting={}",
-        history.len(),
-        snapshot.chat_history_turns
-    );
-
-    // Для Claude CLI собираем prompt как один блок (system + history + user).
-    let history_block = format_history_for_cli(&history);
-    let bundled_for_cli = if history_block.is_empty() {
-        format!(
-            "# SYSTEM CONTEXT (MSPro-Ltd Corp)\n\n{system_prompt}\n\n# USER\n\n{brain_content}"
-        )
-    } else {
-        format!(
-            "# SYSTEM CONTEXT (MSPro-Ltd Corp)\n\n{system_prompt}\n\n{history_block}# USER\n\n{brain_content}"
-        )
-    };
+    let assembled = crate::context_assembler::assemble(
+        &db, &app, &brain_content, &user_id,
+        &snapshot.brain_mode, &snapshot,
+    ).await?;
 
     // Конвертация для Qwen (избегаем cyclic import — BrainHistoryMsg в qwen_bridge).
-    let history_for_qwen: Vec<qwen_bridge::BrainHistoryMsg> = history
+    let history_for_qwen: Vec<qwen_bridge::BrainHistoryMsg> = assembled.history
         .iter()
         .map(|m| qwen_bridge::BrainHistoryMsg {
             role: &m.role,
@@ -422,8 +342,13 @@ pub async fn send_chat_message(
             run_claude_external(
                 &user_id,
                 &brain_content,
-                &system_prompt,
-                &history,
+                &assembled.system_prompt,
+                &assembled.history.iter().map(|m| ChatMessage {
+                    id: m.id.clone(),
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    created_at: m.created_at.clone(),
+                }).collect::<Vec<_>>(),
                 &snapshot,
                 &pending,
                 &gateway,
@@ -433,7 +358,7 @@ pub async fn send_chat_message(
         }
         "qwen_local" => {
             qwen_bridge::run_qwen(
-                &system_prompt,
+                &assembled.system_prompt,
                 &brain_content,
                 &history_for_qwen,
                 &snapshot,
@@ -444,12 +369,12 @@ pub async fn send_chat_message(
         }
         // Default → "claude_cli"
         _ => {
-            claude_bridge::run_claude_cli(&bundled_for_cli, &snapshot, &lifecycle, &app).await
+            claude_bridge::run_claude_cli(&assembled.cli_bundle, &snapshot, &lifecycle, &app).await
         }
     };
 
     // Auto-fallback: Claude CLI упал И auto_fallback_qwen включён → переходим
-    // на Qwen с системной плашкой в чате.
+    // на Qwen с системной плашкой в чате. Re-assemble под окно Qwen (32K).
     let final_text = match primary_result {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => "⚠️ Брейн вернул пустой ответ.".to_string(),
@@ -465,10 +390,26 @@ pub async fn send_chat_message(
                 ),
             )
             .await;
+            // Re-assemble under Qwen window (32K tokens).
+            let qwen_assembled = crate::context_assembler::assemble(
+                &db, &app, &brain_content, &user_id,
+                "qwen_local", &snapshot,
+            ).await;
+            let qwen_assembled = match qwen_assembled {
+                Ok(a) => a,
+                Err(ae) => return Err(format!("fallback assemble: {ae}")),
+            };
+            let qwen_history: Vec<qwen_bridge::BrainHistoryMsg> = qwen_assembled.history
+                .iter()
+                .map(|m| qwen_bridge::BrainHistoryMsg {
+                    role: &m.role,
+                    content: &m.content,
+                })
+                .collect();
             match qwen_bridge::run_qwen(
-                &system_prompt,
+                &qwen_assembled.system_prompt,
                 &brain_content,
-                &history_for_qwen,
+                &qwen_history,
                 &snapshot,
                 &lifecycle,
                 &app,
