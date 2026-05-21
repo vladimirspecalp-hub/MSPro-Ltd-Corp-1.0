@@ -1,0 +1,6 @@
+# Миграции встраиваются через include_str! и проверяются sqlx по SHA-384.
+# Они ОБЯЗАНЫ оставаться LF на всех платформах (включая CI Windows-раннер с
+# core.autocrlf=true), иначе checksum «уплывёт» и init упадёт с
+# "migration N was previously applied but has been modified".
+# Рантайм-нормализация в lib.rs::lf() — основная защита; это — гигиена источника.
+*.sql text eol=lf

@@ -36,43 +36,56 @@ use settings::SettingsStore;
 /// avoids Kaspersky's aggressive scanning of Program Files.
 const DB_URL: &str = "sqlite:app.db";
 
+/// v1.0.32: нормализуем встроенный SQL миграций к LF ДО того как sqlx считает
+/// checksum. CI-раннер Windows из-за core.autocrlf выкачивает *.sql как CRLF,
+/// тогда include_str! вкомпилирует CRLF и SHA-384 разойдётся с LF-checksum'ом
+/// в существующих БД («migration N was previously applied but has been
+/// modified» → init падает). Срезаем CR — checksum независим от среды сборки.
+fn lf(s: &'static str) -> &'static str {
+    if s.as_bytes().contains(&b'\r') {
+        Box::leak(s.replace("\r\n", "\n").into_boxed_str())
+    } else {
+        s
+    }
+}
+
 fn migrations() -> Vec<Migration> {
     vec![
         Migration {
             version: 1,
             description:
                 "Initial schema: departments, posts, agents, owner_history, dispatcher, vault",
-            sql: include_str!("../migrations/01_init.sql"),
+            sql: lf(include_str!("../migrations/01_init.sql")),
             kind: MigrationKind::Up,
         },
         Migration {
             version: 2,
             description: "Step 3: chat_messages table for CEO conversation pane",
-            sql: include_str!("../migrations/02_chat_messages.sql"),
+            sql: lf(include_str!("../migrations/02_chat_messages.sql")),
             kind: MigrationKind::Up,
         },
         Migration {
             version: 3,
             description: "Step 6: HMT-engine — statistics + condition_logs",
-            sql: include_str!("../migrations/03_hmt_engine.sql"),
+            sql: lf(include_str!("../migrations/03_hmt_engine.sql")),
             kind: MigrationKind::Up,
         },
         Migration {
             version: 4,
             description: "Step 9: fix empty-slug Frontend post (historic UI bug)",
-            sql: include_str!("../migrations/04_fix_empty_slug.sql"),
+            sql: lf(include_str!("../migrations/04_fix_empty_slug.sql")),
             kind: MigrationKind::Up,
         },
         Migration {
             version: 5,
             description: "v1.0.19: per-post knowledge (system_prompt_md, vault_subdir, ...)",
-            sql: include_str!("../migrations/05_post_knowledge.sql"),
+            sql: lf(include_str!("../migrations/05_post_knowledge.sql")),
             kind: MigrationKind::Up,
         },
         Migration {
             version: 6,
             description: "v1.0.22: dispatcher hub (parent_task_id, attempts_count, decisions, artifacts)",
-            sql: include_str!("../migrations/06_dispatcher_hub.sql"),
+            sql: lf(include_str!("../migrations/06_dispatcher_hub.sql")),
             kind: MigrationKind::Up,
         },
     ]
@@ -512,4 +525,23 @@ CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind);";
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");
+}
+
+#[cfg(test)]
+mod migration_tests {
+    use super::*;
+
+    /// Регрессия v1.0.31→32: встроенный SQL миграций ОБЯЗАН быть LF, иначе
+    /// sqlx-checksum зависит от среды сборки (CRLF на CI Windows) и расходится с
+    /// LF-checksum'ом в существующих БД → «migration N ... has been modified».
+    #[test]
+    fn embedded_migrations_are_lf_normalized() {
+        for m in migrations() {
+            assert!(
+                !m.sql.contains('\r'),
+                "migration v{} contains CR — checksum will drift across build environments",
+                m.version
+            );
+        }
+    }
 }
