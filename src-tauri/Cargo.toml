@@ -1,6 +1,6 @@
 [package]
 name = "mspro-ltd-corp"
-version = "1.0.30"
+version = "1.0.31"
 description = "MSPro-Ltd Corp — Hubbard-based AI company OS"
 authors = ["Бровяков В.А."]
 edition = "2021"
@@ -19,6 +19,9 @@ tauri-plugin-sql = { version = "2", features = ["sqlite"] }
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-fs = "2"
+# v1.0.31: single-instance guard — второй запуск фокусирует существующее окно,
+# а не плодит дубль (дубль давал спурьёзную ошибку миграций sqlx).
+tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 log = "0.4"

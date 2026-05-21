@@ -84,6 +84,16 @@ pub fn run() {
     let gateway_state: SharedGatewayState = Arc::new(GatewayState::default());
 
     tauri::Builder::default()
+        // v1.0.31: ОБЯЗАН быть первым плагином. Перехватывает повторный запуск:
+        // вместо второго процесса (который давал спурьёзную "migration N ...
+        // has been modified") поднимает уже работающее окно.
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
