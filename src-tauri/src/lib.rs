@@ -413,6 +413,32 @@ CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind);";
                             Err(e) => log::warn!("v1.0.22 self-healing: new tables: {e}"),
                         }
 
+                        // ----- TICKET-001 self-healing: vault_ops_log -----
+                        // Installer-upgrade scenario: migration v7 may not run via
+                        // tauri-plugin-sql, but CEO vault file tools need audit log.
+                        let vault_ops_log_healing = "\
+CREATE TABLE IF NOT EXISTS vault_ops_log ( \
+    id INTEGER PRIMARY KEY AUTOINCREMENT, \
+    timestamp TEXT NOT NULL, \
+    source_post TEXT NOT NULL, \
+    tool TEXT NOT NULL, \
+    path TEXT NOT NULL, \
+    mode TEXT, \
+    anchor TEXT, \
+    bytes_before INTEGER, \
+    bytes_after INTEGER, \
+    success INTEGER NOT NULL, \
+    error_code TEXT, \
+    archive_path TEXT, \
+    reason TEXT \
+); \
+CREATE INDEX IF NOT EXISTS idx_vault_ops_path ON vault_ops_log(path); \
+CREATE INDEX IF NOT EXISTS idx_vault_ops_timestamp ON vault_ops_log(timestamp);";
+                        match sqlx::raw_sql(vault_ops_log_healing).execute(&pool.0).await {
+                            Ok(_) => log::info!("TICKET-001 self-healing: vault_ops_log ensured"),
+                            Err(e) => log::warn!("TICKET-001 self-healing: vault_ops_log: {e}"),
+                        }
+
                         // ----- v1.0.22: Outbox directory init -----
                         if let Some(data_dir) = db_path.parent() {
                             let vault_root = data_dir.join("Vault");
