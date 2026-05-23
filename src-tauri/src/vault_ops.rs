@@ -553,6 +553,41 @@ mod tests {
     }
 
     #[test]
+    fn patch_file_not_found() {
+        let _g = lock_tests();
+        let (_tmp, root) = setup_vault();
+        assert_eq!(
+            patch_file(&root, "missing.md", PatchMode::Append, "x", None).unwrap_err(),
+            VaultOpError::FileNotFound
+        );
+    }
+
+    #[test]
+    fn delete_file_not_found() {
+        let _g = lock_tests();
+        let (_tmp, root) = setup_vault();
+        assert_eq!(
+            delete_file(&root, "missing.md", None).unwrap_err(),
+            VaultOpError::FileNotFound
+        );
+    }
+
+    #[test]
+    fn io_error_mapping_permission_and_disk_full() {
+        assert_eq!(
+            map_io_err(std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                "denied"
+            )),
+            VaultOpError::PermissionDenied
+        );
+        assert_eq!(
+            map_io_err(std::io::Error::new(ErrorKind::StorageFull, "full")),
+            VaultOpError::DiskFull
+        );
+    }
+
+    #[test]
     fn patch_anchor_errors() {
         let _g = lock_tests();
         let (_tmp, root) = setup_vault();
