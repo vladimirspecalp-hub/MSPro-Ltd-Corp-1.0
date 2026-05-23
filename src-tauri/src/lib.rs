@@ -16,6 +16,7 @@ mod secrets;
 mod settings;
 mod updater;
 mod vault;
+mod vault_ops;
 mod outbox;
 
 use std::sync::Arc;
@@ -86,6 +87,12 @@ fn migrations() -> Vec<Migration> {
             version: 6,
             description: "v1.0.22: dispatcher hub (parent_task_id, attempts_count, decisions, artifacts)",
             sql: lf(include_str!("../migrations/06_dispatcher_hub.sql")),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 7,
+            description: "TICKET-001: vault_ops_log audit table for CEO vault file tools",
+            sql: lf(include_str!("../migrations/07_vault_ops_log.sql")),
             kind: MigrationKind::Up,
         },
     ]
