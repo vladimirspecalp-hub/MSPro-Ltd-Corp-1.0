@@ -297,6 +297,18 @@ pub struct DispatchExtras {
     pub refined_prompt: Option<String>,
 }
 
+/// Допустимые значения `hop_kind` (write-side валидация вместо SQL CHECK —
+/// даёт более понятные сообщения об ошибке). Извлечено из `dispatch_task_inner_ex`
+/// (Day 5) для unit-тестирования; поведение идентично прежнему инлайну.
+pub(crate) fn validate_hop_kind(hk: &str) -> Result<(), String> {
+    const ALLOWED: &[&str] = &["raw_request", "refined", "subtask", "retry", "clarification"];
+    if ALLOWED.contains(&hk) {
+        Ok(())
+    } else {
+        Err(format!("invalid hop_kind '{hk}'"))
+    }
+}
+
 /// Расширенная версия `dispatch_task_inner` которая заполняет колонки
 /// Phase 11C (parent_task_id, hop_kind, routed_by_model, refined_prompt).
 /// Старый `dispatch_task_inner` остаётся как backward-compat обёртка.
@@ -322,10 +334,7 @@ pub async fn dispatch_task_inner_ex(
 
     // Валидация hop_kind на write-side (вместо SQL CHECK — даёт лучшие сообщения).
     if let Some(hk) = &extras.hop_kind {
-        const ALLOWED: &[&str] = &["raw_request","refined","subtask","retry","clarification"];
-        if !ALLOWED.contains(&hk.as_str()) {
-            return Err(format!("invalid hop_kind '{hk}'"));
-        }
+        validate_hop_kind(hk)?;
     }
 
     let id = format!("task-{}", uuid::Uuid::new_v4());
@@ -475,4 +484,79 @@ async fn fetch_task_by_id(db: &WritePool, id: &str) -> Result<DispatcherTask, St
     .fetch_one(&db.0)
     .await
     .map_err(|e| format!("fetch task by id: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Tests (Day 5 — forward-path critical-path)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    #[test]
+    fn validate_hop_kind_accepts_allowed() {
+        for hk in ["raw_request", "refined", "subtask", "retry", "clarification"] {
+            assert!(validate_hop_kind(hk).is_ok(), "{hk} должен быть разрешён");
+        }
+    }
+
+    #[test]
+    fn validate_hop_kind_rejects_unknown() {
+        for hk in ["forward_to_post", "", "REFINED"] {
+            assert!(validate_hop_kind(hk).is_err(), "{hk} должен быть отклонён");
+        }
+    }
+
+    #[tokio::test]
+    async fn record_decision_writes_row() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        // FK off: юнит-тестируем сам INSERT, не ссылочную целостность
+        // (родительских строк dispatcher_logs в тесте нет).
+        sqlx::query("PRAGMA foreign_keys=OFF").execute(&pool).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE dispatcher_decisions ( \
+                id TEXT PRIMARY KEY, \
+                source_task_id TEXT NOT NULL REFERENCES dispatcher_logs(id), \
+                result_task_id TEXT REFERENCES dispatcher_logs(id), \
+                decision_kind TEXT NOT NULL CHECK (decision_kind IN ('forward','decompose','escalate','reject','clarify','retry')), \
+                reasoning TEXT, \
+                model_used TEXT NOT NULL, \
+                routing_complexity TEXT CHECK (routing_complexity IS NULL OR routing_complexity IN ('simple','complex')), \
+                elapsed_ms INTEGER, \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP \
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let db = WritePool(pool);
+
+        let id = record_decision(
+            "src-1",
+            Some("res-1"),
+            "forward",
+            Some("test reason"),
+            "qwen3:14b",
+            Some("simple"),
+            Some(42),
+            &db,
+        )
+        .await
+        .unwrap();
+        assert!(id.starts_with("dec-"));
+
+        let row: (String, String, Option<String>) = sqlx::query_as(
+            "SELECT decision_kind, source_task_id, result_task_id \
+             FROM dispatcher_decisions WHERE id = ?",
+        )
+        .bind(&id)
+        .fetch_one(&db.0)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "forward");
+        assert_eq!(row.1, "src-1");
+        assert_eq!(row.2.as_deref(), Some("res-1"));
+    }
 }

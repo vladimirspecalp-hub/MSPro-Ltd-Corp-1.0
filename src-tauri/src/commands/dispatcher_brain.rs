@@ -460,6 +460,61 @@ pub async fn process_pending(
 // Executor helpers — каждый возвращает (decision_kind, result_task_id?, reasoning)
 // ---------------------------------------------------------------------------
 
+/// Собирает payload refined-задачи для post_executor. Извлечено из
+/// `execute_forward` (Day 5) для unit-тестирования; форма payload без изменений.
+pub(crate) fn build_refined_payload(
+    parent_id: &str,
+    refined: &str,
+    expected_artifact: Option<&str>,
+) -> Value {
+    serde_json::json!({
+        "from_parent_task_id": parent_id,
+        "refined_prompt": refined,
+        "expected_artifact": expected_artifact,
+    })
+}
+
+/// Резолвит целевой пост для forward, когда explicit `target_slug` не задан.
+/// Порядок (как в оригинале): target_hint → упоминание любого active-slug в
+/// `prompt_text` → единственный active-пост → Err. DB-чтение active-постов
+/// делает caller и передаёт `active_slugs` (caller читает их ТОЛЬКО когда
+/// hint отсутствует — лишнего запроса при наличии hint нет).
+pub(crate) fn resolve_target_slug(
+    target_hint: Option<&str>,
+    prompt_text: &str,
+    active_slugs: &[String],
+) -> Result<String, String> {
+    if let Some(h) = target_hint {
+        let h = h.trim();
+        if !h.is_empty() {
+            log::warn!(
+                "dispatcher: forward target_slug missing, fallback to parent target_hint='{h}'"
+            );
+            return Ok(h.to_string());
+        }
+    }
+    let haystack = prompt_text.to_lowercase();
+    for s in active_slugs {
+        if haystack.contains(&s.to_lowercase()) {
+            log::warn!(
+                "dispatcher: forward target_slug missing, extracted slug='{s}' from prompts"
+            );
+            return Ok(s.clone());
+        }
+    }
+    if active_slugs.len() == 1 {
+        log::warn!(
+            "dispatcher: forward target_slug missing, only-one-post fallback to '{}'",
+            active_slugs[0]
+        );
+        return Ok(active_slugs[0].clone());
+    }
+    Err(format!(
+        "forward_to_post: target_slug missing; не нашёл ни target_hint, ни упоминание slug в prompts. Активных постов: {}",
+        active_slugs.len()
+    ))
+}
+
 async fn execute_forward(
     parent: &DispatcherTask,
     args: &Value,
@@ -480,68 +535,35 @@ async fn execute_forward(
     let target: &str = match args.get("target_slug").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
-            // 1) target_hint
-            let hint = serde_json::from_str::<Value>(&parent.task_payload)
-                .ok()
-                .and_then(|v| {
-                    v.get("target_hint")
-                        .and_then(Value::as_str)
-                        .map(|s| s.trim().to_string())
-                        .filter(|s| !s.is_empty())
-                });
-            if let Some(h) = hint {
-                log::warn!(
-                    "dispatcher: forward target_slug missing, fallback to parent target_hint='{h}'"
-                );
-                target_owned = h;
-                &target_owned
+            // target_slug не задан явно → резолвим через resolve_target_slug.
+            // hint берём из parent.task_payload; raw_prompt + active-слаги читаем
+            // ТОЛЬКО когда hint отсутствует (как в оригинале — без лишнего запроса).
+            let payload_json = serde_json::from_str::<Value>(&parent.task_payload).ok();
+            let hint = payload_json.as_ref().and_then(|v| {
+                v.get("target_hint")
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
+            let (haystack, slugs): (String, Vec<String>) = if hint.is_some() {
+                (String::new(), Vec::new())
             } else {
-                // 2) ищем слаг любого active поста в refined_prompt / raw_prompt
-                let raw = serde_json::from_str::<Value>(&parent.task_payload)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("raw_prompt")
-                            .and_then(Value::as_str)
-                            .map(str::to_string)
-                    })
+                let raw = payload_json
+                    .as_ref()
+                    .and_then(|v| v.get("raw_prompt").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_default();
-                let haystack = format!("{} {}", refined.to_lowercase(), raw.to_lowercase());
-
-                let slugs: Vec<(String,)> =
-                    sqlx::query_as("SELECT slug FROM posts WHERE status = 'active'")
+                let slugs: Vec<String> =
+                    sqlx::query_as::<_, (String,)>("SELECT slug FROM posts WHERE status = 'active'")
                         .fetch_all(&db.0)
                         .await
-                        .map_err(|e| format!("posts lookup: {e}"))?;
-
-                let mut matched: Option<String> = None;
-                for (s,) in &slugs {
-                    if haystack.contains(&s.to_lowercase()) {
-                        matched = Some(s.clone());
-                        break;
-                    }
-                }
-
-                if let Some(m) = matched {
-                    log::warn!(
-                        "dispatcher: forward target_slug missing, extracted slug='{m}' from prompts"
-                    );
-                    target_owned = m;
-                    &target_owned
-                } else if slugs.len() == 1 {
-                    // 3) одиночный пост → fallback на него
-                    log::warn!(
-                        "dispatcher: forward target_slug missing, only-one-post fallback to '{}'",
-                        slugs[0].0
-                    );
-                    target_owned = slugs[0].0.clone();
-                    &target_owned
-                } else {
-                    return Err(format!(
-                        "forward_to_post: target_slug missing; не нашёл ни target_hint, ни упоминание slug в prompts. Активных постов: {}",
-                        slugs.len()
-                    ));
-                }
-            }
+                        .map_err(|e| format!("posts lookup: {e}"))?
+                        .into_iter()
+                        .map(|(s,)| s)
+                        .collect();
+                (format!("{refined} {raw}"), slugs)
+            };
+            target_owned = resolve_target_slug(hint.as_deref(), &haystack, &slugs)?;
+            &target_owned
         }
     };
     let expected_artifact = args.get("expected_artifact").and_then(Value::as_str);
@@ -558,11 +580,7 @@ async fn execute_forward(
         ));
     }
 
-    let payload = serde_json::json!({
-        "from_parent_task_id": parent.id,
-        "refined_prompt": refined,
-        "expected_artifact": expected_artifact,
-    });
+    let payload = build_refined_payload(&parent.id, refined, expected_artifact);
 
     let new_task = dispatcher::dispatch_task_inner_ex(
         "dispatcher".to_string(),
@@ -809,5 +827,48 @@ mod tests {
     fn pick_brain_complexity_label() {
         assert_eq!(BrainPick::Qwen.complexity_label(), "simple");
         assert_eq!(BrainPick::Claude.complexity_label(), "complex");
+    }
+
+    // ----- Day 5: forward-path mapping -----
+
+    #[test]
+    fn build_refined_payload_shape() {
+        let p = build_refined_payload("task-1", "do X", Some("result.txt"));
+        assert_eq!(p["from_parent_task_id"], "task-1");
+        assert_eq!(p["refined_prompt"], "do X");
+        assert_eq!(p["expected_artifact"], "result.txt");
+        let p2 = build_refined_payload("task-2", "do Y", None);
+        assert!(p2["expected_artifact"].is_null());
+    }
+
+    #[test]
+    fn resolve_target_slug_uses_hint() {
+        let slugs = vec!["manager".to_string(), "engineer".to_string()];
+        let r = resolve_target_slug(Some("smoke-test"), "no slug here", &slugs).unwrap();
+        assert_eq!(r, "smoke-test");
+    }
+
+    #[test]
+    fn resolve_target_slug_scan_prompt() {
+        let slugs = vec!["manager".to_string(), "engineer".to_string()];
+        let r = resolve_target_slug(None, "please ask ENGINEER to do it", &slugs).unwrap();
+        assert_eq!(r, "engineer");
+    }
+
+    #[test]
+    fn resolve_target_slug_single_post_fallback() {
+        let slugs = vec!["only-post".to_string()];
+        let r = resolve_target_slug(None, "no mention", &slugs).unwrap();
+        assert_eq!(r, "only-post");
+    }
+
+    #[test]
+    fn resolve_target_slug_missing() {
+        // Реалистичные многобуквенные слаги, не являющиеся подстроками промпта
+        // (короткие слаги типа "a" ложно совпали бы — наивный substring-скан,
+        // pre-existing поведение оригинала; в Day 5 не меняем).
+        let slugs = vec!["manager".to_string(), "engineer".to_string()];
+        assert!(resolve_target_slug(None, "completely unrelated request text", &slugs).is_err());
+        assert!(resolve_target_slug(None, "x", &[]).is_err());
     }
 }
