@@ -127,6 +127,45 @@ tool_call с валидным JSON. Формат и схемы:
     }
   },
   {
+    "name": "write_vault_file",
+    "description": "Создать/перезаписать файл по произвольному пути внутри Vault. Path относительный к Vault root. Path Traversal запрещён. Расширения: md/txt/json/yaml/yml. Лимит 200KB.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "Относительный путь от Vault root, например 'decisions-log.md' или '03-Phases/phase-0-detailed-plan.md'"},
+        "content": {"type": "string", "description": "Полное содержимое файла, markdown/yaml/json/txt"},
+        "overwrite": {"type": "boolean", "description": "Если true — перезаписать существующий файл. Если false (default) и файл существует — вернуть ошибку FileExists."}
+      },
+      "required": ["path", "content"]
+    }
+  },
+  {
+    "name": "patch_vault_file",
+    "description": "Модифицировать существующий файл Vault: prepend/append/insert_after_anchor. Для полной перезаписи — write_vault_file с overwrite=true.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "Относительный путь от Vault root"},
+        "mode": {"type": "string", "enum": ["prepend", "append", "insert_after"], "description": "prepend = в начало, append = в конец, insert_after = после якорной строки"},
+        "content": {"type": "string", "description": "Контент для вставки"},
+        "anchor": {"type": "string", "description": "Обязательно при mode=insert_after. Точная строка (substring match) после которой вставляем контент. Если anchor встречается >1 раза — error AmbiguousAnchor."}
+      },
+      "required": ["path", "mode", "content"]
+    }
+  },
+  {
+    "name": "delete_vault_file",
+    "description": "Soft-delete файла Vault: перенос в Vault/.archive/<дата>/<original-path>. Физического удаления нет, восстановление — через write_vault_file с обратным контентом или ручной перенос из .archive.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {"type": "string", "description": "Относительный путь от Vault root"},
+        "reason": {"type": "string", "description": "Опционально: причина архивации (для vault_ops_log и для шапки .archive файла)"}
+      },
+      "required": ["path"]
+    }
+  },
+  {
     "name": "read_post_knowledge",
     "description": "Прочитать что у поста есть в плане инструкций и накопленного опыта. Используй ПЕРЕД dispatch_task если не уверен какие у поста знания/правила/паттерны. Возвращает системный промпт поста + первые ~5 KB Vault-контекста (паттерны + победы). Не вызывай на каждое сообщение — только когда реально планируешь поставить задачу.",
     "parameters": {
@@ -200,6 +239,19 @@ tool_call с валидным JSON. Формат и схемы:
     инструкция). Win = «что получилось» (конкретный случай успеха, история).
 16. **Один Vault-файл = одна тема.** Не сваливай всё в один паттерн —
     несколько маленьких лучше одного огромного.
+
+### Правила работы с Vault-файлами (write_vault_file / patch_vault_file / delete_vault_file)
+
+V1. **write_vault_file** — новый файл или полная перезапись (`overwrite=true`).
+    Для `decisions-log.md`, планов фаз, корневых артефактов.
+V2. **patch_vault_file** — точечная правка существующего файла:
+    `prepend` (шапка DEPRECATED), `append` (Update Log), `insert_after` (после якоря).
+    Anchor должен быть уникален в файле — иначе AmbiguousAnchor.
+V3. **delete_vault_file** — soft-delete в `.archive/<дата>/`. Не для decisions-log
+    без явного указания Владельца. Не архивируй `.archive/` повторно.
+V4. **save_pattern / save_win** — по-прежнему для новых паттернов/побед в
+    фиксированных папках. Для произвольных путей — write_vault_file.
+V5. Пути только относительные, расширения md/txt/json/yaml/yml, лимит 200 KB.
 
 ### Правила Hub-and-Spoke архитектуры (v1.0.22)
 
@@ -472,6 +524,9 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
         "archive_post" => execute_archive_post(call.effective_args(), db, app).await,
         "save_pattern" => execute_save_vault(call.effective_args(), app, "02-Patterns").await,
         "save_win" => execute_save_vault(call.effective_args(), app, "04-Wins").await,
+        "write_vault_file" => execute_write_vault_file(call.effective_args(), db, app).await,
+        "patch_vault_file" => execute_patch_vault_file(call.effective_args(), db, app).await,
+        "delete_vault_file" => execute_delete_vault_file(call.effective_args(), db, app).await,
         "read_post_knowledge" => execute_read_post_knowledge(call.effective_args(), db, app).await,
         unknown => ToolExecution {
             ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
@@ -1142,6 +1197,305 @@ async fn execute_save_vault(
 }
 
 // ---------------------------------------------------------------------------
+// TICKET-001: arbitrary Vault file tools (write / patch / delete)
+// ---------------------------------------------------------------------------
+
+fn vault_root_from_app(app: &AppHandle) -> Result<std::path::PathBuf, ToolExecution> {
+    match app.try_state::<crate::vault::VaultState>() {
+        Some(s) => Ok(s.root.clone()),
+        None => Err(tool_err("VaultState не инициализирован (setup() не закончил)")),
+    }
+}
+
+fn vault_op_err(code: crate::vault_ops::VaultOpError) -> ToolExecution {
+    if code == crate::vault_ops::VaultOpError::FileExists {
+        return ToolExecution {
+            ui_message: format!("ℹ️ Файл уже существует (FileExists). Используй overwrite=true для перезаписи."),
+            success: false,
+        };
+    }
+    tool_err(&format!("vault: {} ({})", code, code.code()))
+}
+
+async fn log_vault_op_safe(
+    db: &WritePool,
+    tool: &str,
+    path: &str,
+    mode: Option<&str>,
+    anchor: Option<&str>,
+    bytes_before: Option<i64>,
+    bytes_after: Option<i64>,
+    success: bool,
+    error_code: Option<&str>,
+    archive_path: Option<&str>,
+    reason: Option<&str>,
+) {
+    if let Err(e) = crate::vault_ops::log_vault_op(
+        &db.0,
+        "ceo",
+        tool,
+        path,
+        mode,
+        anchor,
+        bytes_before,
+        bytes_after,
+        success,
+        error_code,
+        archive_path,
+        reason,
+    )
+    .await
+    {
+        log::warn!("vault_ops_log insert failed: {e}");
+    }
+}
+
+async fn execute_write_vault_file(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let path = match args.get("path").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("write_vault_file: path обязателен"),
+    };
+    let content = match args.get("content").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => return tool_err("write_vault_file: content обязателен"),
+    };
+    let overwrite = args.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
+
+    let root = match vault_root_from_app(app) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let path_log = path.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::vault_ops::write_file(&root, &path, &content, overwrite)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(r)) => {
+            log_vault_op_safe(
+                db,
+                "write_vault_file",
+                &path_log,
+                None,
+                None,
+                None,
+                Some(r.bytes_written as i64),
+                true,
+                None,
+                None,
+                None,
+            )
+            .await;
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Vault: записан `{}` ({} байт){}",
+                    path_log,
+                    r.bytes_written,
+                    if r.created_dirs.is_empty() {
+                        String::new()
+                    } else {
+                        format!("; созданы папки: {}", r.created_dirs.join(", "))
+                    }
+                ),
+                success: true,
+            }
+        }
+        Ok(Err(e)) => {
+            log_vault_op_safe(
+                db,
+                "write_vault_file",
+                &path_log,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(e.code()),
+                None,
+                None,
+            )
+            .await;
+            vault_op_err(e)
+        }
+        Err(e) => tool_err(&format!("write_vault_file: join: {e}")),
+    }
+}
+
+async fn execute_patch_vault_file(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let path = match args.get("path").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("patch_vault_file: path обязателен"),
+    };
+    let mode_str = match args.get("mode").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => return tool_err("patch_vault_file: mode обязателен"),
+    };
+    let content = match args.get("content").and_then(Value::as_str) {
+        Some(s) => s.to_string(),
+        None => return tool_err("patch_vault_file: content обязателен"),
+    };
+    let anchor = args
+        .get("anchor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let mode = match crate::vault_ops::PatchMode::parse(&mode_str) {
+        Ok(m) => m,
+        Err(e) => return vault_op_err(e),
+    };
+
+    let root = match vault_root_from_app(app) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let path_log = path.clone();
+    let mode_log = mode.as_str().to_string();
+    let anchor_log = anchor.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::vault_ops::patch_file(
+            &root,
+            &path,
+            mode,
+            &content,
+            anchor.as_deref(),
+        )
+    })
+    .await;
+
+    match result {
+        Ok(Ok(r)) => {
+            log_vault_op_safe(
+                db,
+                "patch_vault_file",
+                &path_log,
+                Some(&mode_log),
+                anchor_log.as_deref(),
+                Some(r.bytes_before as i64),
+                Some(r.bytes_after as i64),
+                true,
+                None,
+                None,
+                None,
+            )
+            .await;
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Vault: patch `{}` mode={} ({} → {} байт)",
+                    path_log, mode_log, r.bytes_before, r.bytes_after
+                ),
+                success: true,
+            }
+        }
+        Ok(Err(e)) => {
+            log_vault_op_safe(
+                db,
+                "patch_vault_file",
+                &path_log,
+                Some(&mode_log),
+                anchor_log.as_deref(),
+                None,
+                None,
+                false,
+                Some(e.code()),
+                None,
+                None,
+            )
+            .await;
+            vault_op_err(e)
+        }
+        Err(e) => tool_err(&format!("patch_vault_file: join: {e}")),
+    }
+}
+
+async fn execute_delete_vault_file(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let path = match args.get("path").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("delete_vault_file: path обязателен"),
+    };
+    let reason = args
+        .get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let root = match vault_root_from_app(app) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let path_log = path.clone();
+    let reason_log = reason.clone();
+    let root_log = root.clone();
+
+    let result = tokio::task::spawn_blocking(move || {
+        crate::vault_ops::delete_file(&root, &path, reason.as_deref())
+    })
+    .await;
+
+    match result {
+        Ok(Ok(r)) => {
+            let archive_rel = r
+                .archive_path
+                .strip_prefix(&root_log)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| r.archive_path.display().to_string());
+            log_vault_op_safe(
+                db,
+                "delete_vault_file",
+                &path_log,
+                None,
+                None,
+                None,
+                None,
+                true,
+                None,
+                Some(&archive_rel),
+                reason_log.as_deref(),
+            )
+            .await;
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Vault: `{}` архивирован → `{}`",
+                    path_log, archive_rel
+                ),
+                success: true,
+            }
+        }
+        Ok(Err(e)) => {
+            log_vault_op_safe(
+                db,
+                "delete_vault_file",
+                &path_log,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(e.code()),
+                None,
+                reason_log.as_deref(),
+            )
+            .await;
+            vault_op_err(e)
+        }
+        Err(e) => tool_err(&format!("delete_vault_file: join: {e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // v1.0.19: read_post_knowledge — Гендир видит инструкции/опыт поста
 // ---------------------------------------------------------------------------
 
@@ -1425,6 +1779,42 @@ mod tests {
         assert_eq!(
             calls[0].effective_args().get("target_post").and_then(Value::as_str),
             Some("manager")
+        );
+    }
+
+    #[test]
+    fn parse_write_vault_file_block() {
+        let raw = "<tool_call>{\"name\":\"write_vault_file\",\"arguments\":{\"path\":\"decisions-log.md\",\"content\":\"DEC log\",\"overwrite\":true}}</tool_call>";
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "write_vault_file");
+        assert_eq!(
+            calls[0].effective_args().get("path").and_then(Value::as_str),
+            Some("decisions-log.md")
+        );
+    }
+
+    #[test]
+    fn parse_patch_vault_file_block() {
+        let raw = r#"<tool_call>{"name":"patch_vault_file","arguments":{"path":"02-Patterns/old.md","mode":"prepend","content":"DEPRECATED"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "patch_vault_file");
+        assert_eq!(
+            calls[0].effective_args().get("mode").and_then(Value::as_str),
+            Some("prepend")
+        );
+    }
+
+    #[test]
+    fn parse_delete_vault_file_block() {
+        let raw = r#"<tool_call>{"name":"delete_vault_file","arguments":{"path":"02-Patterns/old.md","reason":"superseded"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "delete_vault_file");
+        assert_eq!(
+            calls[0].effective_args().get("reason").and_then(Value::as_str),
+            Some("superseded")
         );
     }
 
