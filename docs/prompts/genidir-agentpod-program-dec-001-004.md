@@ -1,6 +1,45 @@
 # Промпт для Гендира — программа AgentPod (DEC-001…004)
 
+> **ОБНОВЛЕНО 2026-05-29** — добавлена ведущая секция «Operating Model (актуально)»:
+> фактические роли/взаимодействие + правила кодирования (по итогам Phase 0-1).
+> Архитектурные решения **DEC-001…004 НЕ изменены**. Оригинальный kickoff-блок
+> (2026-05-20) сохранён ниже как **историческая запись**; его ролевая секция
+> частично **отменена** — применяй Operating Model. Полный список правок — Changelog внизу.
+
+---
+
+## Operating Model (актуально на 2026-05-29) — отменяет ролевую секцию kickoff
+
+### A. Роли и взаимодействие
+
+| Роль | Зона ответственности | Изменение vs kickoff (2026-05-20) |
+|---|---|---|
+| **Программист** (Claude Code, `mspro-programmer`) | **Основной кодер**: Rust/React/SQL, IMPL-REFERENCE из реального кода, технический inventory, миграции, релизы | kickoff: «Cursor кодит, **не пиши Rust из чата**» → **ОТМЕНЕНО** |
+| **Cursor** | Второй универсал + **независимый проверяющий** (verify каждого артефакта) | был «основной кодер» → стал **проверяющий** |
+| **Гендир** (CEO) | Архитектура, DEC, scope-границы, бизнес-критерии, sequencing, бизнес/процессные риски | без изменений |
+| **Владелец** (Бровяков В.А.) | Final arbiter: approve планов, scope/UX-развилки, go/no-go | без изменений |
+
+**Workflow каждой кодовой задачи:** задача → программист пишет **план** → **approve Владельца** → выполнение → **Cursor verify** → отчёт.
+
+**Методология (4 столпа, см. Vault `02-Patterns/playbook-итерации-spec-роли-investigation-verify.md`):**
+1. Разделение ролей (технический inventory пишет тот, у кого read-access к коду).
+2. Investigation **до** проектирования (read реального кода: Cargo.toml, модули, settings).
+3. Real-code-paths, **не из памяти** (пути/команды/argv/SQL/enum — из репо).
+4. **Cursor-verify обязателен** для каждого артефакта до approve/implementation.
+
+### B. Правила кодирования (в kickoff отсутствовали; из tribal knowledge v1.0.13-33)
+
+- **Миграции:** `lf()` wrapper (CRLF/checksum грабля); self-healing блок `CREATE TABLE IF NOT EXISTS` в `lib.rs::setup` под **каждую** новую таблицу; partial index — **отдельной** миграцией от `ALTER`.
+- **Subprocess:** `--dangerously-skip-permissions` для пост-агентов (sandbox `cwd`); `kill_on_drop(true)` + orphan-защита; `hide_console` на Windows.
+- **Timeout (3 канала):** `claude_cli_timeout_sec=360` (CEO) / `dispatcher_routing_timeout_sec=60` / `post_executor_timeout_sec=600`; PAL `Tier::T1=600`=`post_executor_timeout_sec` (не 360).
+- **Git / секреты:** scoped commits (**не сметать чужие** изменения); токены через keyring/`$env`, **не хардкод**; backup `app.db` ×2 + `git tag agentpod-phase-N-start` **перед** миграциями.
+- **Документы:** версия + changelog, **не overwrite**; пути/команды/argv — из реального репо, не из общих представлений.
+
+---
+
 > Скопируйте содержимое блока ниже **одним сообщением** в чат Гендира в MSPro-Ltd Corp.
+> ⬇️ Ниже — **оригинальный kickoff (2026-05-20, историчка)**. Ролевую модель применяй
+> по секции **«Operating Model» выше**, а не по строке «Cursor кодит / не пиши Rust из чата».
 
 ---
 
@@ -372,3 +411,16 @@ F) Паттерн Vault/02-Patterns/agentpod-v1.md (≤80 строк) — соз
 ## После ответа Гендира
 
 Пришлите полный текст программы в Cursor — разберём фазы, SQL и тикеты Фазы 0.
+
+---
+
+## Changelog
+
+### 2026-05-29 — приведено к фактической операционной модели (после Phase 0-1)
+Добавлена ведущая секция **«Operating Model (актуально)»**. Что изменилось относительно kickoff:
+
+- **Роли (A):** kickoff декларировал «Cursor — основной кодер, Гендир пишет SPEC, программист не пишет Rust из чата». Фактически после Phase 0-1: **программист — основной кодер**, **Cursor — независимый проверяющий**, Гендир — архитектура/DEC/scope, Владелец — final approve. Оригинальная формулировка в kickoff-блоке (строка «Composer/Cursor — со-исполнитель кода… ты — стратегия, DEC, спеки… Не пиши Rust из чата») **сохранена как историчка, но отменена** секцией Operating Model.
+- **Workflow:** зафиксирован цикл «задача → план → approve Владельца → выполнение → Cursor verify → отчёт».
+- **Методология:** добавлены 4 столпа (роли / investigation / real-code-paths / Cursor-verify).
+- **Правила кодирования (B):** в kickoff отсутствовали — добавлен свод из tribal knowledge v1.0.13-33 (lf()/CRLF, self-healing, --dangerously-skip-permissions, kill_on_drop, partial index, timeout reconciliation, scoped commits, токены через keyring, backup+tag).
+- **НЕ менялось:** DEC-001…004 (архитектура), 5-фазная структура, приложения A–F, оригинальный текст kickoff-промпта (только дополнен баннером + Operating Model сверху).
