@@ -210,6 +210,17 @@ async fn run_claude_cli_for_post(
     // Снимок «что было» в папке до спавна — для дельты после exit.
     let pre_snapshot = snapshot_dir(&task_dir);
 
+    // Phase 1 (Iteration B): PAL killswitch. Флаг снимаем ОДИН раз (R-T-008).
+    // pal_enabled → через PAL (orchestrator → ClaudeCliDriver) + run_logs.
+    // false → legacy прямой spawn ниже (нетронут). default false (v1.0.34).
+    if settings.pal_enabled {
+        return run_via_pal(
+            task_id, &slug, refined_prompt, system_prompt, &agent_name, &model,
+            &task_dir, &pre_snapshot, settings, db, vault, app,
+        )
+        .await;
+    }
+
     // 4. Spawn claude.exe.
     let mut cmd = Command::new(&settings.claude_cli_path);
     hide_console(&mut cmd);
@@ -482,6 +493,150 @@ async fn bump_attempts(task_id: &str, db: &WritePool) -> Result<(), String> {
     .await
     .map(|_| ())
     .map_err(|e| format!("bump_attempts: {e}"))
+}
+
+/// Map модели → Tier (Phase 1 interim, до post_runtime в Срезе 3).
+fn tier_for_model(m: &str) -> crate::pal::Tier {
+    let l = m.to_lowercase();
+    if l.contains("opus") {
+        crate::pal::Tier::T1
+    } else if l.contains("sonnet") {
+        crate::pal::Tier::T2
+    } else if l.contains("qwen") || l.contains("haiku") {
+        crate::pal::Tier::T3
+    } else {
+        crate::pal::Tier::T2
+    }
+}
+
+/// Phase 1 (Iteration B) — путь исполнения через PAL.
+/// Повторяет downstream logic legacy (diff_dir / register_artifact / fail/success),
+/// но spawn делает orchestrator → ClaudeCliDriver + пишет run_logs.
+/// Срез 1: один провайдер (claude_cli), без fallback chain (Срез 2).
+#[allow(clippy::too_many_arguments)]
+async fn run_via_pal(
+    task_id: &str,
+    slug: &str,
+    refined_prompt: &str,
+    system_prompt: &str,
+    agent_name: &str,
+    model: &str,
+    task_dir: &Path,
+    pre_snapshot: &HashMap<String, u64>,
+    settings: &AppSettings,
+    db: &WritePool,
+    vault: &VaultState,
+    app: &AppHandle,
+) -> Result<PostExecResult, String> {
+    use crate::pal::claude_cli_driver::ClaudeCliDriver;
+    use crate::pal::{orchestrator, ProviderRequest, RequestTrace};
+    use crate::run_logger::{insert_run_log, RunLogEntry};
+
+    let started = Instant::now();
+    let tier = tier_for_model(model);
+    let driver = ClaudeCliDriver::new(
+        "claude_cli".to_string(),
+        settings.claude_cli_path.clone(),
+        model.to_string(),
+    );
+    let request = ProviderRequest {
+        system_prompt: system_prompt.to_string(),
+        user_message: refined_prompt.to_string(),
+        tier,
+        timeout: None, // orchestrator возьмёт Tier::default_timeout (T1=600)
+        max_turns: None,
+        model_override: None,
+        workspace_path: Some(task_dir.to_path_buf()),
+        agent_slug: Some(agent_name.to_string()),
+        mcp_bindings: Vec::new(),
+        trace: RequestTrace {
+            post_slug: slug.to_string(),
+            dispatcher_log_id: Some(task_id.to_string()),
+            attempt_id: format!("{task_id}-0"),
+            attempt_number: 0,
+        },
+    };
+
+    log::info!("run_via_pal: task={task_id} slug={slug} tier={} model={model}", tier.as_str());
+    let result = orchestrator::pal_invoke(&driver, request).await;
+    let elapsed_ms = started.elapsed().as_millis();
+
+    // run_logs запись (успех или ошибка).
+    let (success, error_kind, raw_output, latency) = match &result {
+        Ok(resp) => (true, None, Some(resp.text.clone()), resp.latency_ms as i64),
+        Err(e) => (false, Some(e.kind_str().to_string()), Some(e.to_string()), elapsed_ms as i64),
+    };
+    let entry = RunLogEntry {
+        task_id: Some(task_id.to_string()),
+        post_slug: Some(slug.to_string()),
+        provider_id: "claude_cli".to_string(),
+        model_used: Some(model.to_string()),
+        tier: Some(tier.as_str().to_string()),
+        tokens_in: 0,
+        tokens_out: 0,
+        latency_ms: latency,
+        cost_usd: 0.0,
+        success,
+        fallback_used: false,
+        attempt_number: 0,
+        error_kind,
+        raw_output,
+    };
+    if let Err(e) = insert_run_log(db, entry).await {
+        log::warn!("run_via_pal: run_log insert failed: {e}");
+    }
+
+    // Артефакты — тот же diff_dir + register, что и в legacy.
+    let new_files = diff_dir(task_dir, pre_snapshot);
+    let mut registered = 0usize;
+    for rel in &new_files {
+        let mime = guess_mime_from_ext(rel);
+        match artifacts::register_artifact(task_id, rel, mime.as_deref(), slug, db, vault, app).await {
+            Ok(_) => registered += 1,
+            Err(e) => log::warn!("run_via_pal: register {rel} failed: {e}"),
+        }
+    }
+
+    let exit_code = match &result {
+        Ok(_) if registered > 0 => {
+            log::info!("run_via_pal: task {task_id} produced {registered} artifacts — awaiting approval");
+            0
+        }
+        Ok(_) => {
+            let _ = bump_attempts(task_id, db).await;
+            let _ = dispatcher::fail_task_inner(
+                task_id.to_string(),
+                "PAL finished but produced no artifacts".to_string(),
+                db,
+                app,
+            )
+            .await;
+            0
+        }
+        Err(e) => {
+            let _ = bump_attempts(task_id, db).await;
+            let _ = dispatcher::fail_task_inner(task_id.to_string(), format!("PAL error: {e}"), db, app).await;
+            -1
+        }
+    };
+
+    let _ = app.emit(
+        "post-executor-finished",
+        serde_json::json!({
+            "task_id": task_id,
+            "exit_code": exit_code,
+            "artifacts": registered,
+            "elapsed_ms": elapsed_ms,
+            "pal": true,
+        }),
+    );
+
+    Ok(PostExecResult {
+        task_id: task_id.to_string(),
+        exit_code,
+        artifacts_count: registered,
+        elapsed_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,8 @@ mod updater;
 mod vault;
 mod vault_ops;
 mod outbox;
+mod pal;
+mod run_logger;
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -49,6 +51,17 @@ fn lf(s: &'static str) -> &'static str {
         s
     }
 }
+
+/// Phase 1 (Iteration B): единый источник сид-данных провайдеров (DRY, уточнение
+/// Владельца #1). Migration 08 = только схема; сид — здесь, применяется в
+/// self-healing setup() идемпотентно (`INSERT OR IGNORE`). НЕ дублируем в .sql.
+/// default_model claude_cli = алиас `opus` (always-latest, без хардкода версии —
+/// verified flag-спайком: `--model` принимает алиас 'opus').
+const PROVIDER_SEED_SQL: &str = "\
+INSERT OR IGNORE INTO provider_registry (id,kind,display_name,endpoint,default_model,status) VALUES \
+ ('claude_cli','ClaudeCli','Claude CLI','','opus','enabled'), \
+ ('qwen_http','QwenHttp','Qwen HTTP','http://localhost:11434/v1','qwen3:14b','enabled'), \
+ ('external_gateway','ExternalGateway','External Gateway','ws://127.0.0.1:8899','','enabled');";
 
 fn migrations() -> Vec<Migration> {
     vec![
@@ -93,6 +106,12 @@ fn migrations() -> Vec<Migration> {
             version: 7,
             description: "TICKET-001: vault_ops_log audit table for CEO vault file tools",
             sql: lf(include_str!("../migrations/07_vault_ops_log.sql")),
+            kind: MigrationKind::Up,
+        },
+        Migration {
+            version: 8,
+            description: "Phase 1 (Iteration B): provider_registry + run_logs (PAL)",
+            sql: lf(include_str!("../migrations/08_provider_registry_run_logs.sql")),
             kind: MigrationKind::Up,
         },
     ]
@@ -437,6 +456,53 @@ CREATE INDEX IF NOT EXISTS idx_vault_ops_timestamp ON vault_ops_log(timestamp);"
                         match sqlx::raw_sql(vault_ops_log_healing).execute(&pool.0).await {
                             Ok(_) => log::info!("TICKET-001 self-healing: vault_ops_log ensured"),
                             Err(e) => log::warn!("TICKET-001 self-healing: vault_ops_log: {e}"),
+                        }
+
+                        // ----- Phase 1 (migration 08) self-healing: PAL tables -----
+                        // provider_registry + run_logs. installer-upgrade может не
+                        // прогнать миграцию 08 через tauri-plugin-sql → raw ensure.
+                        // Схема = зеркало migrations/08_*.sql (схема живёт в обоих;
+                        // СИД — единый источник PROVIDER_SEED_SQL, не дублируется).
+                        let pal_healing = "\
+CREATE TABLE IF NOT EXISTS provider_registry ( \
+    id TEXT PRIMARY KEY, \
+    kind TEXT NOT NULL, \
+    display_name TEXT NOT NULL, \
+    endpoint TEXT, \
+    default_model TEXT, \
+    secret_ref TEXT, \
+    status TEXT NOT NULL DEFAULT 'enabled', \
+    created_at TEXT NOT NULL DEFAULT (datetime('now')), \
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')) \
+); \
+CREATE TABLE IF NOT EXISTS run_logs ( \
+    id TEXT PRIMARY KEY, \
+    task_id TEXT, \
+    post_slug TEXT, \
+    provider_id TEXT NOT NULL, \
+    model_used TEXT, \
+    tier TEXT, \
+    tokens_in INTEGER NOT NULL DEFAULT 0, \
+    tokens_out INTEGER NOT NULL DEFAULT 0, \
+    latency_ms INTEGER, \
+    cost_usd REAL NOT NULL DEFAULT 0, \
+    success INTEGER NOT NULL DEFAULT 0, \
+    fallback_used INTEGER NOT NULL DEFAULT 0, \
+    attempt_number INTEGER NOT NULL DEFAULT 0, \
+    error_kind TEXT, \
+    raw_output TEXT, \
+    created_at TEXT NOT NULL DEFAULT (datetime('now')) \
+); \
+CREATE INDEX IF NOT EXISTS idx_run_logs_task ON run_logs(task_id); \
+CREATE INDEX IF NOT EXISTS idx_run_logs_provider ON run_logs(provider_id); \
+CREATE INDEX IF NOT EXISTS idx_run_logs_created ON run_logs(created_at);";
+                        match sqlx::raw_sql(pal_healing).execute(&pool.0).await {
+                            Ok(_) => log::info!("Phase 1 self-healing: provider_registry + run_logs ensured"),
+                            Err(e) => log::warn!("Phase 1 self-healing: PAL tables: {e}"),
+                        }
+                        match sqlx::raw_sql(PROVIDER_SEED_SQL).execute(&pool.0).await {
+                            Ok(_) => log::info!("Phase 1 self-healing: provider seed ensured"),
+                            Err(e) => log::warn!("Phase 1 self-healing: provider seed: {e}"),
                         }
 
                         // ----- v1.0.22: Outbox directory init -----

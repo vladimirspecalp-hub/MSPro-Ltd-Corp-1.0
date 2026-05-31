@@ -2415,6 +2415,7 @@ dependencies = [
 name = "mspro-ltd-corp"
 version = "1.0.33"
 dependencies = [
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
@@ -2438,6 +2439,7 @@ dependencies = [
  "tauri-plugin-sql",
  "tauri-plugin-updater",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
  "uuid",

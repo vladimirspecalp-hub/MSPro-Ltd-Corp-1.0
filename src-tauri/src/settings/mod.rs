@@ -110,6 +110,12 @@ pub struct AppSettings {
     /// Default 3 — каждый = отдельный claude.exe, RAM ~300-500 MB.
     #[serde(default = "default_post_executor_max_concurrent")]
     pub post_executor_max_concurrent: u32,
+
+    // ─── Phase 1 (Iteration B): PAL killswitch ─────────────────────────────
+    /// PAL on/off. default false: v1.0.34 выходит с PAL OFF (legacy прямой
+    /// spawn живёт), flip true в v1.0.35 после smoke. Killswitch при инциденте.
+    #[serde(default = "default_pal_enabled")]
+    pub pal_enabled: bool,
 }
 
 fn default_brain_mode() -> String { "claude_cli".to_string() }
@@ -139,6 +145,7 @@ fn default_dispatcher_routing_timeout() -> u64 { 60 }
 
 fn default_post_executor_timeout() -> u64 { 600 }
 fn default_post_executor_max_concurrent() -> u32 { 3 }
+fn default_pal_enabled() -> bool { false }
 
 impl Default for AppSettings {
     fn default() -> Self {
@@ -166,6 +173,7 @@ impl Default for AppSettings {
             dispatcher_routing_timeout_sec: default_dispatcher_routing_timeout(),
             post_executor_timeout_sec: default_post_executor_timeout(),
             post_executor_max_concurrent: default_post_executor_max_concurrent(),
+            pal_enabled: default_pal_enabled(),
         }
     }
 }
