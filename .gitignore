@@ -48,3 +48,11 @@ __pycache__/
 *.pyc
 .venv/
 
+
+# Iteration B local CI logs (not tracked)
+build.log
+test.log
+clippy.log
+clippy_mine.txt
+ci_summary.txt
+

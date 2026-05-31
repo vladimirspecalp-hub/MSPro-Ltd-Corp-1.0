@@ -7,17 +7,27 @@
 //! Источник истины: `Vault/03-Phases/phase-1-claude-cli-driver-IMPL-REFERENCE.md`.
 //! Инвариант: ноль `unwrap()/expect()`.
 
+use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use tokio::sync::Mutex as AsyncMutex;
 
 use super::{
     Capabilities, HealthStatus, PostRuntimeProvider, ProviderError, ProviderKind,
     ProviderRequest, ProviderResponse, TokenUsage,
 };
+
+/// PAL-нейтральная регистрация PID: (running-map, task_id). Драйвер вписывает
+/// PID спавненного child сразу после spawn — чтобы `cancel_post_executor` мог
+/// убить процесс по task_id (I1). Тип = просто `HashMap<String,u32>` — никакой
+/// зависимости от post_executor (слоистость PAL сохранена); post_executor
+/// клонирует тот же Arc из `PostExecutorRegistry.running`.
+pub type PidRegistration = (Arc<AsyncMutex<HashMap<String, u32>>>, String);
 
 /// Драйвер Claude через локальный CLI (`claude.exe`).
 #[derive(Clone)]
@@ -28,11 +38,24 @@ pub struct ClaudeCliDriver {
     claude_cli_path: String,
     /// Дефолтная модель (алиас `opus` / `sonnet` или полное имя).
     default_model: String,
+    /// I1: куда вписать PID спавненного child (для cancel). None → не регистрируем
+    /// (health_check / unit-тесты).
+    pid_reg: Option<PidRegistration>,
 }
 
 impl ClaudeCliDriver {
     pub fn new(id: String, claude_cli_path: String, default_model: String) -> Self {
-        Self { id, claude_cli_path, default_model }
+        Self { id, claude_cli_path, default_model, pid_reg: None }
+    }
+
+    /// I1: включить регистрацию PID в общий running-map по task_id.
+    pub fn with_pid_registration(
+        mut self,
+        running: Arc<AsyncMutex<HashMap<String, u32>>>,
+        task_id: String,
+    ) -> Self {
+        self.pid_reg = Some((running, task_id));
+        self
     }
 }
 
@@ -133,6 +156,13 @@ impl PostRuntimeProvider for ClaudeCliDriver {
         let mut child = cmd
             .spawn()
             .map_err(|e| ProviderError::Server(format!("claude spawn failed: {e}")))?;
+
+        // I1: регистрируем PID в общий running-map → cancel_post_executor может
+        // убить процесс по task_id. kill_on_drop остаётся как backstop.
+        if let (Some((running, task_id)), Some(pid)) = (&self.pid_reg, child.id()) {
+            running.lock().await.insert(task_id.clone(), pid);
+            log::info!("ClaudeCliDriver: registered pid={pid} for task={task_id}");
+        }
 
         if let Some(mut stdin) = child.stdin.take() {
             stdin

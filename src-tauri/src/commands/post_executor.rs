@@ -216,7 +216,7 @@ async fn run_claude_cli_for_post(
     if settings.pal_enabled {
         return run_via_pal(
             task_id, &slug, refined_prompt, system_prompt, &agent_name, &model,
-            &task_dir, &pre_snapshot, settings, db, vault, app,
+            &task_dir, &pre_snapshot, settings, db, vault, registry, app,
         )
         .await;
     }
@@ -526,6 +526,7 @@ async fn run_via_pal(
     settings: &AppSettings,
     db: &WritePool,
     vault: &VaultState,
+    registry: &PostExecutorRegistry,
     app: &AppHandle,
 ) -> Result<PostExecResult, String> {
     use crate::pal::claude_cli_driver::ClaudeCliDriver;
@@ -534,11 +535,14 @@ async fn run_via_pal(
 
     let started = Instant::now();
     let tier = tier_for_model(model);
+    // I1: driver регистрирует PID спавненного claude в общий running-map по
+    // task_id → cancel_post_executor работает и для PAL-пути.
     let driver = ClaudeCliDriver::new(
         "claude_cli".to_string(),
         settings.claude_cli_path.clone(),
         model.to_string(),
-    );
+    )
+    .with_pid_registration(registry.running.clone(), task_id.to_string());
     let request = ProviderRequest {
         system_prompt: system_prompt.to_string(),
         user_message: refined_prompt.to_string(),
