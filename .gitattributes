@@ -1,6 +1,45 @@
+# Нормализация переносов строк.
+# На машине разработки core.autocrlf=true → без явных правил текстовые файлы
+# (особенно *.toml) флипают CRLF и дают фантомные диффы (поймано на Cargo.toml).
+# Правило: источник всегда LF; бинарники помечены binary (никакой нормализации).
+
+* text=auto eol=lf
+
+# Явные текстовые типы — LF:
+*.rs    text eol=lf
+*.toml  text eol=lf
+*.json  text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.js    text eol=lf
+*.jsx   text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.mjs   text eol=lf
+
 # Миграции встраиваются через include_str! и проверяются sqlx по SHA-384.
 # Они ОБЯЗАНЫ оставаться LF на всех платформах (включая CI Windows-раннер с
 # core.autocrlf=true), иначе checksum «уплывёт» и init упадёт с
 # "migration N was previously applied but has been modified".
 # Рантайм-нормализация в lib.rs::lf() — основная защита; это — гигиена источника.
-*.sql text eol=lf
+*.sql   text eol=lf
+
+# Бинарники — никакой нормализации:
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.ico   binary
+*.icns  binary
+*.exe   binary
+*.msi   binary
+*.dll   binary
+*.db    binary
+*.sig   binary
+*.woff  binary
+*.woff2 binary
+
+# v1.0.34 (Итерация B): расширено с одного *.sql на полное покрытие —
+# закрывает фантомный CRLF Cargo.toml (autocrlf=true).
