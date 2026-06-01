@@ -18,8 +18,8 @@ use tokio::process::Command;
 use tokio::sync::Mutex as AsyncMutex;
 
 use super::{
-    Capabilities, HealthStatus, PostRuntimeProvider, ProviderError, ProviderKind,
-    ProviderRequest, ProviderResponse, TokenUsage,
+    Capabilities, HealthStatus, PostRuntimeProvider, ProviderError, ProviderKind, ProviderRequest,
+    ProviderResponse, TokenUsage,
 };
 
 /// PAL-нейтральная регистрация PID: (running-map, task_id). Драйвер вписывает
@@ -45,7 +45,12 @@ pub struct ClaudeCliDriver {
 
 impl ClaudeCliDriver {
     pub fn new(id: String, claude_cli_path: String, default_model: String) -> Self {
-        Self { id, claude_cli_path, default_model, pid_reg: None }
+        Self {
+            id,
+            claude_cli_path,
+            default_model,
+            pid_reg: None,
+        }
     }
 
     /// I1: включить регистрацию PID в общий running-map по task_id.
@@ -84,7 +89,10 @@ pub fn map_stderr_to_error(code: Option<i32>, stderr: &str) -> ProviderError {
     if low.contains("not authenticated") || low.contains("not logged in") || low.contains("login") {
         return ProviderError::Auth(first_line(stderr));
     }
-    if low.contains("model not found") || low.contains("unknown model") || low.contains("unsupported model") {
+    if low.contains("model not found")
+        || low.contains("unknown model")
+        || low.contains("unsupported model")
+    {
         return ProviderError::ModelUnavailable(first_line(stderr));
     }
     if low.contains("connection") || low.contains("network") || low.contains("dns") {

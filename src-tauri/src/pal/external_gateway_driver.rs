@@ -8,8 +8,8 @@
 use async_trait::async_trait;
 
 use super::{
-    Capabilities, HealthStatus, PostRuntimeProvider, ProviderError, ProviderKind,
-    ProviderRequest, ProviderResponse,
+    Capabilities, HealthStatus, PostRuntimeProvider, ProviderError, ProviderKind, ProviderRequest,
+    ProviderResponse,
 };
 
 pub struct ExternalGatewayDriver {

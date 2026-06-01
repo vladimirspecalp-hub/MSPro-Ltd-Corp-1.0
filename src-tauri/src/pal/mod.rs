@@ -344,7 +344,13 @@ mod tests {
         assert_eq!(ProviderKind::ClaudeCli.as_str(), "claude_cli");
         assert_eq!(ProviderKind::QwenHttp.as_str(), "qwen_http");
         assert_eq!(ProviderKind::ExternalGateway.as_str(), "external_gateway");
-        assert_eq!(ProviderError::Timeout { timeout_secs: 1 }.kind_str(), "timeout");
-        assert_eq!(ProviderError::NotImplemented("x".into()).kind_str(), "not_implemented");
+        assert_eq!(
+            ProviderError::Timeout { timeout_secs: 1 }.kind_str(),
+            "timeout"
+        );
+        assert_eq!(
+            ProviderError::NotImplemented("x".into()).kind_str(),
+            "not_implemented"
+        );
     }
 }
