@@ -65,10 +65,13 @@ impl ClaudeCliDriver {
 }
 
 /// Pure-функция сборки argv — вынесена для unit-теста.
-/// ВАЖНО: `--dangerously-skip-permissions` load-bearing в Срезе 1
-/// (без него `--print` молча отказывает Write/Edit/Bash).
+/// Срез 1.5: `--dangerously-skip-permissions` заменён на acceptEdits +
+/// python-whitelist + deny (`super::permission_flags()`, single source — общий
+/// с legacy-путём post_executor). Раньше bypass обходил все проверки; теперь из
+/// shell разрешён только python (manager/engineer пишут .docx/VBA через python),
+/// деструктив закрыт. Residual risk: BL-P1-015 (Phase 2 изоляция).
 pub fn build_cli_args(agent_name: &str, model: &str) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "--print".into(),
         "--output-format".into(),
         "text".into(),
@@ -76,8 +79,9 @@ pub fn build_cli_args(agent_name: &str, model: &str) -> Vec<String> {
         agent_name.to_string(),
         "--model".into(),
         model.to_string(),
-        "--dangerously-skip-permissions".into(),
-    ]
+    ];
+    args.extend(super::permission_flags());
+    args
 }
 
 /// Маппинг exit/stderr → ProviderError (trait v3 §3.3 / IMPL-REFERENCE §3.3).
@@ -275,9 +279,27 @@ mod tests {
                 "mspro-office-manager",
                 "--model",
                 "opus",
-                "--dangerously-skip-permissions",
+                // Срез 1.5: harden — больше НЕ bypass, а acceptEdits + python-whitelist + deny.
+                "--permission-mode",
+                "acceptEdits",
+                "--allowedTools",
+                "Bash(python *) Read Edit Write",
+                "--disallowedTools",
+                "Bash(rm *) Bash(rmdir *) Bash(del *) Bash(format *)",
             ]
         );
+    }
+
+    #[test]
+    fn no_bypass_permissions_flag() {
+        // Security-инвариант Срез 1.5: bypass-флаг НЕ должен присутствовать нигде.
+        let a = build_cli_args("mspro-test", "opus");
+        assert!(
+            !a.iter()
+                .any(|f| f.contains("dangerously-skip-permissions")
+                    || f.contains("bypassPermissions"))
+        );
+        assert!(a.iter().any(|f| f == "acceptEdits"));
     }
 
     #[test]

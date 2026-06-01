@@ -231,6 +231,12 @@ async fn run_claude_cli_for_post(
     }
 
     // 4. Spawn claude.exe.
+    // Срез 1.5 (security harden): раньше тут стоял `--dangerously-skip-permissions`
+    // (= bypassPermissions, обходил ВСЁ). Заменён на acceptEdits + python-whitelist
+    // + deny через `crate::pal::permission_flags()` — ЕДИНЫЙ источник с PAL-путём
+    // (claude_cli_driver), argv не разъедутся. Из shell разрешён только python
+    // (manager .docx / engineer pywin32). Residual risk: BL-P1-015 (Phase 2 изоляция;
+    // whitelist режет какие бинари, не что python делает внутри; cwd ≠ sandbox).
     let mut cmd = Command::new(&settings.claude_cli_path);
     hide_console(&mut cmd);
     cmd.arg("--print")
@@ -240,10 +246,7 @@ async fn run_claude_cli_for_post(
         .arg(&agent_name)
         .arg("--model")
         .arg(&model)
-        // v1.0.24-fix: без этого флага Claude CLI в --print режиме отказывается
-        // вызывать Write/Edit/Bash tools без интерактивного подтверждения.
-        // Безопасно — cwd жёстко ограничен sandbox-папкой Outbox/<task_id>/.
-        .arg("--dangerously-skip-permissions")
+        .args(crate::pal::permission_flags())
         .current_dir(&task_dir)
         .env("MSPRO_TASK_ID", task_id)
         .stdin(Stdio::piped())

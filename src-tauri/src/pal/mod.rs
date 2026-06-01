@@ -57,6 +57,38 @@ pub trait PostRuntimeProvider: Send + Sync {
 }
 
 // ---------------------------------------------------------------------------
+// Permission flags (Срез 1.5 — security harden, single source)
+// ---------------------------------------------------------------------------
+
+/// Флаги разрешений для headless `claude --print` пост-агентов.
+///
+/// Заменяют `--dangerously-skip-permissions` (= `bypassPermissions`, обходил ВСЁ).
+/// Политика (Вариант Б + deny, выбрана Владельцем по спайку v2.1.140):
+///   `--permission-mode acceptEdits` — Write/Edit авто-принимаются (нет интерактива).
+///   `--allowedTools "Bash(python *) Read Edit Write"` — **whitelist**: из shell
+///     разрешён ТОЛЬКО python (manager .docx через python-docx; engineer pywin32
+///     COM = `python ...`; `python -m pip`). Спайк S5: не-python (powershell/cmd)
+///     физически НЕ запускается → обходы deny-list невозможны.
+///   `--disallowedTools "Bash(rm *) ..."` — defense-in-depth поверх whitelist.
+///
+/// ⚠️ Residual risk (BL-P1-015, Phase 2): whitelist режет КАКИЕ бинари, не ЧТО
+/// python делает внутри (скрипт может `os.remove`/сеть); cwd ≠ sandbox. Это
+/// harden, не полная изоляция.
+///
+/// SINGLE SOURCE: и PAL (`claude_cli_driver`), и legacy (`post_executor`) зовут
+/// эту функцию — argv не разъедутся.
+pub fn permission_flags() -> Vec<String> {
+    vec![
+        "--permission-mode".into(),
+        "acceptEdits".into(),
+        "--allowedTools".into(),
+        "Bash(python *) Read Edit Write".into(),
+        "--disallowedTools".into(),
+        "Bash(rm *) Bash(rmdir *) Bash(del *) Bash(format *)".into(),
+    ]
+}
+
+// ---------------------------------------------------------------------------
 // ProviderRequest
 // ---------------------------------------------------------------------------
 
@@ -312,6 +344,24 @@ pub struct Capabilities {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn permission_flags_harden_no_bypass() {
+        // Срез 1.5 security-инвариант: НЕТ bypass; есть acceptEdits + python-whitelist + deny.
+        let f = permission_flags();
+        let joined = f.join(" ");
+        assert!(!joined.contains("dangerously-skip-permissions"));
+        assert!(!joined.contains("bypassPermissions"));
+        assert!(f.contains(&"acceptEdits".to_string()));
+        assert!(f.contains(&"--permission-mode".to_string()));
+        // whitelist: только python из shell
+        assert!(f.iter().any(|x| x.contains("Bash(python *)")));
+        assert!(f
+            .iter()
+            .any(|x| x.contains("Read") && x.contains("Edit") && x.contains("Write")));
+        // deny деструктива
+        assert!(f.iter().any(|x| x.contains("Bash(rm *)")));
+    }
 
     #[test]
     fn should_fallback_matrix() {
