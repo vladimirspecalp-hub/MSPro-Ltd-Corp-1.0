@@ -31,13 +31,20 @@ static REDACTIONS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
                 .unwrap(),
             "$1$2***REDACTED***",
         ),
+        // Token-маски. Длина {20,200}:
+        //  • нижняя 20 — чтобы НЕ цеплять `sk-` в обычном тексте/артикулах;
+        //  • верхняя 200 — кэп жадности. `\b` тут бесполезен (regex crate без
+        //    lookahead; внутри непрерывного alphanum границы нет — ключ нельзя
+        //    отделить от слипшегося текста без разделителя). Кэп 200 гарантирует:
+        //    при слипании ключа с текстом съедается максимум 200 символов, не весь
+        //    буфер. Реальные ключи короче (Anthropic ~108, OpenAI ~164, GitHub ≤93).
         // Anthropic key (до общего sk-, чтобы сохранить префикс sk-ant-).
-        (Regex::new(r"sk-ant-[A-Za-z0-9_-]{20,}").unwrap(), "sk-ant-***REDACTED***"),
-        // OpenAI-style key. Длина ≥20 — чтобы НЕ цеплять `sk-` в обычном тексте/артикулах.
-        (Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap(), "sk-***REDACTED***"),
+        (Regex::new(r"sk-ant-[A-Za-z0-9_-]{20,200}").unwrap(), "sk-ant-***REDACTED***"),
+        // OpenAI-style key.
+        (Regex::new(r"sk-[A-Za-z0-9]{20,200}").unwrap(), "sk-***REDACTED***"),
         // GitHub tokens.
-        (Regex::new(r"github_pat_[A-Za-z0-9_]{20,}").unwrap(), "ghp_***REDACTED***"),
-        (Regex::new(r"ghp_[A-Za-z0-9]{20,}").unwrap(), "ghp_***REDACTED***"),
+        (Regex::new(r"github_pat_[A-Za-z0-9_]{20,200}").unwrap(), "ghp_***REDACTED***"),
+        (Regex::new(r"ghp_[A-Za-z0-9]{20,200}").unwrap(), "ghp_***REDACTED***"),
         // Bearer header (len ≥8 — не цеплять `Bearer ollama` dummy слишком жадно? — dummy 6 симв, не заденет).
         (Regex::new(r"(?i)bearer\s+[A-Za-z0-9._-]{8,}").unwrap(), "Bearer ***REDACTED***"),
         // PII: имя пользователя в Windows-пути.
@@ -203,6 +210,17 @@ mod tests {
         // цельный ключ замаскирован, хвост def…mno НЕ торчит
         assert!(result.contains("sk-***REDACTED***"));
         assert!(!result.contains("abcdef123ghi456jkl789mno"));
+    }
+
+    #[test]
+    fn redact_length_cap_limits_greedy_eat() {
+        // Слипшийся хвост >200: маска НЕ съедает весь буфер (кэп {20,200}).
+        // Текст после 200-го символа от sk- остаётся (не утечка — это легит-текст).
+        let glued = "sk-".to_string() + &"a".repeat(300) + "ХВОСТ-ТЕКСТ-СОХРАНЁН";
+        let result = redact(&glued);
+        assert!(result.contains("sk-***REDACTED***"));
+        // часть «ключа» за пределами 200 + явный хвост уцелели (кэп сработал)
+        assert!(result.contains("ХВОСТ-ТЕКСТ-СОХРАНЁН"));
     }
 
     #[test]
