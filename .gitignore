@@ -58,3 +58,14 @@ ci_summary.txt
 
 scripts/smoke/proof.txt
 scripts/smoke/baseline_run.txt
+scripts/smoke/*_proof.txt
+
+# Iteration B local smoke/build artifacts (machine-specific, not tracked)
+build_msi_done.txt
+exe_ver.txt
+installed_state.txt
+bump.log
+commit.log
+cargocheck.log
+preflight_tsc.log
+build_msi.log
