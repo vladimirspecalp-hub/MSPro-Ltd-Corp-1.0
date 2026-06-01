@@ -56,3 +56,5 @@ clippy.log
 clippy_mine.txt
 ci_summary.txt
 
+scripts/smoke/proof.txt
+scripts/smoke/baseline_run.txt
