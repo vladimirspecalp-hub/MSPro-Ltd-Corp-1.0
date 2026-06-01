@@ -104,9 +104,7 @@ pub fn trigger_post_executor(
         {
             let map = registry.running.lock().await;
             if map.contains_key(&task_id) {
-                log::warn!(
-                    "post_executor: task {task_id} already running, skip duplicate trigger"
-                );
+                log::warn!("post_executor: task {task_id} already running, skip duplicate trigger");
                 return;
             }
         }
@@ -133,7 +131,10 @@ pub fn trigger_post_executor(
         match result {
             Ok(r) => log::info!(
                 "post_executor: task {} done exit={} artifacts={} elapsed_ms={}",
-                r.task_id, r.exit_code, r.artifacts_count, r.elapsed_ms
+                r.task_id,
+                r.exit_code,
+                r.artifacts_count,
+                r.elapsed_ms
             ),
             Err(e) => {
                 log::error!("post_executor: task {task_id} failed: {e}");
@@ -160,25 +161,22 @@ async fn run_claude_cli_for_post(
     let started_at = Instant::now();
 
     // 1. Lookup post row — нужны system_prompt_md + preferred_model.
-    let row: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
-        "SELECT slug, system_prompt_md, preferred_model FROM posts WHERE slug = ?",
-    )
-    .bind(post_slug)
-    .fetch_optional(&db.0)
-    .await
-    .map_err(|e| format!("posts lookup: {e}"))?;
+    let row: Option<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT slug, system_prompt_md, preferred_model FROM posts WHERE slug = ?")
+            .bind(post_slug)
+            .fetch_optional(&db.0)
+            .await
+            .map_err(|e| format!("posts lookup: {e}"))?;
 
-    let (slug, system_prompt_opt, preferred_model_opt) = row
-        .ok_or_else(|| format!("post '{post_slug}' not found"))?;
+    let (slug, system_prompt_opt, preferred_model_opt) =
+        row.ok_or_else(|| format!("post '{post_slug}' not found"))?;
 
     let system_prompt = system_prompt_opt
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| {
-            format!(
-                "post '{slug}' не имеет system_prompt_md — задай его в Posts Editor (🧠)"
-            )
+            format!("post '{slug}' не имеет system_prompt_md — задай его в Posts Editor (🧠)")
         })?;
 
     // Выбор модели: preferred_model → settings.claude_cli_model → дефолт.
@@ -215,8 +213,19 @@ async fn run_claude_cli_for_post(
     // false → legacy прямой spawn ниже (нетронут). default false (v1.0.34).
     if settings.pal_enabled {
         return run_via_pal(
-            task_id, &slug, refined_prompt, system_prompt, &agent_name, &model,
-            &task_dir, &pre_snapshot, settings, db, vault, registry, app,
+            task_id,
+            &slug,
+            refined_prompt,
+            system_prompt,
+            &agent_name,
+            &model,
+            &task_dir,
+            &pre_snapshot,
+            settings,
+            db,
+            vault,
+            registry,
+            app,
         )
         .await;
     }
@@ -242,19 +251,17 @@ async fn run_claude_cli_for_post(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
 
-    let mut child: Child = cmd
-        .spawn()
-        .map_err(|e| {
-            // Сразу помечаем задачу failed чтобы UI не висел.
-            let task_id = task_id.to_string();
-            let reason = format!("spawn failed: {e}");
-            let db_clone = db.clone();
-            let app_clone = app.clone();
-            tauri::async_runtime::spawn(async move {
-                let _ = dispatcher::fail_task_inner(task_id, reason, &db_clone, &app_clone).await;
-            });
-            format!("claude spawn failed: {e}")
-        })?;
+    let mut child: Child = cmd.spawn().map_err(|e| {
+        // Сразу помечаем задачу failed чтобы UI не висел.
+        let task_id = task_id.to_string();
+        let reason = format!("spawn failed: {e}");
+        let db_clone = db.clone();
+        let app_clone = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = dispatcher::fail_task_inner(task_id, reason, &db_clone, &app_clone).await;
+        });
+        format!("claude spawn failed: {e}")
+    })?;
 
     // Регистрируем PID для cancel.
     let pid = child.id().unwrap_or(0);
@@ -427,10 +434,7 @@ fn walk_dir(root: &Path, cur: &Path, out: &mut HashMap<String, u64>) {
             walk_dir(root, &p, out);
         } else if meta.is_file() {
             if let Ok(rel) = p.strip_prefix(root) {
-                let rel_s = rel
-                    .to_string_lossy()
-                    .replace('\\', "/")
-                    .to_string();
+                let rel_s = rel.to_string_lossy().replace('\\', "/").to_string();
                 let mtime_secs = meta
                     .modified()
                     .ok()
@@ -468,13 +472,9 @@ fn guess_mime_from_ext(rel_path: &str) -> Option<String> {
         "txt" | "md" => "text/plain",
         "json" => "application/json",
         "html" | "htm" => "text/html",
-        "docx" => {
-            "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-        }
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        "pptx" => {
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation"
-        }
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
         "pdf" => "application/pdf",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
@@ -485,14 +485,12 @@ fn guess_mime_from_ext(rel_path: &str) -> Option<String> {
 }
 
 async fn bump_attempts(task_id: &str, db: &WritePool) -> Result<(), String> {
-    sqlx::query(
-        "UPDATE dispatcher_logs SET attempts_count = attempts_count + 1 WHERE id = ?",
-    )
-    .bind(task_id)
-    .execute(&db.0)
-    .await
-    .map(|_| ())
-    .map_err(|e| format!("bump_attempts: {e}"))
+    sqlx::query("UPDATE dispatcher_logs SET attempts_count = attempts_count + 1 WHERE id = ?")
+        .bind(task_id)
+        .execute(&db.0)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("bump_attempts: {e}"))
 }
 
 /// Map модели → Tier (Phase 1 interim, до post_runtime в Срезе 3).
@@ -511,8 +509,9 @@ fn tier_for_model(m: &str) -> crate::pal::Tier {
 
 /// Phase 1 (Iteration B) — путь исполнения через PAL.
 /// Повторяет downstream logic legacy (diff_dir / register_artifact / fail/success),
-/// но spawn делает orchestrator → ClaudeCliDriver + пишет run_logs.
-/// Срез 1: один провайдер (claude_cli), без fallback chain (Срез 2).
+/// но invoke делает orchestrator::pal_invoke_chain + пишет run_logs.
+/// Срез 2: fallback chain [claude_cli primary, qwen_http]. provider_registry-driven
+/// chain (post_runtime) — Срез 3. Qwen-ответ пишется в result.txt (нет native Write).
 #[allow(clippy::too_many_arguments)]
 async fn run_via_pal(
     task_id: &str,
@@ -530,19 +529,35 @@ async fn run_via_pal(
     app: &AppHandle,
 ) -> Result<PostExecResult, String> {
     use crate::pal::claude_cli_driver::ClaudeCliDriver;
-    use crate::pal::{orchestrator, ProviderRequest, RequestTrace};
+    use crate::pal::qwen_http_driver::QwenHttpDriver;
+    use crate::pal::{
+        orchestrator, PostRuntimeProvider, ProviderKind, ProviderRequest, RequestTrace,
+    };
     use crate::run_logger::{insert_run_log, RunLogEntry};
+    use std::sync::Arc;
 
     let started = Instant::now();
     let tier = tier_for_model(model);
-    // I1: driver регистрирует PID спавненного claude в общий running-map по
-    // task_id → cancel_post_executor работает и для PAL-пути.
-    let driver = ClaudeCliDriver::new(
-        "claude_cli".to_string(),
-        settings.claude_cli_path.clone(),
-        model.to_string(),
-    )
-    .with_pid_registration(registry.running.clone(), task_id.to_string());
+
+    // Срез 2: хардкод-interim fallback chain [claude_cli primary, qwen_http].
+    // Provider_registry-driven chain (post_runtime.fallback_chain_json) — Срез 3.
+    // I1: ClaudeCliDriver регистрирует PID спавненного claude в общий running-map
+    // → cancel_post_executor работает на PAL-пути.
+    let claude: Arc<dyn PostRuntimeProvider> = Arc::new(
+        ClaudeCliDriver::new(
+            "claude_cli".to_string(),
+            settings.claude_cli_path.clone(),
+            model.to_string(),
+        )
+        .with_pid_registration(registry.running.clone(), task_id.to_string()),
+    );
+    let qwen: Arc<dyn PostRuntimeProvider> = Arc::new(QwenHttpDriver::new(
+        "qwen_http".to_string(),
+        settings.qwen_endpoint.clone(),
+        settings.qwen_model.clone(),
+    ));
+    let chain: Vec<Arc<dyn PostRuntimeProvider>> = vec![claude, qwen];
+
     let request = ProviderRequest {
         system_prompt: system_prompt.to_string(),
         user_message: refined_prompt.to_string(),
@@ -556,33 +571,70 @@ async fn run_via_pal(
         trace: RequestTrace {
             post_slug: slug.to_string(),
             dispatcher_log_id: Some(task_id.to_string()),
-            attempt_id: format!("{task_id}-0"),
+            attempt_id: task_id.to_string(),
             attempt_number: 0,
         },
     };
 
-    log::info!("run_via_pal: task={task_id} slug={slug} tier={} model={model}", tier.as_str());
-    let result = orchestrator::pal_invoke(&driver, request).await;
+    log::info!("run_via_pal: task={task_id} slug={slug} tier={} model={model} chain=[claude_cli,qwen_http]", tier.as_str());
+    let outcome = orchestrator::pal_invoke_chain(&chain, request).await;
+    let result = outcome.result;
     let elapsed_ms = started.elapsed().as_millis();
 
-    // run_logs запись (успех или ошибка).
-    let (success, error_kind, raw_output, latency) = match &result {
-        Ok(resp) => (true, None, Some(resp.text.clone()), resp.latency_ms as i64),
-        Err(e) => (false, Some(e.kind_str().to_string()), Some(e.to_string()), elapsed_ms as i64),
+    // Qwen не пишет файлы сам (нет native Write) → post_executor пишет result.txt,
+    // чтобы diff_dir подхватил как artifact (IMPL-REFERENCE §2 Вариант A). Claude
+    // создаёт файлы сам — для него result.txt НЕ пишем.
+    if let Ok(resp) = &result {
+        if resp.provider_used == ProviderKind::QwenHttp && !resp.text.trim().is_empty() {
+            let result_path = task_dir.join("result.txt");
+            if let Err(e) = std::fs::write(&result_path, &resp.text) {
+                log::warn!("run_via_pal: write Qwen result.txt failed: {e}");
+            }
+        }
+    }
+
+    // run_logs: provider_used/model_used/fallback_used из ФАКТИЧЕСКОГО ответа.
+    let (provider_used, model_used, success, error_kind, raw_output, latency) = match &result {
+        Ok(resp) => (
+            resp.provider_used.as_str().to_string(),
+            resp.model_used.clone(),
+            true,
+            None,
+            Some(resp.text.clone()),
+            resp.latency_ms as i64,
+        ),
+        Err(e) => (
+            // при провале chain — id последнего пробованного провайдера
+            chain
+                .get(outcome.attempt_idx)
+                .map(|p| p.provider_id())
+                .unwrap_or_else(|| "claude_cli".to_string()),
+            model.to_string(),
+            false,
+            Some(e.kind_str().to_string()),
+            Some(e.to_string()),
+            elapsed_ms as i64,
+        ),
     };
     let entry = RunLogEntry {
         task_id: Some(task_id.to_string()),
         post_slug: Some(slug.to_string()),
-        provider_id: "claude_cli".to_string(),
-        model_used: Some(model.to_string()),
+        provider_id: provider_used,
+        model_used: Some(model_used),
         tier: Some(tier.as_str().to_string()),
-        tokens_in: 0,
-        tokens_out: 0,
+        tokens_in: result
+            .as_ref()
+            .map(|r| r.usage.input_tokens as i64)
+            .unwrap_or(0),
+        tokens_out: result
+            .as_ref()
+            .map(|r| r.usage.output_tokens as i64)
+            .unwrap_or(0),
         latency_ms: latency,
         cost_usd: 0.0,
         success,
-        fallback_used: false,
-        attempt_number: 0,
+        fallback_used: outcome.fallback_used,
+        attempt_number: outcome.attempt_idx as i64,
         error_kind,
         raw_output,
     };
@@ -595,7 +647,9 @@ async fn run_via_pal(
     let mut registered = 0usize;
     for rel in &new_files {
         let mime = guess_mime_from_ext(rel);
-        match artifacts::register_artifact(task_id, rel, mime.as_deref(), slug, db, vault, app).await {
+        match artifacts::register_artifact(task_id, rel, mime.as_deref(), slug, db, vault, app)
+            .await
+        {
             Ok(_) => registered += 1,
             Err(e) => log::warn!("run_via_pal: register {rel} failed: {e}"),
         }
@@ -603,7 +657,9 @@ async fn run_via_pal(
 
     let exit_code = match &result {
         Ok(_) if registered > 0 => {
-            log::info!("run_via_pal: task {task_id} produced {registered} artifacts — awaiting approval");
+            log::info!(
+                "run_via_pal: task {task_id} produced {registered} artifacts — awaiting approval"
+            );
             0
         }
         Ok(_) => {
@@ -619,7 +675,13 @@ async fn run_via_pal(
         }
         Err(e) => {
             let _ = bump_attempts(task_id, db).await;
-            let _ = dispatcher::fail_task_inner(task_id.to_string(), format!("PAL error: {e}"), db, app).await;
+            let _ = dispatcher::fail_task_inner(
+                task_id.to_string(),
+                format!("PAL error: {e}"),
+                db,
+                app,
+            )
+            .await;
             -1
         }
     };
@@ -665,7 +727,10 @@ pub async fn cancel_post_executor(
     {
         use sysinfo::Pid;
         let mut sys = sysinfo::System::new();
-        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]), true);
+        sys.refresh_processes(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
+            true,
+        );
         if let Some(proc_) = sys.process(Pid::from_u32(pid)) {
             let killed = proc_.kill();
             log::info!("cancel_post_executor: kill pid={pid} task={task_id} ok={killed}");
