@@ -27,7 +27,11 @@ def main() -> int:
     lines = []
 
     def emit(s: str = "") -> None:
-        print(s)
+        # cp1251-консоль падает на не-ASCII (↔ и т.п.) — пишем безопасно.
+        try:
+            print(s)
+        except UnicodeEncodeError:
+            print(s.encode("ascii", "replace").decode("ascii"))
         lines.append(s)
 
     conn = sqlite3.connect(uri, uri=True, timeout=5)
@@ -81,7 +85,7 @@ def main() -> int:
             emit(f"  run_logs read error: {e}")
 
         emit("")
-        emit("=== JOIN dispatcher_logs ↔ run_logs (последняя PAL-задача) ===")
+        emit("=== JOIN dispatcher_logs <-> run_logs (последняя PAL-задача) ===")
         try:
             j = cur.execute(
                 "SELECT d.id task, d.status d_status, d.outbox_path, "

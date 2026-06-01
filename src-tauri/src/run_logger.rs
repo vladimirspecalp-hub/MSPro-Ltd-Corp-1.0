@@ -1,14 +1,59 @@
 //! Run Logger — запись каждого PAL-вызова в `run_logs`.
 //!
-//! Параметризованный INSERT (никакой конкатенации). `raw_output` обрезается
-//! ≤64KB (R-T-015 — защита от роста БД). id = uuid v4.
+//! Параметризованный INSERT (никакой конкатенации). `raw_output` сначала
+//! **редактируется** (маскировка секретов/PII — BL-P1-007), затем обрезается
+//! ≤64KB (R-T-015). Порядок строгий: redact → truncate, в ЕДИНСТВЕННОЙ точке
+//! (`insert_run_log`). id = uuid v4.
 
+use once_cell::sync::Lazy;
+use regex::Regex;
 use uuid::Uuid;
 
 use crate::db::WritePool;
 
 /// Максимум для `run_logs.raw_output` (AC-002.7 / R-T-015).
 pub const MAX_RAW_OUTPUT: usize = 64 * 1024;
+
+/// Маски секретов/PII (BL-P1-007). Компилируются один раз.
+///
+/// ВАЖНО (SSE-граница): redact применяется к УЖЕ СОБРАННОЙ строке `response.text`
+/// (Qwen-аккумулятор склеил все SSE-чанки до возврата из invoke), поэтому ключ,
+/// разорванный по чанкам, на входе сюда уже цельный → маскируется целиком.
+/// НЕ применять redact к отдельному SSE-чанку.
+///
+/// Англ + РУС ключевые слова — проект работает на русском, англ-only паттерны
+/// не поймали бы утечку в русском тексте.
+static REDACTIONS: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
+    vec![
+        // key=value / ключ: значение (англ + рус). $1 сохраняет имя поля.
+        (
+            Regex::new(r"(?i)\b(api[_-]?key|token|password|passwd|secret|пароль|ключ|токен|секрет|доступ)\b(\s*[:=]\s*)\S+")
+                .unwrap(),
+            "$1$2***REDACTED***",
+        ),
+        // Anthropic key (до общего sk-, чтобы сохранить префикс sk-ant-).
+        (Regex::new(r"sk-ant-[A-Za-z0-9_-]{20,}").unwrap(), "sk-ant-***REDACTED***"),
+        // OpenAI-style key. Длина ≥20 — чтобы НЕ цеплять `sk-` в обычном тексте/артикулах.
+        (Regex::new(r"sk-[A-Za-z0-9]{20,}").unwrap(), "sk-***REDACTED***"),
+        // GitHub tokens.
+        (Regex::new(r"github_pat_[A-Za-z0-9_]{20,}").unwrap(), "ghp_***REDACTED***"),
+        (Regex::new(r"ghp_[A-Za-z0-9]{20,}").unwrap(), "ghp_***REDACTED***"),
+        // Bearer header (len ≥8 — не цеплять `Bearer ollama` dummy слишком жадно? — dummy 6 симв, не заденет).
+        (Regex::new(r"(?i)bearer\s+[A-Za-z0-9._-]{8,}").unwrap(), "Bearer ***REDACTED***"),
+        // PII: имя пользователя в Windows-пути.
+        (Regex::new(r"C:\\Users\\[^\\\s]+").unwrap(), r"C:\Users\***"),
+    ]
+});
+
+/// Маскирует секреты/PII в строке (BL-P1-007). Pure-функция.
+/// Применяется ДО truncate (см. `insert_run_log`).
+pub fn redact(s: &str) -> String {
+    let mut out = s.to_string();
+    for (re, repl) in REDACTIONS.iter() {
+        out = re.replace_all(&out, *repl).into_owned();
+    }
+    out
+}
 
 /// Запись для вставки в run_logs (одна попытка одного провайдера).
 #[derive(Debug, Clone)]
@@ -44,7 +89,10 @@ pub fn truncate_raw(s: &str) -> String {
 /// Вставляет строку в run_logs. Возвращает id записи.
 pub async fn insert_run_log(pool: &WritePool, e: RunLogEntry) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
-    let raw = e.raw_output.as_deref().map(truncate_raw);
+    // BL-P1-007: redact ДО truncate (секрет заменён ПЕРЕД обрезкой → даже если
+    // ***REDACTED*** ляжет на границу 64KB, хвоста ключа нет). Единственная
+    // точка обрезки raw_output во всём коде (verified грепом).
+    let raw = e.raw_output.as_deref().map(|s| truncate_raw(&redact(s)));
     sqlx::query(
         "INSERT INTO run_logs (id, task_id, post_slug, provider_id, model_used, tier, \
             tokens_in, tokens_out, latency_ms, cost_usd, success, fallback_used, \
@@ -89,5 +137,87 @@ mod tests {
     #[test]
     fn truncate_passes_small_output() {
         assert_eq!(truncate_raw("hello"), "hello");
+    }
+
+    // ----- BL-P1-007 redaction -----
+
+    #[test]
+    fn redact_masks_all_kinds() {
+        // Англ + РУС ключевые слова.
+        assert!(redact("password: hunter2xyz").contains("***REDACTED***"));
+        assert!(!redact("password: hunter2xyz").contains("hunter2xyz"));
+        assert!(redact("пароль = mojSecret123").contains("***REDACTED***"));
+        assert!(!redact("пароль = mojSecret123").contains("mojSecret123"));
+        assert!(redact("ключ: abcDEF12345").contains("***REDACTED***"));
+        assert!(redact("токен=ghp_0123456789abcdefghijklmnop").contains("***REDACTED***"));
+        assert!(redact("секрет: topsecretvalue").contains("***REDACTED***"));
+        assert!(redact("доступ = qwerty999").contains("***REDACTED***"));
+        // Anthropic / OpenAI / GitHub / Bearer.
+        let s = redact("key sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123");
+        assert!(s.contains("sk-ant-***REDACTED***"));
+        assert!(!s.contains("abcdefghijklmnopqrstuvwxyz0123"));
+        assert!(redact("sk-proj1234567890ABCDEFGHIJ").contains("sk-***REDACTED***"));
+        assert!(redact("ghp_0123456789abcdefghijklmnop").contains("ghp_***REDACTED***"));
+        assert!(redact("Authorization: Bearer eyJ0eXAabcdefgh").contains("Bearer ***REDACTED***"));
+        // PII path.
+        assert_eq!(
+            redact(r"file at C:\Users\Vladimir\doc.txt"),
+            r"file at C:\Users\***\doc.txt"
+        );
+    }
+
+    #[test]
+    fn redact_key_at_truncate_boundary() {
+        // Суть: redact идёт ДО truncate, поэтому даже если хвост строки уходит
+        // под обрезку — настоящего ключа в выводе НЕТ (он заменён маской раньше).
+        // Ключ ставим так, чтобы хвост (после ключа) попадал под нож, а сам
+        // ключ был ДО границы → маска уцелевает целиком.
+        // Ключ окружён разделителями (пробелами) — как в реальном выводе
+        // (ключ = отдельный токен, не слипается с соседним текстом).
+        let key = "sk-".to_string() + &"a".repeat(40);
+        let big = "x".repeat(MAX_RAW_OUTPUT - 1000) + " " + &key + " " + &"y".repeat(5000);
+        let redacted = redact(&big);
+        let result = truncate_raw(&redacted);
+        // redact срезал только ключ (~26 байт), хвост y×5000 цел → всё ещё > MAX
+        assert!(
+            redacted.len() > MAX_RAW_OUTPUT,
+            "redacted.len()={} должно быть > MAX={}",
+            redacted.len(),
+            MAX_RAW_OUTPUT
+        );
+        // 1) настоящего ключа sk-aaaa… не осталось (главная гарантия: redact ДО truncate)
+        assert!(!result.contains(&key));
+        assert!(!result.contains("sk-aaaaaaaaaa"));
+        // 2) маска на месте (ключ был до границы → уцелел целиком)
+        assert!(result.contains("sk-***REDACTED***"));
+        // 3) хвост обрезан (truncate сработал после redact)
+        assert!(result.contains("truncated"));
+    }
+
+    #[test]
+    fn redact_key_assembled_from_sse_chunks() {
+        // Имитация: accumulate склеил чанки в ОДНУ строку до redact.
+        let chunks = ["前文 sk-abc", "def123ghi456jkl789mno ключ-конец"];
+        let assembled: String = chunks.concat(); // "前文 sk-abcdef123ghi456jkl789mno ключ-конец"
+        let result = redact(&assembled);
+        // цельный ключ замаскирован, хвост def…mno НЕ торчит
+        assert!(result.contains("sk-***REDACTED***"));
+        assert!(!result.contains("abcdef123ghi456jkl789mno"));
+    }
+
+    #[test]
+    fn redact_does_not_break_legit_text() {
+        // Рабочий русский деловой текст — без изменений.
+        let biz = "Подготовь короткое письмо контрагенту ООО «Промтехкор» о пропусках.";
+        assert_eq!(redact(biz), biz);
+        // Артикулы / короткий sk- (<20) — не трогаем.
+        let art = "Артикул АРТ-2024-001, позиция sk-12, склад №5.";
+        assert_eq!(redact(art), art);
+        // Обычный путь без Users — не трогаем.
+        let path = r"Сохранено в D:\Projects\report.docx";
+        assert_eq!(redact(path), path);
+        // Dummy `Bearer ollama` (6 симв < 8) — не маскируем (это не секрет).
+        let dummy = "header Bearer ollama";
+        assert_eq!(redact(dummy), dummy);
     }
 }

@@ -1,0 +1,14 @@
+=== provider_registry (R-T-006: ожидаем 3) ===
+COUNT=3
+  claude_cli         kind=ClaudeCli        model='opus'               status=enabled
+  external_gateway   kind=ExternalGateway  model=''                   status=enabled
+  qwen_http          kind=QwenHttp         model='qwen3:14b'          status=enabled
+
+=== run_logs (последние 5) ===
+COUNT_TOTAL=0
+  (пусто — задач через PAL ещё не было)
+
+=== JOIN dispatcher_logs <-> run_logs (последняя PAL-задача) ===
+  (нет связанных строк run_logs↔dispatcher_logs)
+
+[written] C:\CODE\MSPro-Ltd Corp 1.0\scripts\smoke\proof.txt
