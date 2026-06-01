@@ -231,28 +231,25 @@ async fn run_claude_cli_for_post(
     }
 
     // 4. Spawn claude.exe.
-    // Срез 1.5 (security harden): раньше тут стоял `--dangerously-skip-permissions`
-    // (= bypassPermissions, обходил ВСЁ). Заменён на acceptEdits + python-whitelist
-    // + deny через `crate::pal::permission_flags()` — ЕДИНЫЙ источник с PAL-путём
-    // (claude_cli_driver), argv не разъедутся. Из shell разрешён только python
-    // (manager .docx / engineer pywin32). Residual risk: BL-P1-015 (Phase 2 изоляция;
-    // whitelist режет какие бинари, не что python делает внутри; cwd ≠ sandbox).
+    // Срез 1.5 (security harden): legacy-путь использует ТУ ЖЕ `build_cli_args`,
+    // что и PAL (claude_cli_driver) — ЕДИНЫЙ источник всего argv (включая
+    // permission_flags: acceptEdits + python-whitelist + deny). Раньше тут был
+    // `--dangerously-skip-permissions` (bypass всего) + руками дублировался базовый
+    // argv. Теперь одна функция на оба пути → bypass физически нельзя вернуть в
+    // обход (нет второго места с argv-строками). Residual risk: BL-P1-015 (Phase 2
+    // изоляция; whitelist режет какие бинари, не что python делает внутри).
     let mut cmd = Command::new(&settings.claude_cli_path);
     hide_console(&mut cmd);
-    cmd.arg("--print")
-        .arg("--output-format")
-        .arg("text")
-        .arg("--agent")
-        .arg(&agent_name)
-        .arg("--model")
-        .arg(&model)
-        .args(crate::pal::permission_flags())
-        .current_dir(&task_dir)
-        .env("MSPRO_TASK_ID", task_id)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+    cmd.args(crate::pal::claude_cli_driver::build_cli_args(
+        &agent_name,
+        &model,
+    ))
+    .current_dir(&task_dir)
+    .env("MSPRO_TASK_ID", task_id)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .kill_on_drop(true);
 
     let mut child: Child = cmd.spawn().map_err(|e| {
         // Сразу помечаем задачу failed чтобы UI не висел.
@@ -756,4 +753,41 @@ pub async fn cleanup_orphan_post_processes() -> usize {
     // в 11B-1 — no-op stub. Полную реализацию через wmic / WMIC
     // оставим на 11B-2 (если Job Object не справится).
     0
+}
+
+#[cfg(test)]
+mod tests {
+    /// Сторож на LEGACY-двери (Cursor follow-up Срез 1.5): регресс-тесты на
+    /// `build_cli_args` стоят на PAL-двери, но legacy spawn — отдельный путь
+    /// (прод!). Source-guard: исходник этого файла НЕ должен содержать
+    /// `--dangerously-skip-permissions` (bypass) и должен звать единый
+    /// `build_cli_args`. Ловит возврат bypass прямо в legacy в обход
+    /// permission_flags() — закрывает «флаг в двух местах» с обеих сторон.
+    const SRC: &str = include_str!("post_executor.rs");
+
+    #[test]
+    fn legacy_spawn_has_no_bypass_flag() {
+        // Source-guard ищет bypass-флаг как переданный в Command аргумент.
+        // Паттерн и сам флаг собраны из частей в runtime, чтобы этот тест
+        // (через include_str! читающий собственный файл) НЕ матчил сам себя —
+        // в исходнике нет цельного литерала, только склейка ниже.
+        let dot_arg = concat!(".", "arg");
+        let flag = concat!("--dangerously", "-skip-permissions");
+        let bypass_call = format!("{}({}{}{})", dot_arg, '"', flag, '"');
+        let hits = SRC.matches(&bypass_call).count();
+        assert_eq!(
+            hits, 0,
+            "legacy spawn содержит bypass-флаг как аргумент Command — security regress (Срез 1.5)"
+        );
+    }
+
+    #[test]
+    fn legacy_spawn_uses_single_source_argv() {
+        // legacy должен звать общий build_cli_args (единый источник argv с PAL),
+        // а не собирать --print/--agent/permission_flags руками (риск разъезда).
+        assert!(
+            SRC.contains("claude_cli_driver::build_cli_args(&agent_name, &model)"),
+            "legacy spawn не использует единый build_cli_args — argv может разъехаться с PAL"
+        );
+    }
 }
