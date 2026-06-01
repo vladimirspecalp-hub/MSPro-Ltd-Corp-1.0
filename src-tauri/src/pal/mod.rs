@@ -18,6 +18,7 @@
 pub mod claude_cli_driver;
 pub mod external_gateway_driver;
 pub mod orchestrator;
+pub mod qwen_http_driver;
 
 use std::path::PathBuf;
 use std::time::Duration;
