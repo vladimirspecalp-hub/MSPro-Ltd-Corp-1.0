@@ -101,3 +101,13 @@
 - **Приоритет:** Средний (Phase 2; Phase 1 harden закрыл очевидный вектор — произвольные shell-команды/деструктив).
 - **Оценка:** R&D. Кандидаты: (а) запуск пост-агента в отдельном Windows-процессе с ограниченным токеном (job object + restricted SID); (б) контейнер/WSL без сети + bind-mount только Outbox; (в) python-sandbox (RestrictedPython / seccomp-аналог) — слабее; (г) FS-jail через junction + ACL на Outbox. Выбор — отдельное investigation Phase 2.
 - **Пререквизиты:** Phase 2. Связь с R-T-002/011 (Job Object 11B-bis — частично пересекается).
+
+---
+
+## 1.0.35 backlog
+
+## BL-P1-016 — Cancel-кнопка: краевой случай cancel Ok + fail_task Err (UX)
+- **Описание:** заведено при verify Cursor cancel-кнопки (1.0.35, `TaskRow.tsx::quickCancel`). Связка: `cancel_post_executor` (убивает PID) → `fail_task` (уводит из Processing). Если `cancel_post_executor` вернул Ok (процесс убит), но последующий `fail_task` бросил Err — `catch` делает только `alert(String(e))`, и задача **остаётся in_progress в UI**, хотя процесс уже мёртв (рассинхрон: процесса нет, статус «выполняется»). Не блокер (fail_task — локальный SQL UPDATE, Err редок), но UX-дыра.
+- **Приоритет:** Low (UX-полировка; краевой случай — fail_task роняется редко).
+- **Оценка:** ~30 мин. Варианты: (а) при Err после успешного kill — retry `fail_task` 1 раз / показать явное «процесс убит, но статус не обновлён — обнови вручную»; (б) перенести связку cancel+fail в один Rust-метод `cancel_and_fail` (атомарно, БД-транзакция) — чище, но Rust-правка; (в) оптимистично обновить локальный статус на failed до подтверждения. Предпочтение — (б) при следующем касании post_executor.
+- **Пререквизиты:** нет.
