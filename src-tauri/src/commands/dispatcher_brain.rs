@@ -29,7 +29,7 @@ use crate::commands::dispatcher::{
 };
 use crate::commands::dispatcher_tools::DISPATCHER_TOOLS_PREAMBLE;
 use crate::commands::qwen_bridge;
-use crate::commands::tool_calls::parse_tool_calls;
+use crate::commands::tool_calls::{parse_tool_calls, ToolCall};
 use crate::db::WritePool;
 use crate::settings::AppSettings;
 
@@ -245,117 +245,140 @@ pub async fn process_pending(
 
     let routed_model = pick.model_label(&settings);
 
-    let routing_result = match pick {
-        BrainPick::Qwen => {
-            qwen_bridge::run_qwen_for_dispatcher(
-                &system_prompt,
-                &user_prompt,
-                &settings,
-                &lifecycle,
-                &app,
-            )
-            .await
-        }
-        BrainPick::Claude => {
-            let full = format!("{system_prompt}\n\n{user_prompt}");
-            claude_bridge::run_claude_cli_for_dispatcher(&full, &settings, &lifecycle, &app).await
-        }
-    };
+    // BL-P1-017: рефайнинг устойчив к транзиентам. Деградированный ответ мозга при
+    // нестабильной сети давал forward_to_post без refined_prompt (на стабильной сети
+    // доказано 7/7 OK — причина не контент, а сеть). Ретраим ВЫЗОВ МОЗГА + parse +
+    // валидацию (чистые, без сайд-эффектов) до 2 раз; execute_* вызывается ОДИН раз
+    // ПОСЛЕ успеха — дубль refined-задачи исключён (idempotency). При исчерпании
+    // попыток сохраняем сырой ответ в dispatcher_logs.raw_brain_response (observability)
+    // и фейлим parent, чтобы не висел in_progress.
+    let max_attempts = settings.dispatcher_max_attempts.clamp(1, 2);
+    let mut last_raw = String::new();
+    let mut last_problem = String::new();
+    let mut selected: Option<(ToolCall, String, &'static str)> = None;
 
-    // Auto-fallback Qwen → Claude если включено и Qwen упал
-    let (raw_response, final_model, used_fallback) = match routing_result {
-        Ok(text) => (text, routed_model.clone(), false),
-        Err(e) if pick == BrainPick::Qwen && settings.dispatcher_auto_fallback_claude => {
-            log::warn!(
-                "dispatcher: Qwen failed ({e}), auto-fallback to Claude for task {}",
-                task.id
-            );
-            let full = format!("{system_prompt}\n\n{user_prompt}");
-            match claude_bridge::run_claude_cli_for_dispatcher(
-                &full,
-                &settings,
-                &lifecycle,
-                &app,
-            )
-            .await
-            {
-                Ok(t) => (t, settings.dispatcher_claude_model.clone(), true),
-                Err(e2) => {
-                    log::error!(
-                        "dispatcher: both Qwen+Claude failed for task {}: {e2}",
-                        task.id
-                    );
-                    let _ = dispatcher::fail_task_inner(
-                        task.id.clone(),
-                        format!("dispatcher routing failed: {e2}"),
-                        &db,
-                        &app,
-                    )
-                    .await;
-                    return Err(e2);
+    for attempt in 1..=max_attempts {
+        let routing_result = match pick {
+            BrainPick::Qwen => {
+                qwen_bridge::run_qwen_for_dispatcher(
+                    &system_prompt,
+                    &user_prompt,
+                    &settings,
+                    &lifecycle,
+                    &app,
+                )
+                .await
+            }
+            BrainPick::Claude => {
+                let full = format!("{system_prompt}\n\n{user_prompt}");
+                claude_bridge::run_claude_cli_for_dispatcher(&full, &settings, &lifecycle, &app).await
+            }
+        };
+
+        // Auto-fallback Qwen → Claude. Сбой здесь — не fail задачи сразу, а повтор.
+        let (raw_response, final_model, used_fallback) = match routing_result {
+            Ok(text) => (text, routed_model.clone(), false),
+            Err(_e) if pick == BrainPick::Qwen && settings.dispatcher_auto_fallback_claude => {
+                let full = format!("{system_prompt}\n\n{user_prompt}");
+                match claude_bridge::run_claude_cli_for_dispatcher(&full, &settings, &lifecycle, &app)
+                    .await
+                {
+                    Ok(t) => (t, settings.dispatcher_claude_model.clone(), true),
+                    Err(e2) => {
+                        last_problem = format!("routing failed (qwen+claude): {e2}");
+                        log::warn!(
+                            "dispatcher: task {} attempt {attempt}/{max_attempts} {last_problem}; retrying",
+                            task.id
+                        );
+                        continue;
+                    }
                 }
             }
+            Err(e) => {
+                last_problem = format!("routing failed: {e}");
+                log::warn!(
+                    "dispatcher: task {} attempt {attempt}/{max_attempts} {last_problem}; retrying",
+                    task.id
+                );
+                continue;
+            }
+        };
+
+        last_raw = raw_response.clone();
+        let (_cleaned, calls) = parse_tool_calls(&raw_response);
+        let complexity = if used_fallback || pick == BrainPick::Claude {
+            "complex"
+        } else {
+            "simple"
+        };
+
+        match calls.into_iter().next() {
+            Some(call) => {
+                // Валидация ДО исполнения (чисто): forward/decompose требуют
+                // непустой refined_prompt. Только валидный tool_call идёт в execute.
+                if validate_tool_call(&call.name, pick_args(&call)) {
+                    selected = Some((call, final_model, complexity));
+                    break;
+                }
+                last_problem =
+                    format!("invalid tool_call '{}' (missing required args)", call.name);
+                log::warn!(
+                    "dispatcher: task {} attempt {attempt}/{max_attempts} {last_problem}; retrying",
+                    task.id
+                );
+            }
+            None => {
+                last_problem = format!("no tool_call parsed from {final_model}");
+                log::warn!(
+                    "dispatcher: task {} attempt {attempt}/{max_attempts} {last_problem}; retrying",
+                    task.id
+                );
+            }
         }
-        Err(e) => {
-            log::error!("dispatcher: routing failed for task {}: {e}", task.id);
+    }
+
+    let elapsed_ms = started.elapsed().as_millis() as i64;
+    let (call, final_model, complexity) = match selected {
+        Some(s) => s,
+        None => {
+            // Все попытки исчерпаны → observability: сохраняем ПОЛНЫЙ сырой ответ
+            // мозга, чтобы следующий сбой диагностировался по факту.
+            save_raw_brain_response(&task.id, &last_raw, &db).await;
+            let problem = if last_problem.is_empty() {
+                "no valid tool_call".to_string()
+            } else {
+                last_problem
+            };
+            log::warn!(
+                "dispatcher: task {} failed after {max_attempts} attempt(s): {problem}; \
+                 raw_brain_response saved ({} chars)",
+                task.id,
+                last_raw.len()
+            );
+            let _ = dispatcher::record_decision(
+                &task.id,
+                None,
+                "reject",
+                Some(&format!(
+                    "{problem} (after {max_attempts} attempt(s); raw_brain_response saved)"
+                )),
+                &routed_model,
+                Some("complex"),
+                Some(elapsed_ms),
+                &db,
+            )
+            .await;
             let _ = dispatcher::fail_task_inner(
                 task.id.clone(),
-                format!("dispatcher routing failed: {e}"),
+                format!("dispatcher: {problem} (after {max_attempts} attempt(s))"),
                 &db,
                 &app,
             )
             .await;
-            return Err(e);
+            return Err(problem);
         }
     };
-
-    // Парсим tool_call из ответа Диспетчера
-    let (_cleaned, calls) = parse_tool_calls(&raw_response);
-    let elapsed_ms = started.elapsed().as_millis() as i64;
-    let complexity = if used_fallback || pick == BrainPick::Claude {
-        "complex"
-    } else {
-        "simple"
-    };
-
-    if calls.is_empty() {
-        log::warn!(
-            "dispatcher: no tool_call from brain ({}). raw: {}...",
-            final_model,
-            raw_response.chars().take(200).collect::<String>()
-        );
-        let _ = dispatcher::record_decision(
-            &task.id,
-            None,
-            "reject",
-            Some(&format!(
-                "no tool_call parsed from {final_model} response. \
-                 raw: {}...",
-                raw_response.chars().take(500).collect::<String>()
-            )),
-            &final_model,
-            Some(complexity),
-            Some(elapsed_ms),
-            &db,
-        )
-        .await;
-        let _ = dispatcher::fail_task_inner(
-            task.id.clone(),
-            "dispatcher: no tool_call in brain response".into(),
-            &db,
-            &app,
-        )
-        .await;
-        return Err("no tool_call".into());
-    }
-
-    // Берём ПЕРВЫЙ tool_call (правило: один в ответе)
-    let call = &calls[0];
-    let args = if call.arguments.is_object() || call.arguments.is_array() {
-        &call.arguments
-    } else {
-        &call.args
-    };
+    let args = pick_args(&call);
 
     log::info!(
         "dispatcher: task {} decision={} model={}",
@@ -472,6 +495,57 @@ pub(crate) fn build_refined_payload(
         "refined_prompt": refined,
         "expected_artifact": expected_artifact,
     })
+}
+
+// ---------------------------------------------------------------------------
+// BL-P1-017: устойчивость рефайнинга (валидация tool_call + observability)
+// ---------------------------------------------------------------------------
+
+/// Достаёт аргументы tool_call (object/array из `arguments`, иначе `args`).
+fn pick_args(call: &ToolCall) -> &Value {
+    if call.arguments.is_object() || call.arguments.is_array() {
+        &call.arguments
+    } else {
+        &call.args
+    }
+}
+
+/// Проверка обязательных полей tool_call ДО исполнения (чисто, без сайд-эффектов) —
+/// основа ретрая BL-P1-017. forward/decompose требуют непустой `refined_prompt`
+/// (зеркалит проверку в `execute_forward`/`execute_decompose`); escalate/reject/clarify
+/// мягкие (executor подставляет дефолты); неизвестный tool — невалиден (ретрай).
+fn validate_tool_call(name: &str, args: &Value) -> bool {
+    fn non_empty_refined(v: &Value) -> bool {
+        v.get("refined_prompt")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+    match name {
+        "forward_to_post" => non_empty_refined(args),
+        "decompose_task" => args
+            .get("subtasks")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty() && a.iter().all(non_empty_refined))
+            .unwrap_or(false),
+        "escalate_to_ceo" | "reject_task" | "clarify" => true,
+        _ => false,
+    }
+}
+
+/// Пишет ПОЛНЫЙ сырой ответ мозга в `dispatcher_logs.raw_brain_response` (кап 64KB)
+/// при провале рефайнинга — чтобы следующий сбой диагностировался по факту,
+/// а не реконструкцией. best-effort (сбой записи не роняет flow).
+async fn save_raw_brain_response(task_id: &str, raw: &str, db: &WritePool) {
+    let capped: String = raw.chars().take(64_000).collect();
+    if let Err(e) = sqlx::query("UPDATE dispatcher_logs SET raw_brain_response = ? WHERE id = ?")
+        .bind(&capped)
+        .bind(task_id)
+        .execute(&db.0)
+        .await
+    {
+        log::warn!("dispatcher: save raw_brain_response for {task_id} failed: {e}");
+    }
 }
 
 /// Резолвит целевой пост для forward, когда explicit `target_slug` не задан.
@@ -870,5 +944,47 @@ mod tests {
         let slugs = vec!["manager".to_string(), "engineer".to_string()];
         assert!(resolve_target_slug(None, "completely unrelated request text", &slugs).is_err());
         assert!(resolve_target_slug(None, "x", &[]).is_err());
+    }
+
+    // ----- BL-P1-017: validate_tool_call (основа ретрая рефайнинга) -----
+
+    #[test]
+    fn validate_forward_requires_nonempty_refined() {
+        use serde_json::json;
+        assert!(validate_tool_call(
+            "forward_to_post",
+            &json!({"refined_prompt": "do X", "target_slug": "office-manager"})
+        ));
+        // ровно тот сбой из 1.0.35: forward без refined_prompt → невалиден → ретрай
+        assert!(!validate_tool_call(
+            "forward_to_post",
+            &json!({"target_slug": "office-manager"})
+        ));
+        // пустой/пробельный refined_prompt тоже невалиден
+        assert!(!validate_tool_call("forward_to_post", &json!({"refined_prompt": "   "})));
+    }
+
+    #[test]
+    fn validate_decompose_requires_subtask_refined() {
+        use serde_json::json;
+        assert!(validate_tool_call(
+            "decompose_task",
+            &json!({"subtasks": [{"refined_prompt": "a"}, {"refined_prompt": "b"}]})
+        ));
+        assert!(!validate_tool_call(
+            "decompose_task",
+            &json!({"subtasks": [{"target_slug": "x"}]})
+        ));
+        assert!(!validate_tool_call("decompose_task", &json!({"subtasks": []})));
+    }
+
+    #[test]
+    fn validate_soft_tools_ok_unknown_invalid() {
+        use serde_json::json;
+        assert!(validate_tool_call("escalate_to_ceo", &json!({})));
+        assert!(validate_tool_call("reject_task", &json!({})));
+        assert!(validate_tool_call("clarify", &json!({})));
+        // неизвестный tool → невалиден (ретрай, не слепой execute)
+        assert!(!validate_tool_call("totally_unknown", &json!({"refined_prompt": "x"})));
     }
 }

@@ -114,6 +114,12 @@ fn migrations() -> Vec<Migration> {
             sql: lf(include_str!("../migrations/08_provider_registry_run_logs.sql")),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 9,
+            description: "BL-P1-017: dispatcher_logs.raw_brain_response (refining observability)",
+            sql: lf(include_str!("../migrations/09_dispatcher_raw_brain.sql")),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -378,6 +384,8 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             ("routed_by_model", "ALTER TABLE dispatcher_logs ADD COLUMN routed_by_model TEXT DEFAULT NULL"),
                             ("refined_prompt",  "ALTER TABLE dispatcher_logs ADD COLUMN refined_prompt TEXT DEFAULT NULL"),
                             ("outbox_path",     "ALTER TABLE dispatcher_logs ADD COLUMN outbox_path TEXT DEFAULT NULL"),
+                            // BL-P1-017: raw brain response on refine failure (migration 09 + self-heal)
+                            ("raw_brain_response", "ALTER TABLE dispatcher_logs ADD COLUMN raw_brain_response TEXT DEFAULT NULL"),
                         ];
                         let dl_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
                             sqlx::query_as("PRAGMA table_info(dispatcher_logs)")
