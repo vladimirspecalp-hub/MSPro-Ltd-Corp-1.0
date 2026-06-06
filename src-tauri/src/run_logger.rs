@@ -93,13 +93,22 @@ pub fn truncate_raw(s: &str) -> String {
     format!("{}…[truncated {} bytes]", &s[..end], s.len() - end)
 }
 
+/// ЕДИНАЯ точка подготовки чувствительного лог-текста: **redact → truncate**
+/// (BL-P1-007 + R-T-015). Порядок строгий — секрет маскируется ДО обрезки, иначе
+/// хвост ключа уцелел бы на границе MAX_RAW_OUTPUT (урок Среза 2).
+///
+/// ⚠️ ЛЮБОЙ канал, пишущий сырой вывод модели в БД, ОБЯЗАН идти через неё
+/// (`run_logs.raw_output`, `dispatcher_logs.raw_brain_response`, …) — чтобы
+/// незащищённый лог-канал в обход redaction нельзя было создать случайно (BL-P1-017).
+pub fn prepare_sensitive_log(s: &str) -> String {
+    truncate_raw(&redact(s))
+}
+
 /// Вставляет строку в run_logs. Возвращает id записи.
 pub async fn insert_run_log(pool: &WritePool, e: RunLogEntry) -> Result<String, String> {
     let id = Uuid::new_v4().to_string();
-    // BL-P1-007: redact ДО truncate (секрет заменён ПЕРЕД обрезкой → даже если
-    // ***REDACTED*** ляжет на границу 64KB, хвоста ключа нет). Единственная
-    // точка обрезки raw_output во всём коде (verified грепом).
-    let raw = e.raw_output.as_deref().map(|s| truncate_raw(&redact(s)));
+    // BL-P1-007: redact ДО truncate через единый chokepoint (см. prepare_sensitive_log).
+    let raw = e.raw_output.as_deref().map(prepare_sensitive_log);
     sqlx::query(
         "INSERT INTO run_logs (id, task_id, post_slug, provider_id, model_used, tier, \
             tokens_in, tokens_out, latency_ms, cost_usd, success, fallback_used, \
@@ -237,5 +246,25 @@ mod tests {
         // Dummy `Bearer ollama` (6 симв < 8) — не маскируем (это не секрет).
         let dummy = "header Bearer ollama";
         assert_eq!(redact(dummy), dummy);
+    }
+
+    // ----- BL-P1-017: единый sensitive-pipeline (raw_brain_response + run_logs) -----
+
+    #[test]
+    fn prepare_sensitive_log_redacts_then_truncates() {
+        // Канал dispatcher_logs.raw_brain_response пишется ЧЕРЕЗ эту функцию —
+        // секрет в сыром ответе мозга обязан быть замаскирован ПЕРЕД записью.
+        // (Граница redact→truncate отдельно покрыта `redact_key_at_truncate_boundary`.)
+        let key = "sk-".to_string() + &"a".repeat(40);
+        let raw = format!("мозг вернул мусор {key} и пароль: superSecret123 хвост");
+        let safe = prepare_sensitive_log(&raw);
+        assert!(!safe.contains(&key), "настоящий ключ не должен попасть в БД");
+        assert!(safe.contains("sk-***REDACTED***"), "маска ключа на месте");
+        assert!(!safe.contains("superSecret123"), "key:value секрет замаскирован");
+        assert!(safe.contains("***REDACTED***"));
+        // Большой вход всё ещё кэпится (через truncate внутри pipeline).
+        let huge = prepare_sensitive_log(&"z".repeat(MAX_RAW_OUTPUT + 5000));
+        assert!(huge.contains("truncated"));
+        assert!(huge.len() <= MAX_RAW_OUTPUT + 40);
     }
 }

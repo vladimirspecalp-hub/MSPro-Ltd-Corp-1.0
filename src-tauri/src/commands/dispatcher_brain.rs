@@ -537,9 +537,12 @@ fn validate_tool_call(name: &str, args: &Value) -> bool {
 /// при провале рефайнинга — чтобы следующий сбой диагностировался по факту,
 /// а не реконструкцией. best-effort (сбой записи не роняет flow).
 async fn save_raw_brain_response(task_id: &str, raw: &str, db: &WritePool) {
-    let capped: String = raw.chars().take(64_000).collect();
+    // ⚠️ Срез-2 + BL-P1-017: НИКОГДА не писать сырой ответ напрямую — только через
+    // единый redact→truncate pipeline run_logger::prepare_sensitive_log. Иначе это
+    // незащищённый лог-канал в обход маскировки секретов.
+    let safe = crate::run_logger::prepare_sensitive_log(raw);
     if let Err(e) = sqlx::query("UPDATE dispatcher_logs SET raw_brain_response = ? WHERE id = ?")
-        .bind(&capped)
+        .bind(&safe)
         .bind(task_id)
         .execute(&db.0)
         .await
@@ -986,5 +989,19 @@ mod tests {
         assert!(validate_tool_call("clarify", &json!({})));
         // неизвестный tool → невалиден (ретрай, не слепой execute)
         assert!(!validate_tool_call("totally_unknown", &json!({"refined_prompt": "x"})));
+    }
+
+    #[test]
+    fn raw_brain_response_routes_through_redaction() {
+        // Сторож (Срез 2 + Cursor BLOCK): канал raw_brain_response НЕ должен писать
+        // сырой ответ мимо redact. Старый код кэпал char-ами без маскировки — регресс
+        // к голому char-капу = дыра. Паттерн собран из частей, чтобы тест не сматчил
+        // сам себя (урок legacy-door source-guard).
+        let src = include_str!("dispatcher_brain.rs");
+        let forbidden = concat!("chars().", "take(64");
+        assert!(
+            !src.contains(forbidden),
+            "save_raw_brain_response must route raw via run_logger::prepare_sensitive_log, not a raw char-cap"
+        );
     }
 }
