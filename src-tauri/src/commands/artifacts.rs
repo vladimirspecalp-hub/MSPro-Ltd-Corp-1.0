@@ -137,6 +137,33 @@ pub async fn open_artifact_in_default_app(
     Ok(())
 }
 
+/// BL-P1-018: открыть ПАПКУ артефакта в Проводнике Windows.
+/// Та же Outbox-защита, что у `open_artifact_in_default_app` — путь резолвится
+/// через `safe_artifact_path` (canonicalize + starts_with Outbox), затем берём
+/// родительскую папку. Открыть можно ТОЛЬКО папку внутри Outbox.
+/// `.arg(folder)` передаёт путь одним аргументом (без shell) — пробелы/спецсимволы
+/// в пути безопасны.
+#[tauri::command]
+pub async fn open_artifact_folder(
+    artifact_id: String,
+    db: State<'_, WritePool>,
+    vault: State<'_, VaultState>,
+) -> Result<(), String> {
+    let art = fetch_artifact(&artifact_id, &db).await?;
+    let abs = outbox::safe_artifact_path(&vault.root, &art.task_id, &art.rel_path)?;
+    if !abs.exists() {
+        return Err(format!("file not found: {}", abs.display()));
+    }
+    let folder = abs
+        .parent()
+        .ok_or_else(|| "no parent directory".to_string())?;
+    std::process::Command::new("explorer")
+        .arg(folder)
+        .spawn()
+        .map_err(|e| format!("spawn explorer: {e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn approve_artifact(
     artifact_id: String,

@@ -615,6 +615,7 @@ CREATE INDEX IF NOT EXISTS idx_run_logs_created ON run_logs(created_at);";
             // v1.0.22 Phase 11C — Artifacts (Outbox)
             commands::artifacts::list_task_artifacts,
             commands::artifacts::open_artifact_in_default_app,
+            commands::artifacts::open_artifact_folder,
             commands::artifacts::approve_artifact,
             commands::artifacts::reject_artifact,
             commands::artifacts::register_external_artifact,

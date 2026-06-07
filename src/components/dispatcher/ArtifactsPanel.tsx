@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import FileActions from "../common/FileActions";
 
 interface Artifact {
   id: string;
@@ -38,14 +39,6 @@ export default function ArtifactsPanel({ taskId }: Props) {
     refresh();
   }, [taskId]);
 
-  async function onOpen(id: string) {
-    setError(null);
-    try {
-      await invoke("open_artifact_in_default_app", { artifactId: id });
-    } catch (e) {
-      setError(String(e));
-    }
-  }
   async function onApprove(id: string) {
     setBusy(true);
     setError(null);
@@ -142,13 +135,7 @@ export default function ArtifactsPanel({ taskId }: Props) {
               </div>
             )}
             <div style={{ display: "flex", gap: 6, marginTop: 6 }}>
-              <button
-                type="button"
-                onClick={() => onOpen(a.id)}
-                style={btnStyle("#fff")}
-              >
-                📂 Открыть
-              </button>
+              <FileActions artifactId={a.id} onError={setError} />
               {!a.approved_at && (
                 <button
                   type="button"
