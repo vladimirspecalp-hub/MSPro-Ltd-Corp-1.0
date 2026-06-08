@@ -53,7 +53,7 @@ export default function Sidebar({ current, onChange }: SidebarProps) {
     <nav style={containerStyle} aria-label="Главная навигация">
       <div style={headerStyle}>
         <div style={{ fontSize: 16, fontWeight: 700, color: "#fff" }}>MSPro-Ltd Corp</div>
-        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.35 · PAL Qwen-fallback + security harden</div>
+        <div style={{ fontSize: 11, color: "#888", marginTop: 2 }}>v1.0.36 · файлы-результат в чате + retry Диспетчера</div>
       </div>
       {ITEMS.map((item) => (
         <button
