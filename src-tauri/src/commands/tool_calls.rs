@@ -13,9 +13,10 @@
 //!      вытягивает все `<tool_call>` блоки, исполняет их через WritePool
 //!      (atomic, под транзакцией где нужно), и возвращает:
 //!         - cleaned_text: финальный ответ без служебных тегов
-//!         - Vec<ToolExecution>: результаты для системных сообщений
+//!         - Vec<(ToolExecution, Option<String>)>: результаты + id порождённой
+//!           Диспетчер-задачи (BL-P1-018, для показа артефактов в чате)
 //!
-//! Формат `<tool_call>` ZAchется в каноне Nous Hermes (см. Context7
+//! Формат `<tool_call>` задаётся в каноне Nous Hermes (см. Context7
 //! /nousresearch/hermes-agent — XML-wrapped JSON), под который Hermes Pro
 //! зафайнтьюнен. Это самый robust формат для локальных моделей.
 
@@ -445,7 +446,7 @@ pub async fn intercept_and_execute(
     raw: &str,
     db: &WritePool,
     app: &AppHandle,
-) -> (String, Vec<ToolExecution>, String) {
+) -> (String, Vec<(ToolExecution, Option<String>)>, String) {
     let (cleaned, calls) = parse_tool_calls(raw);
     if calls.is_empty() {
         return (cleaned, Vec::new(), String::new());
@@ -461,12 +462,15 @@ pub async fn intercept_and_execute(
                 knowledge.push_str(&exec.ui_message);
                 let topic = call.effective_args()
                     .get("topic").and_then(Value::as_str).unwrap_or("?");
-                executions.push(ToolExecution {
-                    ui_message: format!("⚡ Справочник HMT «{topic}» загружен"),
-                    success: true,
-                });
+                executions.push((
+                    ToolExecution {
+                        ui_message: format!("⚡ Справочник HMT «{topic}» загружен"),
+                        success: true,
+                    },
+                    None,
+                ));
             } else {
-                executions.push(exec);
+                executions.push((exec, None));
             }
         } else {
             let exec = execute(call, db, app).await;
@@ -476,7 +480,7 @@ pub async fn intercept_and_execute(
     (cleaned, executions, knowledge)
 }
 
-async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecution {
+async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> (ToolExecution, Option<String>) {
     log::info!("tool_call dispatch: name={}", call.name);
 
     if call.name == "__invalid__" {
@@ -485,12 +489,15 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or("неизвестная ошибка парсинга");
-        return ToolExecution {
-            ui_message: format!(
-                "⚠️ Инструмент не понят: JSON-блок Гендира некорректен ({err}). Гендир увидит это в следующем ответе и переформулирует."
-            ),
-            success: false,
-        };
+        return (
+            ToolExecution {
+                ui_message: format!(
+                    "⚠️ Инструмент не понят: JSON-блок Гендира некорректен ({err}). Гендир увидит это в следующем ответе и переформулирует."
+                ),
+                success: false,
+            },
+            None,
+        );
     }
 
     match call.name.as_str() {
@@ -519,19 +526,23 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> ToolExecuti
             });
             execute_send_to_dispatcher(&mapped, db, app).await
         }
-        "create_post" => execute_create_post(call.effective_args(), db, app).await,
-        "update_post" => execute_update_post(call.effective_args(), db, app).await,
-        "archive_post" => execute_archive_post(call.effective_args(), db, app).await,
-        "save_pattern" => execute_save_vault(call.effective_args(), app, "02-Patterns").await,
-        "save_win" => execute_save_vault(call.effective_args(), app, "04-Wins").await,
-        "write_vault_file" => execute_write_vault_file(call.effective_args(), db, app).await,
-        "patch_vault_file" => execute_patch_vault_file(call.effective_args(), db, app).await,
-        "delete_vault_file" => execute_delete_vault_file(call.effective_args(), db, app).await,
-        "read_post_knowledge" => execute_read_post_knowledge(call.effective_args(), db, app).await,
-        unknown => ToolExecution {
-            ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
-            success: false,
-        },
+        // Прочие инструменты не порождают задачу Диспетчера → spawned_task_id = None.
+        "create_post" => (execute_create_post(call.effective_args(), db, app).await, None),
+        "update_post" => (execute_update_post(call.effective_args(), db, app).await, None),
+        "archive_post" => (execute_archive_post(call.effective_args(), db, app).await, None),
+        "save_pattern" => (execute_save_vault(call.effective_args(), app, "02-Patterns").await, None),
+        "save_win" => (execute_save_vault(call.effective_args(), app, "04-Wins").await, None),
+        "write_vault_file" => (execute_write_vault_file(call.effective_args(), db, app).await, None),
+        "patch_vault_file" => (execute_patch_vault_file(call.effective_args(), db, app).await, None),
+        "delete_vault_file" => (execute_delete_vault_file(call.effective_args(), db, app).await, None),
+        "read_post_knowledge" => (execute_read_post_knowledge(call.effective_args(), db, app).await, None),
+        unknown => (
+            ToolExecution {
+                ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
+                success: false,
+            },
+            None,
+        ),
     }
 }
 
@@ -543,10 +554,10 @@ async fn execute_send_to_dispatcher(
     args: &Value,
     db: &WritePool,
     app: &AppHandle,
-) -> ToolExecution {
+) -> (ToolExecution, Option<String>) {
     let raw_prompt = match args.get("raw_prompt").and_then(Value::as_str).map(str::trim) {
         Some(s) if !s.is_empty() => s.to_string(),
-        _ => return tool_err("send_to_dispatcher: raw_prompt обязателен"),
+        _ => return (tool_err("send_to_dispatcher: raw_prompt обязателен"), None),
     };
     let target_hint = args
         .get("target_hint")
@@ -590,7 +601,7 @@ async fn execute_send_to_dispatcher(
     .await
     {
         Ok(t) => t,
-        Err(e) => return tool_err(&format!("send_to_dispatcher: {e}")),
+        Err(e) => return (tool_err(&format!("send_to_dispatcher: {e}")), None),
     };
 
     // Запускаем AI-Диспетчера в фоне — chat-stream Гендира не блокируется.
@@ -598,24 +609,30 @@ async fn execute_send_to_dispatcher(
         Some(s) => s.data.lock().unwrap().clone(),
         None => {
             log::warn!("send_to_dispatcher: SettingsStore not available, dispatcher not invoked");
-            return ToolExecution {
-                ui_message: format!(
-                    "⚡ Задача передана Диспетчеру (`{}`), но мозг Диспетчера ещё не инициализирован.",
-                    task.id
-                ),
-                success: true,
-            };
+            return (
+                ToolExecution {
+                    ui_message: format!(
+                        "⚡ Задача передана Диспетчеру (`{}`), но мозг Диспетчера ещё не инициализирован.",
+                        task.id
+                    ),
+                    success: true,
+                },
+                Some(task.id.clone()),
+            );
         }
     };
 
     if !settings.dispatcher_enabled {
-        return ToolExecution {
-            ui_message: format!(
-                "⚡ Задача `{}` в Inbox Диспетчера. Auto-routing отключён — Владелец должен ручную маршрутизацию.",
-                task.id
-            ),
-            success: true,
-        };
+        return (
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Задача `{}` в Inbox Диспетчера. Auto-routing отключён — Владелец должен ручную маршрутизацию.",
+                    task.id
+                ),
+                success: true,
+            },
+            Some(task.id.clone()),
+        );
     }
 
     let task_id = task.id.clone();
@@ -627,10 +644,13 @@ async fn execute_send_to_dispatcher(
         Some(lc) => lc.inner().clone(),
         None => {
             log::warn!("DispatcherLifecycle not in state");
-            return ToolExecution {
-                ui_message: format!("⚡ Задача `{}` в Inbox, но lifecycle Диспетчера не готов.", task.id),
-                success: true,
-            };
+            return (
+                ToolExecution {
+                    ui_message: format!("⚡ Задача `{}` в Inbox, но lifecycle Диспетчера не готов.", task.id),
+                    success: true,
+                },
+                Some(task.id.clone()),
+            );
         }
     };
 
@@ -652,14 +672,17 @@ async fn execute_send_to_dispatcher(
         .as_deref()
         .map(|h| format!(" (предложен `{h}`)"))
         .unwrap_or_default();
-    ToolExecution {
-        ui_message: format!(
-            "⚡ Гендир передал Диспетчеру задачу{target_label}: \"{}\"\n\n_task_id: `{}` — жду переформулировки..._",
-            truncate_for_ui(&raw_prompt, 200),
-            task.id
-        ),
-        success: true,
-    }
+    (
+        ToolExecution {
+            ui_message: format!(
+                "⚡ Гендир передал Диспетчеру задачу{target_label}: \"{}\"\n\n_task_id: `{}` — жду переформулировки..._",
+                truncate_for_ui(&raw_prompt, 200),
+                task.id
+            ),
+            success: true,
+        },
+        Some(task.id.clone()),
+    )
 }
 
 fn truncate_for_ui(s: &str, max: usize) -> String {

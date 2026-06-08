@@ -119,6 +119,32 @@ pub async fn list_task_artifacts(
     .map_err(|e| format!("list artifacts: {e}"))
 }
 
+/// BL-P1-018 Заход 2: артефакты задачи И её ПРЯМЫХ детей. Чат Гендира знает
+/// родительскую ceo→dispatcher задачу, а файлы регистрируются на дочерней
+/// office-manager (`dispatcher_logs.parent_task_id` = parent). Скобки вокруг OR
+/// обязательны: иначе `rejected_at IS NULL` применилось бы лишь к одной ветке.
+/// Отклонённые артефакты не показываем.
+#[tauri::command]
+pub async fn list_result_artifacts(
+    task_id: String,
+    db: State<'_, WritePool>,
+) -> Result<Vec<Artifact>, String> {
+    sqlx::query_as::<_, Artifact>(
+        "SELECT id, task_id, rel_path, mime_type, size_bytes, created_by,
+                created_at, approved_at, rejected_at, reject_reason
+         FROM task_artifacts
+         WHERE (task_id = ?
+                OR task_id IN (SELECT id FROM dispatcher_logs WHERE parent_task_id = ?))
+           AND rejected_at IS NULL
+         ORDER BY created_at ASC",
+    )
+    .bind(&task_id)
+    .bind(&task_id)
+    .fetch_all(&db.0)
+    .await
+    .map_err(|e| format!("list result artifacts: {e}"))
+}
+
 #[tauri::command]
 pub async fn open_artifact_in_default_app(
     artifact_id: String,

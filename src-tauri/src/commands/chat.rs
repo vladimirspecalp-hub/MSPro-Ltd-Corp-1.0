@@ -30,6 +30,11 @@ pub struct ChatMessage {
     pub role: String,
     pub content: String,
     pub created_at: String,
+    /// BL-P1-018: id порождённой ceo→dispatcher задачи (для показа результата в чате).
+    /// `#[sqlx(default)]` → SELECT без этой колонки даёт None, FromRow НЕ падает —
+    /// поэтому остальные ChatMessage-SELECT'ы менять не нужно (только list_chat_history).
+    #[sqlx(default)]
+    pub spawned_task_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,6 +49,8 @@ pub struct ChatMessageOut {
     pub role: String,
     pub content: String,
     pub created_at: String,
+    /// BL-P1-018: id порождённой задачи (для live-показа результата в чате через событие).
+    pub spawned_task_id: Option<String>,
 }
 
 #[derive(Debug, Serialize, FromRow)]
@@ -385,6 +392,7 @@ pub async fn send_chat_message(
                     role: m.role.clone(),
                     content: m.content.clone(),
                     created_at: m.created_at.clone(),
+                    spawned_task_id: None,
                 }).collect::<Vec<_>>(),
                 &snapshot,
                 &pending,
@@ -505,12 +513,14 @@ pub async fn send_chat_message(
             role: user.role,
             content: user.content,
             created_at: user.created_at,
+            spawned_task_id: None,
         },
         ceo: ChatMessageOut {
             id: ceo.id.clone(),
             role: ceo.role,
             content: ceo.content,
             created_at: ceo.created_at,
+            spawned_task_id: None,
         },
     };
 
@@ -519,7 +529,7 @@ pub async fn send_chat_message(
     // 6. Step 7 Этап 3 — каждое выполнение инструмента → отдельное системное
     // сообщение в чате (роль 'ceo' + префикс ⚡/⚠️ позволяет UI отрисовать его
     // как плашку action'а без миграции CHECK constraint на role).
-    for exec in tool_executions {
+    for (exec, spawned_task_id) in tool_executions {
         let sys_id = format!("msg-{}", uuid::Uuid::new_v4());
         // Если ui_message сама уже начинается с эмодзи-маркера — не дублируем.
         let body = if exec.ui_message.starts_with("⚡") || exec.ui_message.starts_with("⚠️") {
@@ -530,9 +540,12 @@ pub async fn send_chat_message(
             format!("⚠️ {}", exec.ui_message)
         };
         if let Err(e) =
-            sqlx::query("INSERT INTO chat_messages (id, role, content) VALUES (?, 'ceo', ?)")
+            sqlx::query(
+                "INSERT INTO chat_messages (id, role, content, spawned_task_id) VALUES (?, 'ceo', ?, ?)",
+            )
                 .bind(&sys_id)
                 .bind(&body)
+                .bind(&spawned_task_id)
                 .execute(&db.0)
                 .await
         {
@@ -553,6 +566,7 @@ pub async fn send_chat_message(
                     role: row.role,
                     content: row.content,
                     created_at: row.created_at,
+                    spawned_task_id,
                 },
             );
         }
@@ -590,6 +604,7 @@ async fn emit_system_warning(db: &State<'_, WritePool>, app: &AppHandle, text: &
                 role: row.role,
                 content: row.content,
                 created_at: row.created_at,
+                spawned_task_id: None,
             },
         );
     }
@@ -713,12 +728,14 @@ async fn finalize_with_text(
             role: user.role,
             content: user.content,
             created_at: user.created_at,
+            spawned_task_id: None,
         },
         ceo: ChatMessageOut {
             id: ceo.id.clone(),
             role: ceo.role,
             content: ceo.content,
             created_at: ceo.created_at,
+            spawned_task_id: None,
         },
     };
     let _ = app.emit("ceo-done", &turn.ceo);
@@ -732,8 +749,8 @@ pub async fn list_chat_history(
 ) -> Result<Vec<ChatMessage>, String> {
     let limit = limit.clamp(1, 1000) as i64;
     sqlx::query_as::<_, ChatMessage>(
-        "SELECT id, role, content, created_at FROM (
-             SELECT id, role, content, created_at
+        "SELECT id, role, content, created_at, spawned_task_id FROM (
+             SELECT id, role, content, created_at, spawned_task_id
              FROM chat_messages
              ORDER BY created_at DESC
              LIMIT ?
@@ -743,4 +760,60 @@ pub async fn list_chat_history(
     .fetch_all(&db.0)
     .await
     .map_err(|e| format!("list chat: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    /// BL-P1-018 / забота Владельца #1: после добавления `spawned_task_id`
+    /// существующие SELECT'ы БЕЗ этой колонки (owner/ceo INSERT read-back и
+    /// `emit_system_warning` — 4 места) НЕ должны падать FromRow. Гарантия —
+    /// `#[sqlx(default)]` на поле. Этот тест ловит регрессию, если атрибут уберут.
+    #[tokio::test]
+    async fn chat_message_fromrow_tolerates_missing_and_present_column() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE chat_messages ( \
+                id TEXT PRIMARY KEY, \
+                role TEXT NOT NULL, \
+                content TEXT NOT NULL, \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+                spawned_task_id TEXT \
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO chat_messages (id, role, content, spawned_task_id) \
+             VALUES ('m1', 'ceo', 'hi', NULL), ('m2', 'ceo', '⚡ task', 'task-42')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // 1. СТАРАЯ форма (без колонки) — как owner/ceo/warning read-back.
+        //    Должна работать благодаря #[sqlx(default)] (иначе FromRow упал бы).
+        let old_shape: Vec<ChatMessage> =
+            sqlx::query_as("SELECT id, role, content, created_at FROM chat_messages ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .expect("old-shape SELECT не должен ронять FromRow");
+        assert_eq!(old_shape.len(), 2);
+        assert_eq!(old_shape[0].spawned_task_id, None);
+        assert_eq!(old_shape[1].spawned_task_id, None); // колонки нет в SELECT → default
+
+        // 2. НОВАЯ форма (с колонкой) — как list_chat_history. Значение читается.
+        let new_shape: Vec<ChatMessage> = sqlx::query_as(
+            "SELECT id, role, content, created_at, spawned_task_id FROM chat_messages ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("new-shape SELECT должен прочитать колонку");
+        assert_eq!(new_shape.len(), 2);
+        assert_eq!(new_shape[0].spawned_task_id, None);
+        assert_eq!(new_shape[1].spawned_task_id.as_deref(), Some("task-42"));
+    }
 }

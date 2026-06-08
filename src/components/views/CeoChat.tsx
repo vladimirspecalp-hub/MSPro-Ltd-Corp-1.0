@@ -7,6 +7,7 @@ import MessageHoverActions from "../chat/MessageHoverActions";
 import VaultSaveModal, { type VaultKind } from "../chat/VaultSaveModal";
 import AttachmentButtons from "../chat/AttachmentButtons";
 import AttachmentsArea from "../chat/AttachmentsArea";
+import ChatTaskArtifacts from "../chat/ChatTaskArtifacts";
 import {
   readSingleFile,
   validateAdd,
@@ -29,6 +30,9 @@ interface ChatMessage {
   role: "owner" | "ceo";
   content: string;
   created_at: string;
+  /** BL-P1-018: для системного (⚡) сообщения — id порождённой Диспетчер-задачи;
+   *  по нему ChatTaskArtifacts показывает файлы-результат прямо в чате. */
+  spawned_task_id?: string | null;
 }
 
 interface ChatTurn {
@@ -531,6 +535,9 @@ export default function CeoChat() {
                   <div style={{ ...timestampStyle, alignSelf: "flex-start" }}>
                     {formatTime(m.created_at)}
                   </div>
+                  {m.spawned_task_id && (
+                    <ChatTaskArtifacts parentTaskId={m.spawned_task_id} />
+                  )}
                 </div>
               );
             }

@@ -120,6 +120,12 @@ fn migrations() -> Vec<Migration> {
             sql: lf(include_str!("../migrations/09_dispatcher_raw_brain.sql")),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 10,
+            description: "BL-P1-018: chat_messages.spawned_task_id (result link in CEO chat)",
+            sql: lf(include_str!("../migrations/10_chat_messages_spawned_task_id.sql")),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -404,6 +410,29 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             }
                         }
 
+                        // ----- BL-P1-018 self-healing: chat_messages.spawned_task_id -----
+                        // Migration 10 + страховка от installer-upgrade (R-T-006): если
+                        // tauri-plugin-sql не доехал миграцию — добавляем колонку здесь.
+                        let chat_alters: &[(&str, &str)] = &[
+                            ("spawned_task_id", "ALTER TABLE chat_messages ADD COLUMN spawned_task_id TEXT DEFAULT NULL"),
+                        ];
+                        let cm_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                            sqlx::query_as("PRAGMA table_info(chat_messages)")
+                                .fetch_all(&pool.0)
+                                .await
+                                .unwrap_or_default();
+                        let cm_existing: std::collections::HashSet<String> =
+                            cm_cols.into_iter().map(|c| c.1).collect();
+                        for (col, sql) in chat_alters {
+                            if cm_existing.contains(*col) {
+                                continue;
+                            }
+                            match sqlx::raw_sql(sql).execute(&pool.0).await {
+                                Ok(_) => log::info!("BL-P1-018 self-healing: added chat_messages.{col}"),
+                                Err(e) => log::warn!("BL-P1-018 self-healing: chat_messages.{col} ALTER failed: {e}"),
+                            }
+                        }
+
                         // CREATE TABLE IF NOT EXISTS для двух новых таблиц
                         let new_tables = "\
 CREATE TABLE IF NOT EXISTS dispatcher_decisions ( \
@@ -614,6 +643,7 @@ CREATE INDEX IF NOT EXISTS idx_run_logs_created ON run_logs(created_at);";
             commands::dispatcher::list_decisions_for_task,
             // v1.0.22 Phase 11C — Artifacts (Outbox)
             commands::artifacts::list_task_artifacts,
+            commands::artifacts::list_result_artifacts,
             commands::artifacts::open_artifact_in_default_app,
             commands::artifacts::open_artifact_folder,
             commands::artifacts::approve_artifact,
