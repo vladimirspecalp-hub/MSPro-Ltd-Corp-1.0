@@ -6,6 +6,7 @@ pub mod dispatcher_tools;
 pub mod artifacts;
 pub mod post_executor;
 pub mod hmt;
+pub mod org_chart;
 pub mod ping;
 pub mod posts;
 pub mod qwen_bridge;

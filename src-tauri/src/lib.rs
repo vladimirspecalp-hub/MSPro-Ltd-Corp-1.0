@@ -126,6 +126,12 @@ fn migrations() -> Vec<Migration> {
             sql: lf(include_str!("../migrations/10_chat_messages_spawned_task_id.sql")),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 11,
+            description: "Этап 1: org_* tables (org-chart constructor, isolated from departments/posts)",
+            sql: lf(include_str!("../migrations/11_org_structure.sql")),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -542,6 +548,46 @@ CREATE INDEX IF NOT EXISTS idx_run_logs_created ON run_logs(created_at);";
                             Err(e) => log::warn!("Phase 1 self-healing: provider seed: {e}"),
                         }
 
+                        // ----- Этап 1 (migration 11) self-healing: org_* tables -----
+                        // Конструктор оргсхемы. ОТДЕЛЬНЫЕ таблицы — departments/posts
+                        // не трогаем. installer-upgrade может не прогнать миграцию 11.
+                        let org_healing = "\
+CREATE TABLE IF NOT EXISTS org_divisions ( \
+    id TEXT PRIMARY KEY, \
+    name TEXT NOT NULL, \
+    description TEXT, \
+    sort_order INTEGER NOT NULL DEFAULT 0, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP \
+); \
+CREATE TABLE IF NOT EXISTS org_departments ( \
+    id TEXT PRIMARY KEY, \
+    division_id TEXT NOT NULL, \
+    name TEXT NOT NULL, \
+    description TEXT, \
+    sort_order INTEGER NOT NULL DEFAULT 0, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+    FOREIGN KEY (division_id) REFERENCES org_divisions(id) ON DELETE CASCADE \
+); \
+CREATE TABLE IF NOT EXISTS org_agents ( \
+    id TEXT PRIMARY KEY, \
+    department_id TEXT NOT NULL, \
+    name TEXT NOT NULL, \
+    slug TEXT NOT NULL, \
+    role_label TEXT NOT NULL DEFAULT 'member', \
+    status TEXT NOT NULL DEFAULT 'active', \
+    folder_path TEXT, \
+    sort_order INTEGER NOT NULL DEFAULT 0, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+    updated_at TEXT DEFAULT NULL, \
+    FOREIGN KEY (department_id) REFERENCES org_departments(id) ON DELETE CASCADE, \
+    CHECK (role_label IN ('head','member')), \
+    CHECK (status IN ('active','paused','off')) \
+);";
+                        match sqlx::raw_sql(org_healing).execute(&pool.0).await {
+                            Ok(_) => log::info!("Этап1 self-healing: org_* tables ensured"),
+                            Err(e) => log::warn!("Этап1 self-healing: org_* tables: {e}"),
+                        }
+
                         // ----- v1.0.22: Outbox directory init -----
                         if let Some(data_dir) = db_path.parent() {
                             let vault_root = data_dir.join("Vault");
@@ -660,6 +706,20 @@ CREATE INDEX IF NOT EXISTS idx_run_logs_created ON run_logs(created_at);";
             commands::vault_io::save_pattern,
             commands::vault_io::save_win,
             commands::vault_io::get_vault_preview,
+            // Этап 1 — Конструктор оргсхемы (вкладка «Оргсхема»)
+            commands::org_chart::list_org_tree,
+            commands::org_chart::create_division,
+            commands::org_chart::rename_division,
+            commands::org_chart::delete_division,
+            commands::org_chart::create_department,
+            commands::org_chart::rename_department,
+            commands::org_chart::move_department,
+            commands::org_chart::delete_department,
+            commands::org_chart::create_agent,
+            commands::org_chart::rename_agent,
+            commands::org_chart::move_agent,
+            commands::org_chart::delete_agent,
+            commands::org_chart::set_agent_role_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");

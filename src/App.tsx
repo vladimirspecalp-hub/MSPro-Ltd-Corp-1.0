@@ -5,6 +5,7 @@ import CeoChat from "./components/views/CeoChat";
 import SecurityVault from "./components/views/SecurityVault";
 import Dispatcher from "./components/views/Dispatcher";
 import Settings from "./components/views/Settings";
+import OrgStructure from "./components/views/OrgStructure";
 import { ToastProvider } from "./components/common/Toast";
 import "./App.css";
 
@@ -29,6 +30,7 @@ export default function App() {
           {view === "ceo" && <CeoChat />}
           {view === "vault" && <SecurityVault />}
           {view === "dispatcher" && <Dispatcher />}
+          {view === "orgchart" && <OrgStructure />}
           {view === "settings" && <Settings />}
         </main>
       </div>

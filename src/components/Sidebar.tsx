@@ -1,6 +1,6 @@
 import type { CSSProperties } from "react";
 
-export type View = "home" | "ceo" | "vault" | "dispatcher" | "settings";
+export type View = "home" | "ceo" | "vault" | "dispatcher" | "orgchart" | "settings";
 
 interface SidebarProps {
   current: View;
@@ -12,6 +12,7 @@ const ITEMS: Array<{ id: View; label: string; icon: string }> = [
   { id: "ceo", label: "Гендир (CEO)", icon: "💬" },
   { id: "vault", label: "Отдел СБ", icon: "🔐" },
   { id: "dispatcher", label: "Диспетчер", icon: "📡" },
+  { id: "orgchart", label: "Оргсхема", icon: "🏢" },
   { id: "settings", label: "Настройки", icon: "⚙" },
 ];
 
