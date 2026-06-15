@@ -130,6 +130,16 @@ pub async fn fail_task(
 }
 
 #[tauri::command]
+pub async fn cancel_task(
+    task_id: String,
+    reason: String,
+    db: State<'_, WritePool>,
+    app: AppHandle,
+) -> Result<DispatcherTask, String> {
+    cancel_task_inner(task_id, reason, &db, &app).await
+}
+
+#[tauri::command]
 pub async fn list_active_tasks(
     db: State<'_, WritePool>,
 ) -> Result<Vec<DispatcherTask>, String> {
@@ -270,19 +280,77 @@ pub async fn fail_task_inner(
         .to_string(),
     };
 
-    sqlx::query(
+    let rows = sqlx::query(
         "UPDATE dispatcher_logs
          SET status = 'failed', task_payload = ?, completed_at = CURRENT_TIMESTAMP
-         WHERE id = ?",
+         WHERE id = ? AND status = 'in_progress'",
     )
     .bind(&merged)
     .bind(&task_id)
     .execute(&db.0)
     .await
-    .map_err(|e| format!("fail task: {e}"))?;
+    .map_err(|e| format!("fail task: {e}"))?
+    .rows_affected();
 
     let task = fetch_task_by_id(db, &task_id).await?;
+    if rows == 0 {
+        log::info!("fail_task_inner: skip id={task_id} — already {}", task.status);
+        return Ok(task);
+    }
     log::info!("fail_task id={} reason={}", task.id, reason);
+    let _ = app.emit("dispatcher-task-changed", &task);
+    Ok(task)
+}
+
+pub async fn cancel_task_inner(
+    task_id: String,
+    reason: String,
+    db: &WritePool,
+    app: &AppHandle,
+) -> Result<DispatcherTask, String> {
+    let existing: Option<(String,)> =
+        sqlx::query_as("SELECT task_payload FROM dispatcher_logs WHERE id = ?")
+            .bind(&task_id)
+            .fetch_optional(&db.0)
+            .await
+            .map_err(|e| format!("read existing payload: {e}"))?;
+    let Some((existing_payload,)) = existing else {
+        return Err(format!("task {task_id} not found"));
+    };
+
+    let merged = match serde_json::from_str::<serde_json::Value>(&existing_payload) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert(
+                "cancel_reason".to_string(),
+                serde_json::Value::String(reason.clone()),
+            );
+            serde_json::Value::Object(map).to_string()
+        }
+        _ => serde_json::json!({
+            "cancel_reason": reason,
+            "original_payload": existing_payload
+        })
+        .to_string(),
+    };
+
+    let rows = sqlx::query(
+        "UPDATE dispatcher_logs
+         SET status = 'cancelled', task_payload = ?, completed_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND status = 'in_progress'",
+    )
+    .bind(&merged)
+    .bind(&task_id)
+    .execute(&db.0)
+    .await
+    .map_err(|e| format!("cancel task: {e}"))?
+    .rows_affected();
+    if rows == 0 {
+        return Err(format!(
+            "task {task_id} not found or not in_progress"
+        ));
+    }
+    let task = fetch_task_by_id(db, &task_id).await?;
+    log::info!("cancel_task id={} reason={}", task.id, reason);
     let _ = app.emit("dispatcher-task-changed", &task);
     Ok(task)
 }
@@ -494,6 +562,135 @@ async fn fetch_task_by_id(db: &WritePool, id: &str) -> Result<DispatcherTask, St
 mod tests {
     use super::*;
     use sqlx::SqlitePool;
+
+    async fn test_db() -> WritePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "CREATE TABLE dispatcher_logs ( \
+                id TEXT PRIMARY KEY, \
+                from_entity TEXT NOT NULL, \
+                to_entity TEXT NOT NULL, \
+                task_payload TEXT NOT NULL, \
+                status TEXT NOT NULL DEFAULT 'in_progress', \
+                execution_time_ms INTEGER, \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+                parent_task_id TEXT DEFAULT NULL, \
+                completed_at DATETIME DEFAULT NULL, \
+                attempts_count INTEGER NOT NULL DEFAULT 1, \
+                hop_kind TEXT DEFAULT NULL, \
+                routed_by_model TEXT DEFAULT NULL, \
+                refined_prompt TEXT DEFAULT NULL, \
+                outbox_path TEXT DEFAULT NULL, \
+                CHECK (status IN ('in_progress','completed','failed','cancelled')) \
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        WritePool(pool)
+    }
+
+    async fn insert_task(db: &WritePool, id: &str) {
+        sqlx::query(
+            "INSERT INTO dispatcher_logs (id, from_entity, to_entity, task_payload) \
+             VALUES (?, 'test', 'test', '{}')",
+        )
+        .bind(id)
+        .execute(&db.0)
+        .await
+        .unwrap();
+    }
+
+    async fn get_status(db: &WritePool, id: &str) -> String {
+        let (s,): (String,) =
+            sqlx::query_as("SELECT status FROM dispatcher_logs WHERE id = ?")
+                .bind(id)
+                .fetch_one(&db.0)
+                .await
+                .unwrap();
+        s
+    }
+
+    // ── Cancel flow tests (BL-P1-016 verifier follow-up) ─────────────────
+
+    #[tokio::test]
+    async fn cancel_task_sets_status_cancelled() {
+        let db = test_db().await;
+        insert_task(&db, "t-cancel-1").await;
+        assert_eq!(get_status(&db, "t-cancel-1").await, "in_progress");
+
+        let rows = sqlx::query(
+            "UPDATE dispatcher_logs \
+             SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND status = 'in_progress'",
+        )
+        .bind("t-cancel-1")
+        .execute(&db.0)
+        .await
+        .unwrap()
+        .rows_affected();
+
+        assert_eq!(rows, 1);
+        assert_eq!(get_status(&db, "t-cancel-1").await, "cancelled");
+    }
+
+    #[tokio::test]
+    async fn fail_after_cancel_does_not_overwrite() {
+        let db = test_db().await;
+        insert_task(&db, "t-race-1").await;
+
+        sqlx::query(
+            "UPDATE dispatcher_logs \
+             SET status = 'cancelled', completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND status = 'in_progress'",
+        )
+        .bind("t-race-1")
+        .execute(&db.0)
+        .await
+        .unwrap();
+        assert_eq!(get_status(&db, "t-race-1").await, "cancelled");
+
+        let rows = sqlx::query(
+            "UPDATE dispatcher_logs \
+             SET status = 'failed', completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND status = 'in_progress'",
+        )
+        .bind("t-race-1")
+        .execute(&db.0)
+        .await
+        .unwrap()
+        .rows_affected();
+
+        assert_eq!(rows, 0, "fail must be a no-op on cancelled task");
+        assert_eq!(
+            get_status(&db, "t-race-1").await,
+            "cancelled",
+            "TOCTOU: cancelled status must survive a concurrent fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn fail_task_works_on_in_progress() {
+        let db = test_db().await;
+        insert_task(&db, "t-fail-ok").await;
+
+        let rows = sqlx::query(
+            "UPDATE dispatcher_logs \
+             SET status = 'failed', task_payload = '{\"error\":\"boom\"}', \
+                 completed_at = CURRENT_TIMESTAMP \
+             WHERE id = ? AND status = 'in_progress'",
+        )
+        .bind("t-fail-ok")
+        .execute(&db.0)
+        .await
+        .unwrap()
+        .rows_affected();
+
+        assert_eq!(rows, 1);
+        assert_eq!(get_status(&db, "t-fail-ok").await, "failed");
+    }
+
+    // ── Original tests ───────────────────────────────────────────────────
 
     #[test]
     fn validate_hop_kind_accepts_allowed() {

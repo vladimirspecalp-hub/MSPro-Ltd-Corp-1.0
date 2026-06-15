@@ -34,7 +34,7 @@ export interface DispatcherDecision {
   created_at: string;
 }
 
-type Tab = "inbox" | "processing" | "awaiting" | "completed" | "failed" | "all";
+type Tab = "inbox" | "processing" | "awaiting" | "completed" | "failed" | "cancelled" | "all";
 
 export default function Dispatcher() {
   const [tab, setTab] = useState<Tab>("inbox");
@@ -62,6 +62,8 @@ export default function Dispatcher() {
             return t.status === "completed";
           case "failed":
             return t.status === "failed";
+          case "cancelled":
+            return t.status === "cancelled";
           case "all":
             return true;
         }
@@ -119,6 +121,7 @@ export default function Dispatcher() {
           { id: "awaiting" as Tab, label: "👁 Awaiting" },
           { id: "completed" as Tab, label: "✅ Completed" },
           { id: "failed" as Tab, label: "❌ Failed" },
+          { id: "cancelled" as Tab, label: "⊘ Cancelled" },
           { id: "all" as Tab, label: "📋 Все" },
         ]).map((t) => (
           <button

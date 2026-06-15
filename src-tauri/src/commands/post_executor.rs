@@ -252,13 +252,19 @@ async fn run_claude_cli_for_post(
     .kill_on_drop(true);
 
     let mut child: Child = cmd.spawn().map_err(|e| {
-        // Сразу помечаем задачу failed чтобы UI не висел.
         let task_id = task_id.to_string();
         let reason = format!("spawn failed: {e}");
         let db_clone = db.clone();
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = dispatcher::fail_task_inner(task_id, reason, &db_clone, &app_clone).await;
+            // BL-P1-016: не перезатираем cancelled при spawn failure.
+            let already_cancelled = dispatcher::fetch_task_by_id_public(&db_clone, &task_id)
+                .await
+                .map(|t| t.status == "cancelled")
+                .unwrap_or(false);
+            if !already_cancelled {
+                let _ = dispatcher::fail_task_inner(task_id, reason, &db_clone, &app_clone).await;
+            }
         });
         format!("claude spawn failed: {e}")
     })?;
@@ -337,7 +343,10 @@ async fn run_claude_cli_for_post(
     }
 
     // 10. Обновляем статус parent task в dispatcher_logs.
-    if exit_code == 0 && registered > 0 {
+    // BL-P1-016: если пользователь уже отменил — не перезатираем cancelled на failed.
+    if is_task_cancelled(task_id, db).await {
+        log::info!("post_executor: task {task_id} already cancelled — skip status update");
+    } else if exit_code == 0 && registered > 0 {
         // ✅ Успех — task остаётся in_progress с outbox_path != null,
         // UI покажет в Awaiting (Владелец approve/reject).
         log::info!(
@@ -655,7 +664,14 @@ async fn run_via_pal(
         }
     }
 
+    // BL-P1-016: если пользователь уже отменил — не перезатираем cancelled.
+    let already_cancelled = is_task_cancelled(task_id, db).await;
+
     let exit_code = match &result {
+        _ if already_cancelled => {
+            log::info!("run_via_pal: task {task_id} already cancelled — skip status update");
+            0
+        }
         Ok(_) if registered > 0 => {
             log::info!(
                 "run_via_pal: task {task_id} produced {registered} artifacts — awaiting approval"
@@ -709,37 +725,88 @@ async fn run_via_pal(
 // Tauri commands
 // ---------------------------------------------------------------------------
 
-/// Ручной cancel: убивает claude.exe пост-агента по task_id.
+/// BFS-обход дерева процессов: возвращает все PID (корень + потомки).
+/// Чистая функция для тестируемости — `children_of` возвращает детей данного PID.
+fn collect_tree_pids(root: u32, children_of: impl Fn(u32) -> Vec<u32>) -> Vec<u32> {
+    let mut to_kill = vec![root];
+    let mut i = 0;
+    while i < to_kill.len() {
+        for child in children_of(to_kill[i]) {
+            if !to_kill.contains(&child) {
+                to_kill.push(child);
+            }
+        }
+        i += 1;
+    }
+    to_kill
+}
+
+/// BL-P1-016: Рекурсивный kill дерева процессов по корневому PID.
+/// BFS по PPID через sysinfo — убивает листья первыми, корень последним.
+#[cfg(windows)]
+fn kill_process_tree(root_pid: u32) {
+    use sysinfo::{Pid, ProcessesToUpdate, System};
+
+    let mut sys = System::new();
+    sys.refresh_processes(ProcessesToUpdate::All, true);
+
+    let pids = collect_tree_pids(root_pid, |parent| {
+        let parent_pid = sysinfo::Pid::from_u32(parent);
+        sys.processes()
+            .iter()
+            .filter(|(_, p)| p.parent() == Some(parent_pid))
+            .map(|(pid, _)| pid.as_u32())
+            .collect()
+    });
+
+    for &pid in pids.iter().rev() {
+        if let Some(proc_) = sys.process(Pid::from_u32(pid)) {
+            let killed = proc_.kill();
+            log::info!("kill_process_tree: pid={pid} killed={killed}");
+        }
+    }
+}
+
+async fn is_task_cancelled(task_id: &str, db: &WritePool) -> bool {
+    dispatcher::fetch_task_by_id_public(db, task_id)
+        .await
+        .map(|t| t.status == "cancelled")
+        .unwrap_or(false)
+}
+
+/// Ручной cancel: атомарно ставит cancelled + убивает дерево процессов.
+/// Фронтенду НЕ нужно вызывать fail_task — всё внутри.
 #[tauri::command]
 pub async fn cancel_post_executor(
     task_id: String,
     registry: State<'_, PostExecutorRegistry>,
+    db: State<'_, WritePool>,
+    app: AppHandle,
 ) -> Result<bool, String> {
-    let pid = {
-        let map = registry.running.lock().await;
-        map.get(&task_id).copied()
-    };
-    let Some(pid) = pid else {
-        return Ok(false);
-    };
-
-    #[cfg(windows)]
+    match dispatcher::cancel_task_inner(
+        task_id.clone(),
+        "cancelled by user".to_string(),
+        &db,
+        &app,
+    )
+    .await
     {
-        use sysinfo::Pid;
-        let mut sys = sysinfo::System::new();
-        sys.refresh_processes(
-            sysinfo::ProcessesToUpdate::Some(&[Pid::from_u32(pid)]),
-            true,
-        );
-        if let Some(proc_) = sys.process(Pid::from_u32(pid)) {
-            let killed = proc_.kill();
-            log::info!("cancel_post_executor: kill pid={pid} task={task_id} ok={killed}");
-            return Ok(killed);
-        }
+        Ok(_) => log::info!("cancel_post_executor: task {task_id} status → cancelled"),
+        Err(e) => log::warn!("cancel_post_executor: cancel_task_inner: {e}"),
     }
 
-    let _ = task_id;
-    Ok(false)
+    let pid = {
+        let mut map = registry.running.lock().await;
+        map.remove(&task_id)
+    };
+
+    if let Some(pid) = pid {
+        #[cfg(windows)]
+        kill_process_tree(pid);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Cleanup orphan claude.exe — оставшиеся от предыдущего crash MSPro.
@@ -789,5 +856,43 @@ mod tests {
             SRC.contains("claude_cli_driver::build_cli_args(&agent_name, &model)"),
             "legacy spawn не использует единый build_cli_args — argv может разъехаться с PAL"
         );
+    }
+
+    #[test]
+    fn kill_process_tree_bfs_collects_full_tree() {
+        use std::collections::HashMap;
+        //   1
+        //  / \
+        // 2   3
+        //     |
+        //     4
+        let mut tree: HashMap<u32, Vec<u32>> = HashMap::new();
+        tree.insert(1, vec![2, 3]);
+        tree.insert(3, vec![4]);
+
+        let pids = super::collect_tree_pids(1, |p| {
+            tree.get(&p).cloned().unwrap_or_default()
+        });
+        assert_eq!(pids[0], 1, "root first");
+        assert!(pids.contains(&2));
+        assert!(pids.contains(&3));
+        assert!(pids.contains(&4));
+        assert_eq!(pids.len(), 4, "all 4 pids collected");
+        let pos4 = pids.iter().position(|&p| p == 4).unwrap();
+        let pos3 = pids.iter().position(|&p| p == 3).unwrap();
+        assert!(pos4 > pos3, "child 4 discovered after parent 3 (BFS order)");
+    }
+
+    #[test]
+    fn kill_process_tree_bfs_no_cycle() {
+        use std::collections::HashMap;
+        let mut tree: HashMap<u32, Vec<u32>> = HashMap::new();
+        tree.insert(10, vec![20]);
+        tree.insert(20, vec![10]); // cycle
+
+        let pids = super::collect_tree_pids(10, |p| {
+            tree.get(&p).cloned().unwrap_or_default()
+        });
+        assert_eq!(pids, vec![10, 20], "cycle doesn't cause infinite loop");
     }
 }

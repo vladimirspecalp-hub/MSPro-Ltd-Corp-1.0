@@ -132,6 +132,12 @@ fn migrations() -> Vec<Migration> {
             sql: lf(include_str!("../migrations/11_org_structure.sql")),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 12,
+            description: "BL-P1-016: dispatcher_logs CHECK status includes 'cancelled'",
+            sql: lf(include_str!("../migrations/12_cancelled_status.sql")),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -416,6 +422,59 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             }
                         }
 
+                        // ----- BL-P1-016 self-healing: dispatcher_logs CHECK includes 'cancelled' -----
+                        // SQLite cannot ALTER CHECK — if the constraint doesn't include 'cancelled',
+                        // rebuild the table. Runs AFTER column ALTERs above so all columns exist.
+                        let _ = sqlx::raw_sql("DROP TABLE IF EXISTS dispatcher_logs_new")
+                            .execute(&pool.0).await;
+                        let dl_schema: Option<(String,)> = sqlx::query_as(
+                            "SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatcher_logs'"
+                        )
+                            .fetch_optional(&pool.0)
+                            .await
+                            .unwrap_or(None);
+                        if let Some((schema_sql,)) = dl_schema {
+                            if !schema_sql.contains("'cancelled'") {
+                                log::info!("BL-P1-016 self-healing: rebuilding dispatcher_logs for 'cancelled' CHECK");
+                                let rebuild = "\
+CREATE TABLE dispatcher_logs_new ( \
+    id TEXT PRIMARY KEY, \
+    from_entity TEXT NOT NULL, \
+    to_entity TEXT NOT NULL, \
+    task_payload TEXT NOT NULL, \
+    status TEXT NOT NULL DEFAULT 'in_progress', \
+    execution_time_ms INTEGER, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+    parent_task_id TEXT DEFAULT NULL, \
+    completed_at DATETIME DEFAULT NULL, \
+    attempts_count INTEGER NOT NULL DEFAULT 1, \
+    hop_kind TEXT DEFAULT NULL, \
+    routed_by_model TEXT DEFAULT NULL, \
+    refined_prompt TEXT DEFAULT NULL, \
+    outbox_path TEXT DEFAULT NULL, \
+    raw_brain_response TEXT DEFAULT NULL, \
+    CHECK (status IN ('in_progress','completed','failed','cancelled')) \
+); \
+INSERT INTO dispatcher_logs_new \
+    SELECT id, from_entity, to_entity, task_payload, status, \
+           execution_time_ms, created_at, parent_task_id, completed_at, \
+           attempts_count, hop_kind, routed_by_model, refined_prompt, \
+           outbox_path, raw_brain_response \
+    FROM dispatcher_logs; \
+DROP TABLE dispatcher_logs; \
+ALTER TABLE dispatcher_logs_new RENAME TO dispatcher_logs; \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_status ON dispatcher_logs(status, created_at DESC); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_to ON dispatcher_logs(to_entity, created_at DESC); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_from ON dispatcher_logs(from_entity, created_at DESC); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_parent ON dispatcher_logs(parent_task_id); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind);";
+                                match sqlx::raw_sql(rebuild).execute(&pool.0).await {
+                                    Ok(_) => log::info!("BL-P1-016 self-healing: CHECK updated"),
+                                    Err(e) => log::warn!("BL-P1-016 self-healing: rebuild failed: {e}"),
+                                }
+                            }
+                        }
+
                         // ----- BL-P1-018 self-healing: chat_messages.spawned_task_id -----
                         // Migration 10 + страховка от installer-upgrade (R-T-006): если
                         // tauri-plugin-sql не доехал миграцию — добавляем колонку здесь.
@@ -588,6 +647,12 @@ CREATE TABLE IF NOT EXISTS org_agents ( \
                             Err(e) => log::warn!("Этап1 self-healing: org_* tables: {e}"),
                         }
 
+                        // ----- BL-P1-016: cleanup orphan post processes from previous crash -----
+                        let orphans = commands::post_executor::cleanup_orphan_post_processes().await;
+                        if orphans > 0 {
+                            log::info!("cleanup_orphan_post_processes: killed {orphans} orphans");
+                        }
+
                         // ----- v1.0.22: Outbox directory init -----
                         if let Some(data_dir) = db_path.parent() {
                             let vault_root = data_dir.join("Vault");
@@ -682,6 +747,7 @@ CREATE TABLE IF NOT EXISTS org_agents ( \
             commands::dispatcher::dispatch_task,
             commands::dispatcher::complete_task,
             commands::dispatcher::fail_task,
+            commands::dispatcher::cancel_task,
             commands::dispatcher::list_active_tasks,
             commands::dispatcher::list_recent_tasks,
             // v1.0.22 Phase 11C — Dispatcher Hub

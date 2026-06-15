@@ -11,6 +11,7 @@ const STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }> = 
   in_progress: { bg: "#fff3cd", fg: "#856404", label: "⏳ in_progress" },
   completed: { bg: "#d4edda", fg: "#155724", label: "✅ completed" },
   failed: { bg: "#f8d7da", fg: "#721c24", label: "❌ failed" },
+  cancelled: { bg: "#e2e3e5", fg: "#383d41", label: "⊘ cancelled" },
 };
 
 export default function TaskRow({ task, onOpen, onChanged }: Props) {
@@ -49,19 +50,9 @@ export default function TaskRow({ task, onOpen, onChanged }: Props) {
 
   async function quickCancel(e: React.MouseEvent) {
     e.stopPropagation();
-    if (!window.confirm("Отменить выполнение? Процесс пост-агента (claude.exe/python) будет убит.")) return;
+    if (!window.confirm("Отменить выполнение? Процесс пост-агента будет убит.")) return;
     try {
-      // cancel_post_executor убивает PID по task_id (true=убит, false=не найден),
-      // но НЕ меняет статус задачи. Уводим из Processing явным fail_task,
-      // иначе задача зависнет in_progress навсегда.
-      const killed = await invoke<boolean>("cancel_post_executor", { taskId: task.id });
-      const updated = await invoke<DispatcherTask>("fail_task", {
-        taskId: task.id,
-        reason: killed
-          ? "cancelled by user (process killed)"
-          : "cancelled by user (process not running)",
-      });
-      onChanged(updated);
+      await invoke<boolean>("cancel_post_executor", { taskId: task.id });
     } catch (e) {
       alert(String(e));
     }
