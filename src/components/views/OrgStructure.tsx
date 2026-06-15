@@ -8,6 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import AgentCardEditor from "../org/AgentCardEditor";
 
 interface AgentNode {
   id: string;
@@ -134,6 +135,14 @@ export default function OrgStructure() {
       d.departments.map((dep) => ({ id: dep.id, label: `${d.name} / ${dep.name}` })),
     ) ?? [];
 
+  // Все агенты (для Заход 2: карточка → связи).
+  const allAgents: Array<{ id: string; name: string }> =
+    tree?.divisions.flatMap((d) =>
+      d.departments.flatMap((dep) =>
+        dep.agents.map((a) => ({ id: a.id, name: a.name })),
+      ),
+    ) ?? [];
+
   return (
     <div style={{ display: "flex", flex: 1, minHeight: 0, height: "100%" }}>
       {/* ЛЕВАЯ ПАНЕЛЬ — дерево + операции */}
@@ -245,23 +254,17 @@ export default function OrgStructure() {
         )}
       </div>
 
-      {/* ПРАВАЯ ПАНЕЛЬ — карточка агента (заглушка, полноценно в Заходе 2) */}
+      {/* ПРАВАЯ ПАНЕЛЬ — карточка агента (Заход 2) */}
       <div style={{ flex: "1 1 40%", overflowY: "auto", padding: "24px 28px", background: "#fff" }}>
         <h2 style={{ marginTop: 0, fontSize: 18 }}>Карточка агента</h2>
         {selected == null ? (
           <p style={{ color: "#888", fontSize: 13 }}>Выбери агента в дереве слева.</p>
         ) : (
-          <div style={{ fontSize: 13, lineHeight: 1.7 }}>
-            <div><strong>Имя:</strong> {selected.name}</div>
-            <div><strong>Slug:</strong> <code>{selected.slug}</code></div>
-            <div><strong>Роль:</strong> {selected.role_label === "head" ? "глава" : "обычный"}</div>
-            <div><strong>Статус:</strong> {(STATUS_META[selected.status] ?? { label: selected.status }).label}</div>
-            <div><strong>Папка:</strong> {selected.folder_path ?? "— (создаётся на следующем этапе)"}</div>
-            <div style={{ marginTop: 16, padding: 12, background: "#f5f5f5", borderRadius: 4, color: "#666" }}>
-              ✏ Редактор карточки (роль/мозг/MCP/CLAUDE.md/память/ЦКП/чек-лист) — <strong>Заход 2</strong>.
-              Сейчас это скелет: структура и операции дерева.
-            </div>
-          </div>
+          <AgentCardEditor
+            key={selected.id}
+            agentId={selected.id}
+            allAgents={allAgents}
+          />
         )}
       </div>
     </div>

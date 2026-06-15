@@ -457,10 +457,15 @@ pub async fn move_agent(
     Ok(())
 }
 
-/// Удаление агента (Заход 1) = ТОЛЬКО строка БД. Папку на диске НЕ трогаем
-/// (директива Владельца: приложение в скелете папки только создаёт, не стирает).
+/// Удаление агента = строка БД + связи (org_agent_links). Папку НЕ трогаем.
 #[tauri::command]
 pub async fn delete_agent(id: String, db: State<'_, WritePool>) -> Result<(), String> {
+    sqlx::query("DELETE FROM org_agent_links WHERE from_agent_id = ? OR to_agent_id = ?")
+        .bind(&id)
+        .bind(&id)
+        .execute(&db.0)
+        .await
+        .map_err(|e| format!("delete agent links: {e}"))?;
     let rows = sqlx::query("DELETE FROM org_agents WHERE id = ?")
         .bind(&id)
         .execute(&db.0)

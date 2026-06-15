@@ -11,5 +11,6 @@ pub mod ping;
 pub mod posts;
 pub mod qwen_bridge;
 pub mod tool_calls;
+pub mod agent_card;
 pub mod vault;
 pub mod vault_io;

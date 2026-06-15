@@ -138,6 +138,12 @@ fn migrations() -> Vec<Migration> {
             sql: lf(include_str!("../migrations/12_cancelled_status.sql")),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 13,
+            description: "Заход 2: agent card (8 columns + org_agent_links)",
+            sql: lf(include_str!("../migrations/13_agent_card.sql")),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -647,6 +653,55 @@ CREATE TABLE IF NOT EXISTS org_agents ( \
                             Err(e) => log::warn!("Этап1 self-healing: org_* tables: {e}"),
                         }
 
+                        // ----- Заход 2 self-healing: agent card columns -----
+                        // 8 новых колонок org_agents + таблица org_agent_links.
+                        let card_alters: &[(&str, &str)] = &[
+                            ("role_prompt_md",  "ALTER TABLE org_agents ADD COLUMN role_prompt_md TEXT DEFAULT NULL"),
+                            ("brain_mode",      "ALTER TABLE org_agents ADD COLUMN brain_mode TEXT NOT NULL DEFAULT 'disabled'"),
+                            ("brain_model",     "ALTER TABLE org_agents ADD COLUMN brain_model TEXT DEFAULT NULL"),
+                            ("brain_endpoint",  "ALTER TABLE org_agents ADD COLUMN brain_endpoint TEXT DEFAULT NULL"),
+                            ("mcp_servers_json","ALTER TABLE org_agents ADD COLUMN mcp_servers_json TEXT NOT NULL DEFAULT '[]'"),
+                            ("ckp_text",        "ALTER TABLE org_agents ADD COLUMN ckp_text TEXT DEFAULT NULL"),
+                            ("checklist_json",  "ALTER TABLE org_agents ADD COLUMN checklist_json TEXT NOT NULL DEFAULT '[]'"),
+                            ("memory_md",       "ALTER TABLE org_agents ADD COLUMN memory_md TEXT DEFAULT NULL"),
+                        ];
+                        let oa_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                            sqlx::query_as("PRAGMA table_info(org_agents)")
+                                .fetch_all(&pool.0)
+                                .await
+                                .unwrap_or_default();
+                        let oa_existing: std::collections::HashSet<String> =
+                            oa_cols.into_iter().map(|c| c.1).collect();
+                        for (col, sql) in card_alters {
+                            if oa_existing.contains(*col) {
+                                continue;
+                            }
+                            match sqlx::raw_sql(sql).execute(&pool.0).await {
+                                Ok(_) => log::info!("Заход2 self-healing: added org_agents.{col}"),
+                                Err(e) => log::warn!("Заход2 self-healing: org_agents.{col} ALTER failed: {e}"),
+                            }
+                        }
+
+                        let links_healing = "\
+CREATE TABLE IF NOT EXISTS org_agent_links ( \
+    id TEXT PRIMARY KEY, \
+    from_agent_id TEXT NOT NULL, \
+    to_agent_id TEXT NOT NULL, \
+    link_type TEXT NOT NULL CHECK (link_type IN ('next','verifier','input_from')), \
+    description TEXT, \
+    sort_order INTEGER NOT NULL DEFAULT 0, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+    FOREIGN KEY (from_agent_id) REFERENCES org_agents(id) ON DELETE CASCADE, \
+    FOREIGN KEY (to_agent_id) REFERENCES org_agents(id) ON DELETE CASCADE, \
+    UNIQUE(from_agent_id, to_agent_id, link_type), \
+    CHECK(from_agent_id != to_agent_id) \
+); \
+CREATE INDEX IF NOT EXISTS idx_agent_links_to ON org_agent_links(to_agent_id);";
+                        match sqlx::raw_sql(links_healing).execute(&pool.0).await {
+                            Ok(_) => log::info!("Заход2 self-healing: org_agent_links ensured"),
+                            Err(e) => log::warn!("Заход2 self-healing: org_agent_links: {e}"),
+                        }
+
                         // ----- BL-P1-016: cleanup orphan post processes from previous crash -----
                         let orphans = commands::post_executor::cleanup_orphan_post_processes().await;
                         if orphans > 0 {
@@ -786,6 +841,12 @@ CREATE TABLE IF NOT EXISTS org_agents ( \
             commands::org_chart::move_agent,
             commands::org_chart::delete_agent,
             commands::org_chart::set_agent_role_status,
+            // Заход 2 — Карточка агента + связи
+            commands::agent_card::agent_card_get,
+            commands::agent_card::agent_card_save,
+            commands::agent_card::agent_links_get,
+            commands::agent_card::agent_link_set,
+            commands::agent_card::agent_link_remove,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");
