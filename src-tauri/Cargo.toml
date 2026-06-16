@@ -48,6 +48,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 # Step 10 — Qwen 3 local HTTP bridge (OpenAI-compatible streaming)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 dirs = "5"
+sha2 = "0.10"
 
 # Windows-only: secure secret storage backed by DPAPI / Credential Manager.
 [target.'cfg(windows)'.dependencies]

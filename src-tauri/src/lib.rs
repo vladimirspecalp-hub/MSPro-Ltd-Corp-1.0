@@ -12,6 +12,7 @@ mod com_server;
 mod context_assembler;
 mod db;
 mod external_agent;
+mod org_tree;
 mod secrets;
 mod settings;
 mod updater;
@@ -144,6 +145,12 @@ fn migrations() -> Vec<Migration> {
             sql: lf(include_str!("../migrations/13_agent_card.sql")),
             kind: MigrationKind::Up,
         },
+        Migration {
+            version: 14,
+            description: "Заход 3: org slugs for divisions/departments + org_disk_sync",
+            sql: lf(include_str!("../migrations/14_org_slugs.sql")),
+            kind: MigrationKind::Up,
+        },
     ]
 }
 
@@ -178,6 +185,8 @@ pub fn run() {
         .manage(PendingCeoResponses::default())
         // v1.0.24 Phase 11B-1: registry активных пост-агентов (claude.exe в Outbox sandbox)
         .manage(commands::post_executor::PostExecutorRegistry::default())
+        // Заход 3: материализация оргструктуры на диск (C:\CODE\Agents\)
+        .manage(org_tree::OrgTreeState::new(std::path::PathBuf::from(org_tree::ORG_TREE_ROOT)))
         .on_window_event(|window, event| {
             // Anti-zombie: when the user closes the window, set the cancel
             // flag so any in-flight Hermes streaming task kills its child.
@@ -431,6 +440,10 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                         // ----- BL-P1-016 self-healing: dispatcher_logs CHECK includes 'cancelled' -----
                         // SQLite cannot ALTER CHECK — if the constraint doesn't include 'cancelled',
                         // rebuild the table. Runs AFTER column ALTERs above so all columns exist.
+                        //
+                        // dispatcher_decisions and task_artifacts have FK → dispatcher_logs(id).
+                        // DROP TABLE with foreign_keys=ON triggers SQLite error 787, so we
+                        // temporarily disable FK enforcement for the rebuild transaction.
                         let _ = sqlx::raw_sql("DROP TABLE IF EXISTS dispatcher_logs_new")
                             .execute(&pool.0).await;
                         let dl_schema: Option<(String,)> = sqlx::query_as(
@@ -443,6 +456,7 @@ CREATE INDEX IF NOT EXISTS idx_condition_logs_post_time \
                             if !schema_sql.contains("'cancelled'") {
                                 log::info!("BL-P1-016 self-healing: rebuilding dispatcher_logs for 'cancelled' CHECK");
                                 let rebuild = "\
+PRAGMA foreign_keys=OFF; \
 CREATE TABLE dispatcher_logs_new ( \
     id TEXT PRIMARY KEY, \
     from_entity TEXT NOT NULL, \
@@ -451,7 +465,7 @@ CREATE TABLE dispatcher_logs_new ( \
     status TEXT NOT NULL DEFAULT 'in_progress', \
     execution_time_ms INTEGER, \
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
-    parent_task_id TEXT DEFAULT NULL, \
+    parent_task_id TEXT DEFAULT NULL REFERENCES dispatcher_logs(id), \
     completed_at DATETIME DEFAULT NULL, \
     attempts_count INTEGER NOT NULL DEFAULT 1, \
     hop_kind TEXT DEFAULT NULL, \
@@ -473,7 +487,8 @@ CREATE INDEX IF NOT EXISTS idx_dispatcher_status ON dispatcher_logs(status, crea
 CREATE INDEX IF NOT EXISTS idx_dispatcher_to ON dispatcher_logs(to_entity, created_at DESC); \
 CREATE INDEX IF NOT EXISTS idx_dispatcher_from ON dispatcher_logs(from_entity, created_at DESC); \
 CREATE INDEX IF NOT EXISTS idx_dispatcher_parent ON dispatcher_logs(parent_task_id); \
-CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind);";
+CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind); \
+PRAGMA foreign_keys=ON;";
                                 match sqlx::raw_sql(rebuild).execute(&pool.0).await {
                                     Ok(_) => log::info!("BL-P1-016 self-healing: CHECK updated"),
                                     Err(e) => log::warn!("BL-P1-016 self-healing: rebuild failed: {e}"),
@@ -702,6 +717,57 @@ CREATE INDEX IF NOT EXISTS idx_agent_links_to ON org_agent_links(to_agent_id);";
                             Err(e) => log::warn!("Заход2 self-healing: org_agent_links: {e}"),
                         }
 
+                        // ----- Заход 3 self-healing: slug columns + org_disk_sync -----
+                        let div_slug_alters: &[(&str, &str)] = &[
+                            ("slug", "ALTER TABLE org_divisions ADD COLUMN slug TEXT DEFAULT NULL"),
+                        ];
+                        let od_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                            sqlx::query_as("PRAGMA table_info(org_divisions)")
+                                .fetch_all(&pool.0)
+                                .await
+                                .unwrap_or_default();
+                        let od_existing: std::collections::HashSet<String> =
+                            od_cols.into_iter().map(|c| c.1).collect();
+                        for (col, sql) in div_slug_alters {
+                            if od_existing.contains(*col) { continue; }
+                            match sqlx::raw_sql(sql).execute(&pool.0).await {
+                                Ok(_) => log::info!("Заход3 self-healing: added org_divisions.{col}"),
+                                Err(e) => log::warn!("Заход3 self-healing: org_divisions.{col}: {e}"),
+                            }
+                        }
+                        let dept_slug_alters: &[(&str, &str)] = &[
+                            ("slug", "ALTER TABLE org_departments ADD COLUMN slug TEXT DEFAULT NULL"),
+                        ];
+                        let dp_cols: Vec<(i64, String, String, i64, Option<String>, i64)> =
+                            sqlx::query_as("PRAGMA table_info(org_departments)")
+                                .fetch_all(&pool.0)
+                                .await
+                                .unwrap_or_default();
+                        let dp_existing: std::collections::HashSet<String> =
+                            dp_cols.into_iter().map(|c| c.1).collect();
+                        for (col, sql) in dept_slug_alters {
+                            if dp_existing.contains(*col) { continue; }
+                            match sqlx::raw_sql(sql).execute(&pool.0).await {
+                                Ok(_) => log::info!("Заход3 self-healing: added org_departments.{col}"),
+                                Err(e) => log::warn!("Заход3 self-healing: org_departments.{col}: {e}"),
+                            }
+                        }
+                        let disk_sync_healing = "\
+CREATE TABLE IF NOT EXISTS org_disk_sync ( \
+    entity_type TEXT NOT NULL, \
+    entity_id TEXT NOT NULL, \
+    file_rel TEXT NOT NULL, \
+    content_hash TEXT NOT NULL, \
+    written_at TEXT NOT NULL DEFAULT (datetime('now')), \
+    PRIMARY KEY (entity_type, entity_id, file_rel) \
+);";
+                        match sqlx::raw_sql(disk_sync_healing).execute(&pool.0).await {
+                            Ok(_) => log::info!("Заход3 self-healing: org_disk_sync ensured"),
+                            Err(e) => log::warn!("Заход3 self-healing: org_disk_sync: {e}"),
+                        }
+                        // Data-fix: transliterate existing names → ASCII slugs
+                        org_tree::datafix_slugs(&pool.0).await;
+
                         // ----- BL-P1-016: cleanup orphan post processes from previous crash -----
                         let orphans = commands::post_executor::cleanup_orphan_post_processes().await;
                         if orphans > 0 {
@@ -847,6 +913,9 @@ CREATE INDEX IF NOT EXISTS idx_agent_links_to ON org_agent_links(to_agent_id);";
             commands::agent_card::agent_links_get,
             commands::agent_card::agent_link_set,
             commands::agent_card::agent_link_remove,
+            // Заход 3 — Материализация оргструктуры на диск
+            org_tree::rebuild_org_tree,
+            org_tree::force_rebuild_org_tree,
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");
@@ -868,5 +937,160 @@ mod migration_tests {
                 m.version
             );
         }
+    }
+
+    /// BL-P1-016 regression: rebuild dispatcher_logs with FK=OFF so that
+    /// child tables (dispatcher_decisions, task_artifacts) don't trigger
+    /// SQLite error 787 on DROP TABLE.
+    /// Also verifies: parent_task_id self-FK is present after rebuild,
+    /// and PRAGMA foreign_key_check reports 0 violations.
+    #[tokio::test]
+    async fn rebuild_dispatcher_logs_fk_off_no_error_787() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+
+        // Enable FK enforcement (matches WritePool production config)
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await.unwrap();
+
+        // Original schema WITHOUT 'cancelled' — triggers rebuild
+        sqlx::raw_sql("\
+            CREATE TABLE dispatcher_logs ( \
+                id TEXT PRIMARY KEY, \
+                from_entity TEXT NOT NULL, \
+                to_entity TEXT NOT NULL, \
+                task_payload TEXT NOT NULL, \
+                status TEXT NOT NULL DEFAULT 'in_progress', \
+                execution_time_ms INTEGER, \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+                parent_task_id TEXT DEFAULT NULL REFERENCES dispatcher_logs(id), \
+                completed_at DATETIME DEFAULT NULL, \
+                attempts_count INTEGER NOT NULL DEFAULT 1, \
+                hop_kind TEXT DEFAULT NULL, \
+                routed_by_model TEXT DEFAULT NULL, \
+                refined_prompt TEXT DEFAULT NULL, \
+                outbox_path TEXT DEFAULT NULL, \
+                raw_brain_response TEXT DEFAULT NULL, \
+                CHECK (status IN ('in_progress','completed','failed')) \
+            )")
+            .execute(&pool).await.unwrap();
+
+        // Child tables with FK → dispatcher_logs(id)
+        sqlx::raw_sql("\
+            CREATE TABLE dispatcher_decisions ( \
+                id TEXT PRIMARY KEY, \
+                source_task_id TEXT NOT NULL REFERENCES dispatcher_logs(id), \
+                result_task_id TEXT REFERENCES dispatcher_logs(id), \
+                decision_kind TEXT NOT NULL, \
+                reasoning TEXT, \
+                model_used TEXT NOT NULL, \
+                routing_complexity TEXT, \
+                elapsed_ms INTEGER, \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP \
+            ); \
+            CREATE TABLE task_artifacts ( \
+                id TEXT PRIMARY KEY, \
+                task_id TEXT NOT NULL REFERENCES dispatcher_logs(id), \
+                rel_path TEXT NOT NULL, \
+                mime_type TEXT, \
+                size_bytes INTEGER, \
+                created_by TEXT NOT NULL, \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+                approved_at DATETIME, \
+                rejected_at DATETIME, \
+                reject_reason TEXT, \
+                UNIQUE(task_id, rel_path) \
+            )")
+            .execute(&pool).await.unwrap();
+
+        // Seed a parent + child row to exercise FK paths
+        sqlx::raw_sql("\
+            INSERT INTO dispatcher_logs(id, from_entity, to_entity, task_payload, status) \
+                VALUES ('t1','ceo','dispatcher','payload','in_progress'); \
+            INSERT INTO dispatcher_logs(id, from_entity, to_entity, task_payload, status, parent_task_id) \
+                VALUES ('t2','dispatcher','post-1','sub','in_progress','t1'); \
+            INSERT INTO dispatcher_decisions(id, source_task_id, decision_kind, model_used) \
+                VALUES ('d1','t1','forward','qwen3:14b'); \
+            INSERT INTO task_artifacts(id, task_id, rel_path, created_by) \
+                VALUES ('a1','t1','report.docx','post-1')")
+            .execute(&pool).await.unwrap();
+
+        // Confirm FK is ON before rebuild
+        let fk: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(fk.0, 1, "FK must be ON before rebuild");
+
+        // --- Execute the exact rebuild SQL from lib.rs ---
+        let rebuild = "\
+PRAGMA foreign_keys=OFF; \
+CREATE TABLE dispatcher_logs_new ( \
+    id TEXT PRIMARY KEY, \
+    from_entity TEXT NOT NULL, \
+    to_entity TEXT NOT NULL, \
+    task_payload TEXT NOT NULL, \
+    status TEXT NOT NULL DEFAULT 'in_progress', \
+    execution_time_ms INTEGER, \
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, \
+    parent_task_id TEXT DEFAULT NULL REFERENCES dispatcher_logs(id), \
+    completed_at DATETIME DEFAULT NULL, \
+    attempts_count INTEGER NOT NULL DEFAULT 1, \
+    hop_kind TEXT DEFAULT NULL, \
+    routed_by_model TEXT DEFAULT NULL, \
+    refined_prompt TEXT DEFAULT NULL, \
+    outbox_path TEXT DEFAULT NULL, \
+    raw_brain_response TEXT DEFAULT NULL, \
+    CHECK (status IN ('in_progress','completed','failed','cancelled')) \
+); \
+INSERT INTO dispatcher_logs_new \
+    SELECT id, from_entity, to_entity, task_payload, status, \
+           execution_time_ms, created_at, parent_task_id, completed_at, \
+           attempts_count, hop_kind, routed_by_model, refined_prompt, \
+           outbox_path, raw_brain_response \
+    FROM dispatcher_logs; \
+DROP TABLE dispatcher_logs; \
+ALTER TABLE dispatcher_logs_new RENAME TO dispatcher_logs; \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_status ON dispatcher_logs(status, created_at DESC); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_to ON dispatcher_logs(to_entity, created_at DESC); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_from ON dispatcher_logs(from_entity, created_at DESC); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_parent ON dispatcher_logs(parent_task_id); \
+CREATE INDEX IF NOT EXISTS idx_dispatcher_hop ON dispatcher_logs(hop_kind); \
+PRAGMA foreign_keys=ON;";
+        sqlx::raw_sql(rebuild).execute(&pool).await
+            .expect("rebuild must not fail with error 787");
+
+        // FK is back ON after rebuild
+        let fk: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(fk.0, 1, "FK must be restored ON after rebuild");
+
+        // 'cancelled' is now in CHECK
+        let schema: (String,) = sqlx::query_as(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='dispatcher_logs'"
+        ).fetch_one(&pool).await.unwrap();
+        assert!(schema.0.contains("'cancelled'"), "CHECK must include 'cancelled'");
+
+        // parent_task_id self-FK is present
+        assert!(
+            schema.0.contains("REFERENCES dispatcher_logs(id)") ||
+            schema.0.contains("REFERENCES \"dispatcher_logs\"(\"id\")"),
+            "parent_task_id must have self-FK REFERENCES dispatcher_logs(id)"
+        );
+
+        // Data survived the rebuild
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dispatcher_logs")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(count.0, 2, "both rows must survive rebuild");
+
+        // FK integrity check: 0 violations
+        let violations: Vec<(String, i64, String, String)> = sqlx::query_as(
+            "PRAGMA foreign_key_check"
+        ).fetch_all(&pool).await.unwrap();
+        assert!(violations.is_empty(), "FK violations after rebuild: {violations:?}");
+
+        // Child table rows still accessible
+        let dec_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM dispatcher_decisions")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(dec_count.0, 1);
+        let art_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM task_artifacts")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(art_count.0, 1);
     }
 }

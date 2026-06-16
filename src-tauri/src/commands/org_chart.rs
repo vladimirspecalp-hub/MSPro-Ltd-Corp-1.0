@@ -17,6 +17,7 @@ use sqlx::FromRow;
 use tauri::State;
 
 use crate::db::WritePool;
+use crate::org_tree::{self, OrgTreeState};
 
 // ---------------------------------------------------------------------------
 // DTO дерева (nested) — то, что отдаём фронту одним вызовом list_org_tree.
@@ -208,16 +209,21 @@ pub async fn create_division(
     name: String,
     description: Option<String>,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<String, String> {
     let name = validate_name(&name)?;
+    let slug = org_tree::to_disk_slug(&name);
+    let slug = org_tree::dedup_slug_in_table(&db.0, "org_divisions", &slug, None).await?;
     let id = format!("div-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO org_divisions (id, name, description) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO org_divisions (id, name, description, slug) VALUES (?, ?, ?, ?)")
         .bind(&id)
         .bind(&name)
         .bind(norm_desc(description))
+        .bind(&slug)
         .execute(&db.0)
         .await
         .map_err(|e| format!("create division: {e}"))?;
+    org_tree::try_sync_division(&db.0, &tree, &id).await;
     Ok(id)
 }
 
@@ -227,27 +233,82 @@ pub async fn rename_division(
     name: String,
     description: Option<String>,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<(), String> {
     let name = validate_name(&name)?;
-    let rows = sqlx::query("UPDATE org_divisions SET name = ?, description = ? WHERE id = ?")
-        .bind(&name)
-        .bind(norm_desc(description))
-        .bind(&id)
-        .execute(&db.0)
-        .await
-        .map_err(|e| format!("rename division: {e}"))?
-        .rows_affected();
+    let old_slug: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT slug FROM org_divisions WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&db.0)
+            .await
+            .ok()
+            .flatten();
+    let new_slug = org_tree::to_disk_slug(&name);
+    let new_slug =
+        org_tree::dedup_slug_in_table(&db.0, "org_divisions", &new_slug, Some(&id)).await?;
+    let rows = sqlx::query(
+        "UPDATE org_divisions SET name = ?, description = ?, slug = ? WHERE id = ?",
+    )
+    .bind(&name)
+    .bind(norm_desc(description))
+    .bind(&new_slug)
+    .bind(&id)
+    .execute(&db.0)
+    .await
+    .map_err(|e| format!("rename division: {e}"))?
+    .rows_affected();
     if rows == 0 {
         return Err("отделение не найдено".into());
     }
+    if let Some((Some(old),)) = old_slug {
+        if old != new_slug {
+            if let (Ok(old_path), Ok(new_path)) = (
+                org_tree::safe_org_path(&tree.root, &[&old]),
+                org_tree::safe_org_path(&tree.root, &[&new_slug]),
+            ) {
+                if old_path.exists() && !new_path.exists() {
+                    let _ = std::fs::rename(&old_path, &new_path);
+                }
+            }
+        }
+    }
+    org_tree::try_sync_division(&db.0, &tree, &id).await;
+    org_tree::sync_children_of_division(&db.0, &tree, &id).await;
     Ok(())
 }
 
-/// Удаление отделения = явный каскад в БД (отделы + их агенты). Диск не трогаем.
+/// Удаление отделения = явный каскад в БД + soft-delete папки на диске.
 #[tauri::command]
-pub async fn delete_division(id: String, db: State<'_, WritePool>) -> Result<(), String> {
+pub async fn delete_division(
+    id: String,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<(), String> {
+    let div_slug: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT slug FROM org_divisions WHERE id = ?")
+            .bind(&id)
+            .fetch_optional(&db.0)
+            .await
+            .ok()
+            .flatten();
+    let child_agents: Vec<(String,)> = sqlx::query_as(
+        "SELECT id FROM org_agents WHERE department_id IN \
+         (SELECT id FROM org_departments WHERE division_id = ?)",
+    )
+    .bind(&id)
+    .fetch_all(&db.0)
+    .await
+    .unwrap_or_default();
+    let child_depts: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM org_departments WHERE division_id = ?")
+            .bind(&id)
+            .fetch_all(&db.0)
+            .await
+            .unwrap_or_default();
+
     sqlx::query(
-        "DELETE FROM org_agents WHERE department_id IN (SELECT id FROM org_departments WHERE division_id = ?)",
+        "DELETE FROM org_agents WHERE department_id IN \
+         (SELECT id FROM org_departments WHERE division_id = ?)",
     )
     .bind(&id)
     .execute(&db.0)
@@ -263,6 +324,19 @@ pub async fn delete_division(id: String, db: State<'_, WritePool>) -> Result<(),
         .execute(&db.0)
         .await
         .map_err(|e| format!("delete division: {e}"))?;
+
+    if let Some((Some(slug),)) = div_slug {
+        if let Ok(path) = org_tree::safe_org_path(&tree.root, &[&slug]) {
+            org_tree::trash_folder(&tree.root, &path);
+        }
+    }
+    for (aid,) in &child_agents {
+        org_tree::clean_sync_records(&db.0, "agent", aid).await;
+    }
+    for (did,) in &child_depts {
+        org_tree::clean_sync_records(&db.0, "department", did).await;
+    }
+    org_tree::clean_sync_records(&db.0, "division", &id).await;
     Ok(())
 }
 
@@ -276,9 +350,9 @@ pub async fn create_department(
     name: String,
     description: Option<String>,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<String, String> {
     let name = validate_name(&name)?;
-    // Родитель должен существовать.
     let parent: Option<(String,)> = sqlx::query_as("SELECT id FROM org_divisions WHERE id = ?")
         .bind(&division_id)
         .fetch_optional(&db.0)
@@ -287,15 +361,22 @@ pub async fn create_department(
     if parent.is_none() {
         return Err("отделение-родитель не найдено".into());
     }
+    let slug = org_tree::to_disk_slug(&name);
+    let slug = org_tree::dedup_slug_in_table(&db.0, "org_departments", &slug, None).await?;
     let id = format!("dpt-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO org_departments (id, division_id, name, description) VALUES (?, ?, ?, ?)")
-        .bind(&id)
-        .bind(&division_id)
-        .bind(&name)
-        .bind(norm_desc(description))
-        .execute(&db.0)
-        .await
-        .map_err(|e| format!("create department: {e}"))?;
+    sqlx::query(
+        "INSERT INTO org_departments (id, division_id, name, description, slug) \
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(&division_id)
+    .bind(&name)
+    .bind(norm_desc(description))
+    .bind(&slug)
+    .execute(&db.0)
+    .await
+    .map_err(|e| format!("create department: {e}"))?;
+    org_tree::try_sync_department(&db.0, &tree, &id).await;
     Ok(id)
 }
 
@@ -305,28 +386,57 @@ pub async fn rename_department(
     name: String,
     description: Option<String>,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<(), String> {
     let name = validate_name(&name)?;
-    let rows = sqlx::query("UPDATE org_departments SET name = ?, description = ? WHERE id = ?")
-        .bind(&name)
-        .bind(norm_desc(description))
-        .bind(&id)
-        .execute(&db.0)
-        .await
-        .map_err(|e| format!("rename department: {e}"))?
-        .rows_affected();
+    let old_info: Option<(Option<String>, String)> =
+        sqlx::query_as("SELECT d.slug, div.slug FROM org_departments d JOIN org_divisions div ON d.division_id = div.id WHERE d.id = ?")
+            .bind(&id)
+            .fetch_optional(&db.0)
+            .await
+            .ok()
+            .flatten();
+    let new_slug = org_tree::to_disk_slug(&name);
+    let new_slug =
+        org_tree::dedup_slug_in_table(&db.0, "org_departments", &new_slug, Some(&id)).await?;
+    let rows = sqlx::query(
+        "UPDATE org_departments SET name = ?, description = ?, slug = ? WHERE id = ?",
+    )
+    .bind(&name)
+    .bind(norm_desc(description))
+    .bind(&new_slug)
+    .bind(&id)
+    .execute(&db.0)
+    .await
+    .map_err(|e| format!("rename department: {e}"))?
+    .rows_affected();
     if rows == 0 {
         return Err("отдел не найден".into());
     }
+    if let Some((Some(old_slug), div_slug)) = old_info {
+        if old_slug != new_slug {
+            if let (Ok(old_path), Ok(new_path)) = (
+                org_tree::safe_org_path(&tree.root, &[&div_slug, &old_slug]),
+                org_tree::safe_org_path(&tree.root, &[&div_slug, &new_slug]),
+            ) {
+                if old_path.exists() && !new_path.exists() {
+                    let _ = std::fs::rename(&old_path, &new_path);
+                }
+            }
+        }
+    }
+    org_tree::try_sync_department(&db.0, &tree, &id).await;
+    org_tree::sync_children_of_department(&db.0, &tree, &id).await;
     Ok(())
 }
 
-/// Переместить отдел в другое отделение (смена «прописки» в БД).
+/// Переместить отдел в другое отделение (смена «прописки» в БД + диск).
 #[tauri::command]
 pub async fn move_department(
     id: String,
     new_division_id: String,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<(), String> {
     let parent: Option<(String,)> = sqlx::query_as("SELECT id FROM org_divisions WHERE id = ?")
         .bind(&new_division_id)
@@ -336,6 +446,15 @@ pub async fn move_department(
     if parent.is_none() {
         return Err("целевое отделение не найдено".into());
     }
+    let old_info: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT d.slug, div.slug FROM org_departments d \
+         JOIN org_divisions div ON d.division_id = div.id WHERE d.id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&db.0)
+    .await
+    .ok()
+    .flatten();
     let rows = sqlx::query("UPDATE org_departments SET division_id = ? WHERE id = ?")
         .bind(&new_division_id)
         .bind(&id)
@@ -346,11 +465,53 @@ pub async fn move_department(
     if rows == 0 {
         return Err("отдел не найден".into());
     }
+    if let Some((Some(dept_slug), old_div_slug)) = old_info {
+        let new_div_slug: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT slug FROM org_divisions WHERE id = ?")
+                .bind(&new_division_id)
+                .fetch_optional(&db.0)
+                .await
+                .ok()
+                .flatten();
+        if let Some((Some(ndv),)) = new_div_slug {
+            if let (Ok(old_path), Ok(new_path)) = (
+                org_tree::safe_org_path(&tree.root, &[&old_div_slug, &dept_slug]),
+                org_tree::safe_org_path(&tree.root, &[&ndv, &dept_slug]),
+            ) {
+                let new_parent = new_path.parent().unwrap_or(&tree.root);
+                let _ = std::fs::create_dir_all(new_parent);
+                if old_path.exists() && !new_path.exists() {
+                    let _ = std::fs::rename(&old_path, &new_path);
+                }
+            }
+        }
+    }
+    org_tree::sync_children_of_department(&db.0, &tree, &id).await;
     Ok(())
 }
 
 #[tauri::command]
-pub async fn delete_department(id: String, db: State<'_, WritePool>) -> Result<(), String> {
+pub async fn delete_department(
+    id: String,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<(), String> {
+    let dept_info: Option<(Option<String>, String)> = sqlx::query_as(
+        "SELECT d.slug, div.slug FROM org_departments d \
+         JOIN org_divisions div ON d.division_id = div.id WHERE d.id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&db.0)
+    .await
+    .ok()
+    .flatten();
+    let child_agents: Vec<(String,)> =
+        sqlx::query_as("SELECT id FROM org_agents WHERE department_id = ?")
+            .bind(&id)
+            .fetch_all(&db.0)
+            .await
+            .unwrap_or_default();
+
     sqlx::query("DELETE FROM org_agents WHERE department_id = ?")
         .bind(&id)
         .execute(&db.0)
@@ -361,6 +522,16 @@ pub async fn delete_department(id: String, db: State<'_, WritePool>) -> Result<(
         .execute(&db.0)
         .await
         .map_err(|e| format!("delete department: {e}"))?;
+
+    if let Some((Some(dept_slug), div_slug)) = dept_info {
+        if let Ok(path) = org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug]) {
+            org_tree::trash_folder(&tree.root, &path);
+        }
+    }
+    for (aid,) in &child_agents {
+        org_tree::clean_sync_records(&db.0, "agent", aid).await;
+    }
+    org_tree::clean_sync_records(&db.0, "department", &id).await;
     Ok(())
 }
 
@@ -374,6 +545,7 @@ pub async fn create_agent(
     name: String,
     role_label: Option<String>,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<String, String> {
     let name = validate_name(&name)?;
     let role = validate_role(role_label.as_deref().unwrap_or("member"))?;
@@ -387,7 +559,6 @@ pub async fn create_agent(
     }
     let id = format!("agt-{}", uuid::Uuid::new_v4());
     let slug = make_slug(&name);
-    // folder_path = NULL: материализация папки на диске — Заход 3.
     sqlx::query(
         "INSERT INTO org_agents (id, department_id, name, slug, role_label) VALUES (?, ?, ?, ?, ?)",
     )
@@ -399,6 +570,7 @@ pub async fn create_agent(
     .execute(&db.0)
     .await
     .map_err(|e| format!("create agent: {e}"))?;
+    org_tree::try_sync_agent(&db.0, &tree, &id).await;
     Ok(id)
 }
 
@@ -407,8 +579,20 @@ pub async fn rename_agent(
     id: String,
     name: String,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<(), String> {
     let name = validate_name(&name)?;
+    let old_info: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT a.slug, d.slug, div.slug FROM org_agents a \
+         JOIN org_departments d ON a.department_id = d.id \
+         JOIN org_divisions div ON d.division_id = div.id \
+         WHERE a.id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&db.0)
+    .await
+    .ok()
+    .flatten();
     let slug = make_slug(&name);
     let rows = sqlx::query(
         "UPDATE org_agents SET name = ?, slug = ?, updated_at = datetime('now') WHERE id = ?",
@@ -423,16 +607,31 @@ pub async fn rename_agent(
     if rows == 0 {
         return Err("агент не найден".into());
     }
+    if let Some((old_slug, Some(dept_slug), Some(div_slug))) = old_info {
+        let new_disk_slug = org_tree::to_disk_slug(&slug);
+        let old_disk_slug = org_tree::to_disk_slug(&old_slug);
+        if old_disk_slug != new_disk_slug {
+            if let (Ok(old_path), Ok(new_path)) = (
+                org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug, &old_disk_slug]),
+                org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug, &new_disk_slug]),
+            ) {
+                if old_path.exists() && !new_path.exists() {
+                    let _ = std::fs::rename(&old_path, &new_path);
+                }
+            }
+        }
+    }
+    org_tree::try_sync_agent(&db.0, &tree, &id).await;
     Ok(())
 }
 
-/// Переместить агента в другой отдел = смена «прописки» в БД.
-/// Папку на диске НЕ двигаем (директива Владельца).
+/// Переместить агента в другой отдел = смена «прописки» в БД + перенос папки на диске.
 #[tauri::command]
 pub async fn move_agent(
     id: String,
     new_department_id: String,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<(), String> {
     let parent: Option<(String,)> = sqlx::query_as("SELECT id FROM org_departments WHERE id = ?")
         .bind(&new_department_id)
@@ -442,6 +641,17 @@ pub async fn move_agent(
     if parent.is_none() {
         return Err("целевой отдел не найден".into());
     }
+    let old_info: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT a.slug, d.slug, div.slug FROM org_agents a \
+         JOIN org_departments d ON a.department_id = d.id \
+         JOIN org_divisions div ON d.division_id = div.id \
+         WHERE a.id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&db.0)
+    .await
+    .ok()
+    .flatten();
     let rows = sqlx::query(
         "UPDATE org_agents SET department_id = ?, updated_at = datetime('now') WHERE id = ?",
     )
@@ -454,12 +664,61 @@ pub async fn move_agent(
     if rows == 0 {
         return Err("агент не найден".into());
     }
+    if let Some((agent_slug, Some(old_dept_slug), Some(old_div_slug))) = old_info {
+        let new_loc: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT d.slug, div.slug FROM org_departments d \
+             JOIN org_divisions div ON d.division_id = div.id \
+             WHERE d.id = ?",
+        )
+        .bind(&new_department_id)
+        .fetch_optional(&db.0)
+        .await
+        .ok()
+        .flatten();
+        if let Some((Some(new_dept_slug), Some(new_div_slug))) = new_loc {
+            let disk_slug = org_tree::to_disk_slug(&agent_slug);
+            if let (Ok(old_path), Ok(new_path)) = (
+                org_tree::safe_org_path(
+                    &tree.root,
+                    &[&old_div_slug, &old_dept_slug, &disk_slug],
+                ),
+                org_tree::safe_org_path(
+                    &tree.root,
+                    &[&new_div_slug, &new_dept_slug, &disk_slug],
+                ),
+            ) {
+                if let Some(new_parent) = new_path.parent() {
+                    let _ = std::fs::create_dir_all(new_parent);
+                }
+                if old_path.exists() && !new_path.exists() {
+                    let _ = std::fs::rename(&old_path, &new_path);
+                }
+            }
+        }
+    }
+    org_tree::try_sync_agent(&db.0, &tree, &id).await;
     Ok(())
 }
 
-/// Удаление агента = строка БД + связи (org_agent_links). Папку НЕ трогаем.
+/// Удаление агента = строка БД + связи + soft-delete папки на диске.
 #[tauri::command]
-pub async fn delete_agent(id: String, db: State<'_, WritePool>) -> Result<(), String> {
+pub async fn delete_agent(
+    id: String,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<(), String> {
+    let agent_loc: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT a.slug, d.slug, div.slug FROM org_agents a \
+         JOIN org_departments d ON a.department_id = d.id \
+         JOIN org_divisions div ON d.division_id = div.id \
+         WHERE a.id = ?",
+    )
+    .bind(&id)
+    .fetch_optional(&db.0)
+    .await
+    .ok()
+    .flatten();
+
     sqlx::query("DELETE FROM org_agent_links WHERE from_agent_id = ? OR to_agent_id = ?")
         .bind(&id)
         .bind(&id)
@@ -475,6 +734,16 @@ pub async fn delete_agent(id: String, db: State<'_, WritePool>) -> Result<(), St
     if rows == 0 {
         return Err("агент не найден".into());
     }
+
+    if let Some((agent_slug, Some(dept_slug), Some(div_slug))) = agent_loc {
+        let disk_slug = org_tree::to_disk_slug(&agent_slug);
+        if let Ok(path) =
+            org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug, &disk_slug])
+        {
+            org_tree::trash_folder(&tree.root, &path);
+        }
+    }
+    org_tree::clean_sync_records(&db.0, "agent", &id).await;
     Ok(())
 }
 

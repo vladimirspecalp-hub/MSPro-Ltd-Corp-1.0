@@ -9,6 +9,7 @@ use sqlx::FromRow;
 use tauri::State;
 
 use crate::db::WritePool;
+use crate::org_tree::{self, OrgTreeState};
 
 const BRAIN_MODES: &[&str] = &["disabled", "claude_cli", "qwen_http", "external_gateway"];
 
@@ -98,6 +99,7 @@ pub async fn agent_card_save(
     agent_id: String,
     input: AgentCardInput,
     db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
 ) -> Result<AgentCard, String> {
     validate_brain_mode(&input.brain_mode)?;
 
@@ -130,6 +132,7 @@ pub async fn agent_card_save(
     if rows == 0 {
         return Err("agent not found".to_string());
     }
+    org_tree::try_sync_agent(&db.0, &tree, &agent_id).await;
     fetch_card(&db, &agent_id).await
 }
 
