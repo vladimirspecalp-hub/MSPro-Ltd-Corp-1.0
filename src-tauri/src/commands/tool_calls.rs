@@ -187,6 +187,74 @@ tool_call с валидным JSON. Формат и схемы:
       },
       "required": ["topic"]
     }
+  },
+  {
+    "name": "create_org_division",
+    "description": "Создать новое Отделение в оргструктуре (org_agents). Верхний уровень иерархии: Отделение → Отдел → Агент. Используй для построения новой оргсхемы по запросу Владельца.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {"type": "string", "description": "Название отделения (русский или латиница, 1-200 символов). Slug генерируется автоматически."},
+        "description": {"type": "string", "description": "Опционально: описание функции отделения"}
+      },
+      "required": ["name"]
+    }
+  },
+  {
+    "name": "create_org_department",
+    "description": "Создать новый Отдел внутри Отделения. Средний уровень иерархии: Отделение → Отдел → Агент.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "division_id": {"type": "string", "description": "ID отделения-родителя (из ОРГСХЕМЫ в контексте выше)"},
+        "name": {"type": "string", "description": "Название отдела (1-200 символов)"},
+        "description": {"type": "string", "description": "Опционально: описание функции отдела"}
+      },
+      "required": ["division_id", "name"]
+    }
+  },
+  {
+    "name": "create_org_agent",
+    "description": "Создать нового Агента (пост/должность) внутри Отдела. Нижний уровень иерархии.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "department_id": {"type": "string", "description": "ID отдела-родителя (из ОРГСХЕМЫ в контексте выше)"},
+        "name": {"type": "string", "description": "Название агента/поста (1-200 символов). Slug генерируется автоматически из имени."},
+        "role_label": {"type": "string", "enum": ["head", "member"], "description": "Роль: head (глава отдела) или member (рядовой). По умолчанию member."}
+      },
+      "required": ["department_id", "name"]
+    }
+  },
+  {
+    "name": "set_agent_card",
+    "description": "Настроить карточку агента: роль/инструкция, мозг, ЦКП, MCP-серверы. Вызывай ПОСЛЕ create_org_agent для заполнения карточки.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "agent_id": {"type": "string", "description": "ID агента (из ОРГСХЕМЫ в контексте выше)"},
+        "role_prompt_md": {"type": "string", "description": "Системный промпт агента в markdown — что он делает, как работает, правила"},
+        "brain_mode": {"type": "string", "enum": ["disabled", "claude_cli", "qwen_http", "external_gateway"], "description": "Режим мозга: disabled (без AI), claude_cli (Claude), qwen_http (Qwen локально), external_gateway (внешний шлюз)"},
+        "brain_model": {"type": "string", "description": "Опционально: конкретная модель (claude-sonnet-4-6, qwen3-30b-a3b и т.п.)"},
+        "ckp_text": {"type": "string", "description": "ЦКП (Ценный Конечный Продукт) агента — что конкретно он производит"},
+        "mcp_servers_json": {"type": "string", "description": "Опционально: JSON-массив MCP серверов агента, например '[{\"name\":\"context7\"}]'"}
+      },
+      "required": ["agent_id"]
+    }
+  },
+  {
+    "name": "link_agents",
+    "description": "Установить связь между двумя агентами: конвейерная цепочка (next), контролёр/ОТК (verifier), источник данных (input_from).",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "from_agent_id": {"type": "string", "description": "ID агента-источника"},
+        "to_agent_id": {"type": "string", "description": "ID агента-приёмника"},
+        "link_type": {"type": "string", "enum": ["next", "verifier", "input_from"], "description": "Тип связи: next (следующий по конвейеру), verifier (контролёр/ОТК проверяет работу), input_from (получает входные данные от)"},
+        "description": {"type": "string", "description": "Опционально: пояснение к связи"}
+      },
+      "required": ["from_agent_id", "to_agent_id", "link_type"]
+    }
   }
 ]
 </tools>
@@ -268,6 +336,26 @@ H4. **Если ошибся посылая старый dispatch_task** — си
     замапит на send_to_dispatcher с warning. Но лучше сразу новый формат.
 H5. **Posts не общаются друг с другом напрямую** — когда посты-агенты
     появятся (Phase 11B), у них тоже будет только send_to_dispatcher.
+
+### Правила строительства Оргсхемы (org_agents — ОСНОВНАЯ структура)
+
+ORG1. **org_agents — ЕДИНАЯ структура будущего.** Для создания новых отделений,
+   отделов и агентов используй ТОЛЬКО `create_org_division` / `create_org_department`
+   / `create_org_agent`. `create_post` — это legacy для старых постов.
+ORG2. **Только по запросу Владельца.** НЕ строй оргсхему по своему усмотрению —
+   только когда Владелец явно попросил «создай отделение/отдел/агента».
+ORG3. **slug генерируется автоматически** из имени (латинизация кириллицы).
+   НЕ передавай slug параметром — система создаст сама.
+ORG4. **set_agent_card** — настройка агента ПОСЛЕ создания: роль/инструкция
+   (role_prompt_md), мозг (brain_mode), ЦКП (ckp_text). Минимум — brain_mode.
+ORG5. **link_agents** — связи между агентами: `next` (следующий по конвейеру),
+   `verifier` (контролёр/ОТК проверяет работу), `input_from` (источник данных).
+ORG6. **Последовательность:** сначала `create_org_division` → затем
+   `create_org_department(division_id)` → затем `create_org_agent(department_id)`
+   → затем `set_agent_card(agent_id)` → затем `link_agents`. Нельзя создать
+   отдел без отделения, агента без отдела.
+ORG7. **ID из контекста.** Бери id отделений/отделов/агентов из блока «ОРГСХЕМА»
+   в контексте выше. После создания нового элемента — его id вернётся в ⚡ плашке.
 
 ### Правила работы со знаниями постов (read_post_knowledge / target_post)
 
@@ -536,6 +624,12 @@ async fn execute(call: ToolCall, db: &WritePool, app: &AppHandle) -> (ToolExecut
         "patch_vault_file" => (execute_patch_vault_file(call.effective_args(), db, app).await, None),
         "delete_vault_file" => (execute_delete_vault_file(call.effective_args(), db, app).await, None),
         "read_post_knowledge" => (execute_read_post_knowledge(call.effective_args(), db, app).await, None),
+        // Org-building tools (Гендир-строитель)
+        "create_org_division" => (execute_create_org_division(call.effective_args(), db, app).await, None),
+        "create_org_department" => (execute_create_org_department(call.effective_args(), db, app).await, None),
+        "create_org_agent" => (execute_create_org_agent(call.effective_args(), db, app).await, None),
+        "set_agent_card" => (execute_set_agent_card(call.effective_args(), db, app).await, None),
+        "link_agents" => (execute_link_agents(call.effective_args(), db, app).await, None),
         unknown => (
             ToolExecution {
                 ui_message: format!("⚠️ Гендир запросил неизвестный инструмент: `{unknown}`"),
@@ -1612,6 +1706,239 @@ fn execute_read_hmt_topic(args: &Value, app: &AppHandle) -> ToolExecution {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Org-building tools (Гендир-строитель — Виток 1)
+// ---------------------------------------------------------------------------
+
+use crate::commands::{org_chart, agent_card};
+
+fn get_org_tree_state(app: &AppHandle) -> Result<tauri::State<'_, crate::org_tree::OrgTreeState>, ToolExecution> {
+    app.try_state::<crate::org_tree::OrgTreeState>()
+        .ok_or_else(|| tool_err("OrgTreeState не инициализирован"))
+}
+
+async fn execute_create_org_division(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let name = match args.get("name").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_org_division: name обязателен"),
+    };
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tree = match get_org_tree_state(app) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    match org_chart::create_division_inner(name.clone(), description, db, &tree).await {
+        Ok(id) => {
+            let _ = app.emit("org-tree-changed", serde_json::json!({"kind": "division_created", "id": &id}));
+            ToolExecution {
+                ui_message: format!("⚡ Создано отделение «{name}» (id: `{id}`)"),
+                success: true,
+            }
+        }
+        Err(e) => tool_err(&format!("create_org_division: {e}")),
+    }
+}
+
+async fn execute_create_org_department(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let division_id = match args.get("division_id").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_org_department: division_id обязателен"),
+    };
+    let name = match args.get("name").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_org_department: name обязателен"),
+    };
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tree = match get_org_tree_state(app) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    match org_chart::create_department_inner(division_id, name.clone(), description, db, &tree).await {
+        Ok(id) => {
+            let _ = app.emit("org-tree-changed", serde_json::json!({"kind": "department_created", "id": &id}));
+            ToolExecution {
+                ui_message: format!("⚡ Создан отдел «{name}» (id: `{id}`)"),
+                success: true,
+            }
+        }
+        Err(e) => tool_err(&format!("create_org_department: {e}")),
+    }
+}
+
+async fn execute_create_org_agent(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let department_id = match args.get("department_id").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_org_agent: department_id обязателен"),
+    };
+    let name = match args.get("name").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("create_org_agent: name обязателен"),
+    };
+    let role_label = args
+        .get("role_label")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tree = match get_org_tree_state(app) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    match org_chart::create_agent_inner(department_id, name.clone(), role_label.clone(), db, &tree).await {
+        Ok(id) => {
+            let role = role_label.as_deref().unwrap_or("member");
+            let _ = app.emit("org-tree-changed", serde_json::json!({"kind": "agent_created", "id": &id}));
+            ToolExecution {
+                ui_message: format!("⚡ Создан агент «{name}» [{role}] (id: `{id}`)"),
+                success: true,
+            }
+        }
+        Err(e) => tool_err(&format!("create_org_agent: {e}")),
+    }
+}
+
+async fn execute_set_agent_card(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let agent_id = match args.get("agent_id").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("set_agent_card: agent_id обязателен"),
+    };
+
+    let current = match agent_card::fetch_card(db, &agent_id).await {
+        Ok(c) => c,
+        Err(e) => return tool_err(&format!("set_agent_card: {e}")),
+    };
+
+    let input = agent_card::AgentCardInput {
+        role_prompt_md: args
+            .get("role_prompt_md")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or(current.role_prompt_md),
+        brain_mode: args
+            .get("brain_mode")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or(current.brain_mode),
+        brain_model: args
+            .get("brain_model")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or(current.brain_model),
+        brain_endpoint: current.brain_endpoint,
+        mcp_servers_json: args
+            .get("mcp_servers_json")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .unwrap_or(current.mcp_servers_json),
+        ckp_text: args
+            .get("ckp_text")
+            .and_then(Value::as_str)
+            .map(String::from)
+            .or(current.ckp_text),
+        checklist_json: current.checklist_json,
+        memory_md: current.memory_md,
+    };
+
+    let tree = match get_org_tree_state(app) {
+        Ok(t) => t,
+        Err(e) => return e,
+    };
+
+    match agent_card::agent_card_save_inner(&agent_id, input, db, &tree).await {
+        Ok(card) => {
+            let _ = app.emit("org-tree-changed", serde_json::json!({"kind": "agent_card_updated", "id": &agent_id}));
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Карточка агента «{}» (`{}`) обновлена: brain={}{}",
+                    card.name,
+                    card.slug,
+                    card.brain_mode,
+                    card.ckp_text.as_ref().map(|_| ", ЦКП задан").unwrap_or(""),
+                ),
+                success: true,
+            }
+        }
+        Err(e) => tool_err(&format!("set_agent_card: {e}")),
+    }
+}
+
+async fn execute_link_agents(
+    args: &Value,
+    db: &WritePool,
+    app: &AppHandle,
+) -> ToolExecution {
+    let from_id = match args.get("from_agent_id").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("link_agents: from_agent_id обязателен"),
+    };
+    let to_id = match args.get("to_agent_id").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("link_agents: to_agent_id обязателен"),
+    };
+    let link_type = match args.get("link_type").and_then(Value::as_str).map(str::trim) {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return tool_err("link_agents: link_type обязателен (next/verifier/input_from)"),
+    };
+    let description = args
+        .get("description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    match agent_card::agent_link_set_inner(&from_id, &to_id, &link_type, description, db).await {
+        Ok(link) => {
+            let _ = app.emit("org-tree-changed", serde_json::json!({"kind": "link_created", "id": &link.id}));
+            let type_ru = match link_type.as_str() {
+                "next" => "→ следующий",
+                "verifier" => "✓ контролёр",
+                "input_from" => "← источник данных",
+                _ => &link_type,
+            };
+            ToolExecution {
+                ui_message: format!(
+                    "⚡ Связь [{type_ru}]: `{from_id}` → `{to_id}` (link_id: `{}`)",
+                    link.id
+                ),
+                success: true,
+            }
+        }
+        Err(e) => tool_err(&format!("link_agents: {e}")),
+    }
+}
+
 fn short_vault_path(p: &std::path::Path) -> String {
     let s = p.display().to_string();
     let idx = s.to_lowercase().rfind("vault");
@@ -1857,5 +2184,326 @@ mod tests {
         assert!(cleaned.contains("Делаю реорганизацию."));
         assert!(cleaned.contains("Готово."));
         assert!(!cleaned.contains("tool_call"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Org-building tools — parsing tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_create_org_division() {
+        let raw = r#"<tool_call>{"name":"create_org_division","arguments":{"name":"Техническое отделение","description":"Производство"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "create_org_division");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("name").and_then(Value::as_str), Some("Техническое отделение"));
+        assert_eq!(args.get("description").and_then(Value::as_str), Some("Производство"));
+    }
+
+    #[test]
+    fn parse_create_org_department() {
+        let raw = r#"<tool_call>{"name":"create_org_department","arguments":{"division_id":"div-123","name":"Отдел продаж"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "create_org_department");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("division_id").and_then(Value::as_str), Some("div-123"));
+        assert_eq!(args.get("name").and_then(Value::as_str), Some("Отдел продаж"));
+    }
+
+    #[test]
+    fn parse_create_org_agent() {
+        let raw = r#"<tool_call>{"name":"create_org_agent","arguments":{"department_id":"dpt-456","name":"Юрист","role_label":"head"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "create_org_agent");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("department_id").and_then(Value::as_str), Some("dpt-456"));
+        assert_eq!(args.get("name").and_then(Value::as_str), Some("Юрист"));
+        assert_eq!(args.get("role_label").and_then(Value::as_str), Some("head"));
+    }
+
+    #[test]
+    fn parse_create_org_agent_minimal() {
+        let raw = r#"<tool_call>{"name":"create_org_agent","arguments":{"department_id":"dpt-1","name":"Стажёр"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "create_org_agent");
+        let args = calls[0].effective_args();
+        assert!(args.get("role_label").is_none());
+    }
+
+    #[test]
+    fn parse_set_agent_card() {
+        let raw = r##"<tool_call>{"name":"set_agent_card","arguments":{"agent_id":"agt-789","brain_mode":"claude_cli","ckp_text":"Готовый договор","role_prompt_md":"# Юрист\nПроверяй документы."}}</tool_call>"##;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "set_agent_card");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("agent_id").and_then(Value::as_str), Some("agt-789"));
+        assert_eq!(args.get("brain_mode").and_then(Value::as_str), Some("claude_cli"));
+        assert_eq!(args.get("ckp_text").and_then(Value::as_str), Some("Готовый договор"));
+    }
+
+    #[test]
+    fn parse_link_agents() {
+        let raw = r#"<tool_call>{"name":"link_agents","arguments":{"from_agent_id":"agt-1","to_agent_id":"agt-2","link_type":"next","description":"конвейер"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "link_agents");
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("from_agent_id").and_then(Value::as_str), Some("agt-1"));
+        assert_eq!(args.get("to_agent_id").and_then(Value::as_str), Some("agt-2"));
+        assert_eq!(args.get("link_type").and_then(Value::as_str), Some("next"));
+        assert_eq!(args.get("description").and_then(Value::as_str), Some("конвейер"));
+    }
+
+    #[test]
+    fn parse_link_agents_verifier() {
+        let raw = r#"<tool_call>{"name":"link_agents","arguments":{"from_agent_id":"agt-a","to_agent_id":"agt-b","link_type":"verifier"}}</tool_call>"#;
+        let (_, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 1);
+        let args = calls[0].effective_args();
+        assert_eq!(args.get("link_type").and_then(Value::as_str), Some("verifier"));
+        assert!(args.get("description").is_none());
+    }
+
+    #[test]
+    fn parse_org_building_chain() {
+        let raw = r#"Строю оргсхему.
+<tool_call>{"name":"create_org_division","arguments":{"name":"Техническое"}}</tool_call>
+<tool_call>{"name":"create_org_department","arguments":{"division_id":"div-1","name":"Разработка"}}</tool_call>
+<tool_call>{"name":"create_org_agent","arguments":{"department_id":"dpt-1","name":"Программист","role_label":"head"}}</tool_call>
+Готово."#;
+        let (cleaned, calls) = parse_tool_calls(raw);
+        assert_eq!(calls.len(), 3);
+        assert_eq!(calls[0].name, "create_org_division");
+        assert_eq!(calls[1].name, "create_org_department");
+        assert_eq!(calls[2].name, "create_org_agent");
+        assert!(cleaned.contains("Строю оргсхему."));
+        assert!(!cleaned.contains("tool_call"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Org-building tools — execution tests (in-memory DB)
+    // -----------------------------------------------------------------------
+
+    async fn setup_org_db() -> crate::db::WritePool {
+        use sqlx::SqlitePool;
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE org_divisions (
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+                slug TEXT, sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE org_departments (
+                id TEXT PRIMARY KEY, division_id TEXT NOT NULL, name TEXT NOT NULL,
+                description TEXT, slug TEXT, sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE org_agents (
+                id TEXT PRIMARY KEY, department_id TEXT NOT NULL, name TEXT NOT NULL,
+                slug TEXT NOT NULL, role_label TEXT NOT NULL DEFAULT 'member',
+                status TEXT NOT NULL DEFAULT 'active', folder_path TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT NULL,
+                role_prompt_md TEXT DEFAULT NULL,
+                brain_mode TEXT NOT NULL DEFAULT 'disabled',
+                brain_model TEXT DEFAULT NULL, brain_endpoint TEXT DEFAULT NULL,
+                mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+                ckp_text TEXT DEFAULT NULL, checklist_json TEXT NOT NULL DEFAULT '[]',
+                memory_md TEXT DEFAULT NULL
+            );
+            CREATE TABLE org_agent_links (
+                id TEXT PRIMARY KEY,
+                from_agent_id TEXT NOT NULL, to_agent_id TEXT NOT NULL,
+                link_type TEXT NOT NULL CHECK (link_type IN ('next','verifier','input_from')),
+                description TEXT, sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(from_agent_id, to_agent_id, link_type),
+                CHECK(from_agent_id != to_agent_id)
+            );
+            CREATE TABLE org_disk_sync (
+                entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+                file_rel TEXT NOT NULL, content_hash TEXT NOT NULL,
+                written_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (entity_type, entity_id, file_rel)
+            );
+            CREATE TABLE posts (
+                id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE,
+                title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+                department_id TEXT NOT NULL DEFAULT 'd1',
+                central_product TEXT NOT NULL DEFAULT '',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        crate::db::WritePool(pool)
+    }
+
+    #[tokio::test]
+    async fn execute_create_org_division_happy_path() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_div"));
+        let result = org_chart::create_division_inner(
+            "Техническое отделение".to_string(), Some("Производство".to_string()), &db, &tree,
+        ).await;
+        assert!(result.is_ok());
+        let id = result.unwrap();
+        assert!(id.starts_with("div-"));
+        let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_divisions")
+            .fetch_one(&db.0).await.unwrap();
+        assert_eq!(count.0, 1);
+    }
+
+    #[tokio::test]
+    async fn execute_create_org_division_empty_name_rejected() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_div2"));
+        let result = org_chart::create_division_inner(
+            "  ".to_string(), None, &db, &tree,
+        ).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_create_org_department_happy_path() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_dept"));
+        let div_id = org_chart::create_division_inner(
+            "Продажи".to_string(), None, &db, &tree,
+        ).await.unwrap();
+        let dept_id = org_chart::create_department_inner(
+            div_id, "Полевые продажи".to_string(), None, &db, &tree,
+        ).await;
+        assert!(dept_id.is_ok());
+        assert!(dept_id.unwrap().starts_with("dpt-"));
+    }
+
+    #[tokio::test]
+    async fn execute_create_org_department_bad_parent() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_dept2"));
+        let result = org_chart::create_department_inner(
+            "div-nonexistent".to_string(), "Отдел".to_string(), None, &db, &tree,
+        ).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("не найдено"));
+    }
+
+    #[tokio::test]
+    async fn execute_create_org_agent_happy_path() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_agt"));
+        let div_id = org_chart::create_division_inner("Д".to_string(), None, &db, &tree).await.unwrap();
+        let dept_id = org_chart::create_department_inner(div_id, "О".to_string(), None, &db, &tree).await.unwrap();
+        let agt_id = org_chart::create_agent_inner(
+            dept_id, "Юрист".to_string(), Some("head".to_string()), &db, &tree,
+        ).await;
+        assert!(agt_id.is_ok());
+        assert!(agt_id.unwrap().starts_with("agt-"));
+    }
+
+    #[tokio::test]
+    async fn execute_create_org_agent_bad_role() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_agt2"));
+        let div_id = org_chart::create_division_inner("Д".to_string(), None, &db, &tree).await.unwrap();
+        let dept_id = org_chart::create_department_inner(div_id, "О".to_string(), None, &db, &tree).await.unwrap();
+        let result = org_chart::create_agent_inner(
+            dept_id, "Бот".to_string(), Some("boss".to_string()), &db, &tree,
+        ).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn execute_set_agent_card_happy_path() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_card"));
+        let div_id = org_chart::create_division_inner("Д".to_string(), None, &db, &tree).await.unwrap();
+        let dept_id = org_chart::create_department_inner(div_id, "О".to_string(), None, &db, &tree).await.unwrap();
+        let agt_id = org_chart::create_agent_inner(dept_id, "Бот".to_string(), None, &db, &tree).await.unwrap();
+
+        let input = agent_card::AgentCardInput {
+            role_prompt_md: Some("# Бот\nДелай задачи.".to_string()),
+            brain_mode: "claude_cli".to_string(),
+            brain_model: None,
+            brain_endpoint: None,
+            mcp_servers_json: "[]".to_string(),
+            ckp_text: Some("Готовый результат".to_string()),
+            checklist_json: "[]".to_string(),
+            memory_md: None,
+        };
+        let result = agent_card::agent_card_save_inner(&agt_id, input, &db, &tree).await;
+        assert!(result.is_ok());
+        let card = result.unwrap();
+        assert_eq!(card.brain_mode, "claude_cli");
+        assert_eq!(card.ckp_text.as_deref(), Some("Готовый результат"));
+    }
+
+    #[tokio::test]
+    async fn execute_set_agent_card_bad_brain_mode() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_card2"));
+        let div_id = org_chart::create_division_inner("Д".to_string(), None, &db, &tree).await.unwrap();
+        let dept_id = org_chart::create_department_inner(div_id, "О".to_string(), None, &db, &tree).await.unwrap();
+        let agt_id = org_chart::create_agent_inner(dept_id, "Б".to_string(), None, &db, &tree).await.unwrap();
+
+        let input = agent_card::AgentCardInput {
+            role_prompt_md: None,
+            brain_mode: "gpt4".to_string(),
+            brain_model: None,
+            brain_endpoint: None,
+            mcp_servers_json: "[]".to_string(),
+            ckp_text: None,
+            checklist_json: "[]".to_string(),
+            memory_md: None,
+        };
+        let result = agent_card::agent_card_save_inner(&agt_id, input, &db, &tree).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid"));
+    }
+
+    #[tokio::test]
+    async fn execute_link_agents_happy_path() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_link"));
+        let div_id = org_chart::create_division_inner("Д".to_string(), None, &db, &tree).await.unwrap();
+        let dept_id = org_chart::create_department_inner(div_id, "О".to_string(), None, &db, &tree).await.unwrap();
+        let a1 = org_chart::create_agent_inner(dept_id.clone(), "А1".to_string(), None, &db, &tree).await.unwrap();
+        let a2 = org_chart::create_agent_inner(dept_id, "А2".to_string(), None, &db, &tree).await.unwrap();
+
+        let link = agent_card::agent_link_set_inner(&a1, &a2, "next", Some("конвейер".to_string()), &db).await;
+        assert!(link.is_ok());
+        let link = link.unwrap();
+        assert_eq!(link.link_type, "next");
+        assert!(link.id.starts_with("link-"));
+    }
+
+    #[tokio::test]
+    async fn execute_link_agents_bad_link_type() {
+        let db = setup_org_db().await;
+        let tree = crate::org_tree::OrgTreeState::new(std::env::temp_dir().join("org_test_link2"));
+        let div_id = org_chart::create_division_inner("Д".to_string(), None, &db, &tree).await.unwrap();
+        let dept_id = org_chart::create_department_inner(div_id, "О".to_string(), None, &db, &tree).await.unwrap();
+        let a1 = org_chart::create_agent_inner(dept_id.clone(), "А1".to_string(), None, &db, &tree).await.unwrap();
+        let a2 = org_chart::create_agent_inner(dept_id, "А2".to_string(), None, &db, &tree).await.unwrap();
+
+        let result = agent_card::agent_link_set_inner(&a1, &a2, "boss_of", None, &db).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("invalid"));
+    }
+
+    #[tokio::test]
+    async fn execute_link_agents_nonexistent_agent() {
+        let db = setup_org_db().await;
+        let result = agent_card::agent_link_set_inner("agt-fake1", "agt-fake2", "next", None, &db).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not found"));
     }
 }

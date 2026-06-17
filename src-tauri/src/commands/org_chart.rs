@@ -177,12 +177,11 @@ pub async fn list_org_tree(db: State<'_, WritePool>) -> Result<OrgTree, String> 
 // Divisions (Отделения)
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub async fn create_division(
+pub async fn create_division_inner(
     name: String,
     description: Option<String>,
-    db: State<'_, WritePool>,
-    tree: State<'_, OrgTreeState>,
+    db: &WritePool,
+    tree: &OrgTreeState,
 ) -> Result<String, String> {
     let name = validate_name(&name)?;
     let slug = org_tree::to_disk_slug(&name);
@@ -196,8 +195,18 @@ pub async fn create_division(
         .execute(&db.0)
         .await
         .map_err(|e| format!("create division: {e}"))?;
-    org_tree::try_sync_division(&db.0, &tree, &id).await;
+    org_tree::try_sync_division(&db.0, tree, &id).await;
     Ok(id)
+}
+
+#[tauri::command]
+pub async fn create_division(
+    name: String,
+    description: Option<String>,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<String, String> {
+    create_division_inner(name, description, &db, &tree).await
 }
 
 #[tauri::command]
@@ -317,13 +326,12 @@ pub async fn delete_division(
 // Departments (Отделы)
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub async fn create_department(
+pub async fn create_department_inner(
     division_id: String,
     name: String,
     description: Option<String>,
-    db: State<'_, WritePool>,
-    tree: State<'_, OrgTreeState>,
+    db: &WritePool,
+    tree: &OrgTreeState,
 ) -> Result<String, String> {
     let name = validate_name(&name)?;
     let parent: Option<(String,)> = sqlx::query_as("SELECT id FROM org_divisions WHERE id = ?")
@@ -349,8 +357,19 @@ pub async fn create_department(
     .execute(&db.0)
     .await
     .map_err(|e| format!("create department: {e}"))?;
-    org_tree::try_sync_department(&db.0, &tree, &id).await;
+    org_tree::try_sync_department(&db.0, tree, &id).await;
     Ok(id)
+}
+
+#[tauri::command]
+pub async fn create_department(
+    division_id: String,
+    name: String,
+    description: Option<String>,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<String, String> {
+    create_department_inner(division_id, name, description, &db, &tree).await
 }
 
 #[tauri::command]
@@ -512,13 +531,12 @@ pub async fn delete_department(
 // Agents (Агенты) — Заход 1: только метаданные в БД, без папки на диске.
 // ---------------------------------------------------------------------------
 
-#[tauri::command]
-pub async fn create_agent(
+pub async fn create_agent_inner(
     department_id: String,
     name: String,
     role_label: Option<String>,
-    db: State<'_, WritePool>,
-    tree: State<'_, OrgTreeState>,
+    db: &WritePool,
+    tree: &OrgTreeState,
 ) -> Result<String, String> {
     let name = validate_name(&name)?;
     let role = validate_role(role_label.as_deref().unwrap_or("member"))?;
@@ -544,8 +562,19 @@ pub async fn create_agent(
     .execute(&db.0)
     .await
     .map_err(|e| format!("create agent: {e}"))?;
-    org_tree::try_sync_agent(&db.0, &tree, &id).await;
+    org_tree::try_sync_agent(&db.0, tree, &id).await;
     Ok(id)
+}
+
+#[tauri::command]
+pub async fn create_agent(
+    department_id: String,
+    name: String,
+    role_label: Option<String>,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<String, String> {
+    create_agent_inner(department_id, name, role_label, &db, &tree).await
 }
 
 #[tauri::command]

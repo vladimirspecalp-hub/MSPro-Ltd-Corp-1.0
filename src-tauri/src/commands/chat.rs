@@ -100,8 +100,12 @@ pub async fn build_ceo_system_prompt(
     let mut sb = String::new();
     sb.push_str(
         "# Ты — Гендир (CEO) AI-компании MSPro-Ltd Corp.\n\n\
-         Компания построена по канону Хаббарда (8 отделений). \
-         Текущая оргструктура:\n\n",
+         ⚠️ ОСНОВНАЯ структура компании — ОРГСХЕМА (org_agents), см. раздел «ОРГСХЕМА» ниже. \
+         Для НОВЫХ отделений/отделов/агентов используй org-building инструменты \
+         (create_org_division / create_org_department / create_org_agent / set_agent_card / link_agents), \
+         а НЕ create_post. Раздел departments/posts ниже — LEGACY (исторические посты), \
+         в нём ничего нового не создавай.\n\n\
+         Текущая оргструктура (LEGACY — departments/posts):\n\n",
     );
     for d in &depts {
         sb.push_str(&format!("## {} — {}\n", d.dept_number, d.name));
@@ -125,6 +129,99 @@ pub async fn build_ceo_system_prompt(
             sb.push('\n');
         }
     }
+    // --- ОРГСХЕМА (org_agents) — основная структура компании ---
+    {
+        let org_divs: Vec<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, name, description FROM org_divisions ORDER BY sort_order ASC, name ASC",
+        )
+        .fetch_all(&db.0)
+        .await
+        .unwrap_or_default();
+
+        let org_depts: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, division_id, name, description FROM org_departments ORDER BY sort_order ASC, name ASC",
+        )
+        .fetch_all(&db.0)
+        .await
+        .unwrap_or_default();
+
+        let org_agents: Vec<(String, String, String, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, department_id, name, slug, role_label, brain_mode, ckp_text \
+             FROM org_agents WHERE status = 'active' ORDER BY sort_order ASC, name ASC",
+        )
+        .fetch_all(&db.0)
+        .await
+        .unwrap_or_default();
+
+        let org_links: Vec<(String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT from_agent_id, to_agent_id, link_type, description FROM org_agent_links ORDER BY link_type",
+        )
+        .fetch_all(&db.0)
+        .await
+        .unwrap_or_default();
+
+        if !org_divs.is_empty() || !org_agents.is_empty() {
+            sb.push_str("\n## ОРГСХЕМА (org_agents — основная структура компании)\n\n");
+            sb.push_str("Для создания/настройки используй `create_org_division`, `create_org_department`, `create_org_agent`, `set_agent_card`, `link_agents`.\n\n");
+
+            for (div_id, div_name, div_desc) in &org_divs {
+                sb.push_str(&format!("### 📂 {div_name} (id: `{div_id}`)\n"));
+                if let Some(d) = div_desc {
+                    if !d.is_empty() {
+                        sb.push_str(&format!("_{d}_\n"));
+                    }
+                }
+                let div_depts: Vec<_> = org_depts.iter().filter(|d| d.1 == *div_id).collect();
+                if div_depts.is_empty() {
+                    sb.push_str("Отделов пока нет.\n\n");
+                } else {
+                    for (dept_id, _, dept_name, dept_desc) in &div_depts {
+                        sb.push_str(&format!("  **{dept_name}** (id: `{dept_id}`)\n"));
+                        if let Some(d) = dept_desc {
+                            if !d.is_empty() {
+                                sb.push_str(&format!("  _{d}_\n"));
+                            }
+                        }
+                        let dept_agents: Vec<_> = org_agents.iter().filter(|a| a.1 == **dept_id).collect();
+                        if dept_agents.is_empty() {
+                            sb.push_str("  Агентов пока нет.\n");
+                        } else {
+                            for (aid, _, aname, aslug, arole, abrain, ackp) in &dept_agents {
+                                let ckp_short = ackp.as_ref().map(|c| {
+                                    let trimmed: String = c.chars().take(80).collect();
+                                    if c.chars().count() > 80 { format!("{trimmed}…") } else { trimmed }
+                                }).unwrap_or_else(|| "—".to_string());
+                                sb.push_str(&format!(
+                                    "  - **{aname}** (slug: `{aslug}`, id: `{aid}`) [{arole}] brain={abrain} ЦКП: {ckp_short}\n"
+                                ));
+                            }
+                        }
+                    }
+                    sb.push('\n');
+                }
+            }
+
+            if !org_links.is_empty() {
+                sb.push_str("**Связи между агентами:**\n");
+                for (from_id, to_id, lt, ldesc) in &org_links {
+                    let arrow = match lt.as_str() {
+                        "next" => "→",
+                        "verifier" => "✓→",
+                        "input_from" => "←",
+                        _ => "?→",
+                    };
+                    let desc_str = ldesc.as_ref().map(|d| format!(" ({d})")).unwrap_or_default();
+                    sb.push_str(&format!("- `{from_id}` {arrow} `{to_id}` [{lt}]{desc_str}\n"));
+                }
+                sb.push('\n');
+            }
+        }
+    }
+
+    // --- Legacy: Текущие Посты (posts) ---
+    // Посты (posts) — устаревшая структура, сохраняется для обратной совместимости.
+    // Для новой структуры используй org_agents (ОРГСХЕМА выше).
+
     // --- Step 6: HMT-engine — текущие Состояния постов ---
     let conditions = crate::commands::hmt::list_recent_conditions_inner(&db.0).await?;
     if !conditions.is_empty() {

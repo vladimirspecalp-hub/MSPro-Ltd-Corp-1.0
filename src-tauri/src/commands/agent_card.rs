@@ -72,7 +72,7 @@ pub struct AgentLink {
 // Card CRUD
 // ---------------------------------------------------------------------------
 
-async fn fetch_card(db: &WritePool, agent_id: &str) -> Result<AgentCard, String> {
+pub async fn fetch_card(db: &WritePool, agent_id: &str) -> Result<AgentCard, String> {
     sqlx::query_as::<_, AgentCard>(
         "SELECT id, name, slug, role_label, status,
                 role_prompt_md, brain_mode, brain_model, brain_endpoint,
@@ -94,12 +94,11 @@ pub async fn agent_card_get(
     fetch_card(&db, &agent_id).await
 }
 
-#[tauri::command]
-pub async fn agent_card_save(
-    agent_id: String,
+pub async fn agent_card_save_inner(
+    agent_id: &str,
     input: AgentCardInput,
-    db: State<'_, WritePool>,
-    tree: State<'_, OrgTreeState>,
+    db: &WritePool,
+    tree: &OrgTreeState,
 ) -> Result<AgentCard, String> {
     validate_brain_mode(&input.brain_mode)?;
 
@@ -123,7 +122,7 @@ pub async fn agent_card_save(
     .bind(&input.ckp_text)
     .bind(&input.checklist_json)
     .bind(&input.memory_md)
-    .bind(&agent_id)
+    .bind(agent_id)
     .execute(&db.0)
     .await
     .map_err(|e| format!("agent_card_save: {e}"))?
@@ -132,8 +131,18 @@ pub async fn agent_card_save(
     if rows == 0 {
         return Err("agent not found".to_string());
     }
-    org_tree::try_sync_agent(&db.0, &tree, &agent_id).await;
-    fetch_card(&db, &agent_id).await
+    org_tree::try_sync_agent(&db.0, tree, agent_id).await;
+    fetch_card(db, agent_id).await
+}
+
+#[tauri::command]
+pub async fn agent_card_save(
+    agent_id: String,
+    input: AgentCardInput,
+    db: State<'_, WritePool>,
+    tree: State<'_, OrgTreeState>,
+) -> Result<AgentCard, String> {
+    agent_card_save_inner(&agent_id, input, &db, &tree).await
 }
 
 // ---------------------------------------------------------------------------
@@ -160,15 +169,14 @@ pub async fn agent_links_get(
     .map_err(|e| format!("agent_links_get: {e}"))
 }
 
-#[tauri::command]
-pub async fn agent_link_set(
-    from_agent_id: String,
-    to_agent_id: String,
-    link_type: String,
+pub async fn agent_link_set_inner(
+    from_agent_id: &str,
+    to_agent_id: &str,
+    link_type: &str,
     description: Option<String>,
-    db: State<'_, WritePool>,
+    db: &WritePool,
 ) -> Result<AgentLink, String> {
-    if !LINK_TYPES.contains(&link_type.as_str()) {
+    if !LINK_TYPES.contains(&link_type) {
         return Err(format!(
             "link_type '{link_type}' invalid (allowed: next, verifier, input_from)"
         ));
@@ -179,7 +187,7 @@ pub async fn agent_link_set(
 
     let from_exists: Option<(String,)> =
         sqlx::query_as("SELECT id FROM org_agents WHERE id = ?")
-            .bind(&from_agent_id)
+            .bind(from_agent_id)
             .fetch_optional(&db.0)
             .await
             .map_err(|e| format!("check from_agent: {e}"))?;
@@ -189,7 +197,7 @@ pub async fn agent_link_set(
 
     let to_exists: Option<(String,)> =
         sqlx::query_as("SELECT id FROM org_agents WHERE id = ?")
-            .bind(&to_agent_id)
+            .bind(to_agent_id)
             .fetch_optional(&db.0)
             .await
             .map_err(|e| format!("check to_agent: {e}"))?;
@@ -210,8 +218,8 @@ pub async fn agent_link_set(
             SELECT 1 FROM chain WHERE agent_id = ? AND depth > 0
             LIMIT 1",
         )
-        .bind(&to_agent_id)
-        .bind(&from_agent_id)
+        .bind(to_agent_id)
+        .bind(from_agent_id)
         .fetch_optional(&db.0)
         .await
         .map_err(|e| format!("cycle check: {e}"))?;
@@ -231,9 +239,9 @@ pub async fn agent_link_set(
             description = excluded.description",
     )
     .bind(&id)
-    .bind(&from_agent_id)
-    .bind(&to_agent_id)
-    .bind(&link_type)
+    .bind(from_agent_id)
+    .bind(to_agent_id)
+    .bind(link_type)
     .bind(&description)
     .execute(&db.0)
     .await
@@ -244,12 +252,23 @@ pub async fn agent_link_set(
          FROM org_agent_links
          WHERE from_agent_id = ? AND to_agent_id = ? AND link_type = ?",
     )
-    .bind(&from_agent_id)
-    .bind(&to_agent_id)
-    .bind(&link_type)
+    .bind(from_agent_id)
+    .bind(to_agent_id)
+    .bind(link_type)
     .fetch_one(&db.0)
     .await
     .map_err(|e| format!("fetch link: {e}"))
+}
+
+#[tauri::command]
+pub async fn agent_link_set(
+    from_agent_id: String,
+    to_agent_id: String,
+    link_type: String,
+    description: Option<String>,
+    db: State<'_, WritePool>,
+) -> Result<AgentLink, String> {
+    agent_link_set_inner(&from_agent_id, &to_agent_id, &link_type, description, &db).await
 }
 
 #[tauri::command]
