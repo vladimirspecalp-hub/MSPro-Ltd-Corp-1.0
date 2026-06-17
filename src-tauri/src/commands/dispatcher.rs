@@ -369,7 +369,7 @@ pub struct DispatchExtras {
 /// даёт более понятные сообщения об ошибке). Извлечено из `dispatch_task_inner_ex`
 /// (Day 5) для unit-тестирования; поведение идентично прежнему инлайну.
 pub(crate) fn validate_hop_kind(hk: &str) -> Result<(), String> {
-    const ALLOWED: &[&str] = &["raw_request", "refined", "subtask", "retry", "clarification"];
+    const ALLOWED: &[&str] = &["raw_request", "refined", "subtask", "retry", "clarification", "direct", "verify", "next_step"];
     if ALLOWED.contains(&hk) {
         Ok(())
     } else {
@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn validate_hop_kind_accepts_allowed() {
-        for hk in ["raw_request", "refined", "subtask", "retry", "clarification"] {
+        for hk in ["raw_request", "refined", "subtask", "retry", "clarification", "direct", "verify", "next_step"] {
             assert!(validate_hop_kind(hk).is_ok(), "{hk} должен быть разрешён");
         }
     }

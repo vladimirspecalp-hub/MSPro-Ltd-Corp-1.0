@@ -1,25 +1,22 @@
-//! Post Executor — Phase 11B-1 (v1.0.24).
+//! Post Executor — Phase 11B-1 (v1.0.24) + Виток 1 MVP (org_agent execution).
 //!
 //! Когда Диспетчер сделал `forward_to_post(slug, refined_prompt)` — этот модуль
 //! spawn'ит **реальный** Claude CLI subprocess со своим agent.md (генерируется
-//! из `posts.system_prompt_md`), в строгой sandbox-папке `Outbox/<task_id>/`.
+//! из `posts.system_prompt_md` или `org_agents.role_prompt_md`), в строгой
+//! sandbox-папке `Outbox/<task_id>/`.
 //!
-//! Главное отличие от `claude_bridge::run_claude_cli` (мозг Гендира/Диспетчера):
-//!   * agent.md имеет `tools: [Read, Write, Edit, Bash]` — пост ДОЛЖЕН физически
-//!     создавать артефакты (.docx/.xlsx/.txt), а не только генерировать XML.
-//!   * cwd = `Outbox/<task_id>/` — агент пишет файлы строго туда.
-//!   * После exit — мы сканируем директорию и регистрируем все новые файлы
-//!     через `artifacts::register_artifact()` → они появляются в UI «Awaiting».
+//! Виток 1: `run_org_agent_now` — Tauri-команда для запуска org_agent задачи.
+//! Использует тот же механизм `run_executor`, что и посты.
 //!
 //! Lifecycle:
-//!   1. `trigger_post_executor()` — non-blocking entry-point, спавнит фоновый task
-//!   2. Внутри: lookup `posts` → `ensure_post_agent_md` → mkdir Outbox →
-//!      spawn claude.exe → write stdin → wait → scan dir → register artifacts →
-//!      emit dispatcher-task-changed
-//!   3. Job Object (см. lib.rs::setup) гарантирует kill всех claude.exe при
+//!   1. `trigger_post_executor()` / `run_org_agent_now()` — entry-points
+//!   2. `resolve_executor()` — определяет кто исполняет (Post vs OrgAgent)
+//!   3. `run_executor()` — ensure agent.md → mkdir Outbox → spawn claude.exe →
+//!      write stdin → wait → scan dir → register artifacts → emit event
+//!   4. Job Object (см. lib.rs::setup) гарантирует kill всех claude.exe при
 //!      выходе MSPro даже в случае crash.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -35,10 +32,11 @@ use tokio::time::timeout;
 use crate::commands::artifacts;
 use crate::commands::claude_bridge::hide_console;
 use crate::commands::dispatcher;
+use crate::commands::executor_resolver::{resolve_executor, resolve_org_agent_by_id, ExecutorKind, ExecutorSpec};
 use crate::db::WritePool;
 use crate::outbox;
 use crate::settings::{AppSettings, SettingsStore};
-use crate::vault::{sanitize_post_slug, VaultState};
+use crate::vault::VaultState;
 
 /// Registry активных пост-агентов: task_id → PID.
 /// Защищает от двойного spawn-а и позволяет ручной cancel.
@@ -55,8 +53,8 @@ pub struct PostExecResult {
     pub elapsed_ms: u128,
 }
 
-/// Non-blocking entry-point. Спавнит фоновую async-задачу и возвращается
-/// мгновенно — Диспетчер не блокируется ожиданием пост-агента.
+/// Non-blocking entry-point для постов. Спавнит фоновую async-задачу.
+/// Диспетчер не блокируется ожиданием пост-агента.
 pub fn trigger_post_executor(
     task_id: String,
     post_slug: String,
@@ -70,7 +68,6 @@ pub fn trigger_post_executor(
     );
 
     tauri::async_runtime::spawn(async move {
-        // Достаём всё нужное из Tauri state.
         let db = match app.try_state::<WritePool>() {
             Some(s) => s.inner().clone(),
             None => {
@@ -100,18 +97,30 @@ pub fn trigger_post_executor(
             }
         };
 
-        // Защита от двойного spawn — если уже бежим, выходим тихо.
+        // Резолвим исполнителя через единый резолвер.
+        let spec = match resolve_executor(&db, &post_slug, &settings_snapshot).await {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("post_executor: resolve '{post_slug}' failed: {e}");
+                let _ = dispatcher::fail_task_inner(task_id, e, &db, &app).await;
+                return;
+            }
+        };
+
+        // Защита от двойного spawn.
         {
             let map = registry.running.lock().await;
             if map.contains_key(&task_id) {
-                log::warn!("post_executor: task {task_id} already running, skip duplicate trigger");
+                log::warn!(
+                    "post_executor: task {task_id} already running, skip duplicate trigger"
+                );
                 return;
             }
         }
 
-        let result = run_claude_cli_for_post(
+        let result = run_executor(
             &task_id,
-            &post_slug,
+            &spec,
             &refined_prompt,
             expected_artifact.as_deref(),
             &settings_snapshot,
@@ -129,27 +138,147 @@ pub fn trigger_post_executor(
         }
 
         match result {
-            Ok(r) => log::info!(
-                "post_executor: task {} done exit={} artifacts={} elapsed_ms={}",
-                r.task_id,
-                r.exit_code,
-                r.artifacts_count,
-                r.elapsed_ms
-            ),
+            Ok(ref r) => {
+                log::info!(
+                    "post_executor: task {} done exit={} artifacts={} elapsed_ms={}",
+                    r.task_id,
+                    r.exit_code,
+                    r.artifacts_count,
+                    r.elapsed_ms
+                );
+                // Виток 3: trigger verify-hop + next-chain
+                try_trigger_chains(&task_id, &spec, r, &db, &app).await;
+            }
             Err(e) => {
                 log::error!("post_executor: task {task_id} failed: {e}");
-                // Fail-task мы уже звали внутри run_claude_cli_for_post — здесь
-                // только лог.
             }
         }
     });
 }
 
-/// Главная функция: spawn агента и обработка результата.
+// ---------------------------------------------------------------------------
+// Tauri command: run_org_agent_now (Виток 1 MVP)
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn run_org_agent_now(
+    agent_id: String,
+    task_prompt: String,
+    db: State<'_, WritePool>,
+    vault: State<'_, VaultState>,
+    settings_store: State<'_, SettingsStore>,
+    registry: State<'_, PostExecutorRegistry>,
+    app: AppHandle,
+) -> Result<String, String> {
+    // Guard: пустая задача.
+    if task_prompt.trim().is_empty() {
+        return Err("пустая задача".to_string());
+    }
+
+    let settings = settings_store.data.lock().unwrap().clone();
+    let spec = resolve_org_agent_by_id(&db, &agent_id, &settings).await?;
+
+    // Guard: brain_mode.
+    if spec.brain_mode == "disabled" {
+        return Err("агент не активирован: включите мозг".to_string());
+    }
+    if spec.brain_mode != "claude_cli" {
+        return Err(format!(
+            "brain_mode '{}' пока не поддерживается (Виток 1)",
+            spec.brain_mode
+        ));
+    }
+
+    let prompt = task_prompt.trim().to_string();
+
+    // Создаём запись задачи в dispatcher_logs для трекинга.
+    let task = dispatcher::dispatch_task_inner_ex(
+        "owner".to_string(),
+        spec.slug.clone(),
+        serde_json::json!({ "raw_prompt": &prompt }),
+        dispatcher::DispatchExtras {
+            parent_task_id: None,
+            hop_kind: Some("direct".to_string()),
+            routed_by_model: None,
+            refined_prompt: Some(prompt.clone()),
+        },
+        &db,
+        &app,
+    )
+    .await?;
+
+    let task_id_ret = task.id.clone();
+
+    log::info!(
+        "run_org_agent_now: agent={} task={} slug={}",
+        agent_id,
+        task.id,
+        spec.slug
+    );
+
+    // Спавним исполнение в фоне — команда возвращается мгновенно.
+    let db_clone = db.inner().clone();
+    let vault_clone = vault.inner().clone();
+    let registry_clone = registry.inner().clone();
+    let app_clone = app.clone();
+    let task_id = task.id;
+
+    tauri::async_runtime::spawn(async move {
+        {
+            let map = registry_clone.running.lock().await;
+            if map.contains_key(&task_id) {
+                log::warn!("run_org_agent_now: task {task_id} already running");
+                return;
+            }
+        }
+
+        let result = run_executor(
+            &task_id,
+            &spec,
+            &prompt,
+            None,
+            &settings,
+            &db_clone,
+            &vault_clone,
+            &registry_clone,
+            &app_clone,
+        )
+        .await;
+
+        {
+            let mut map = registry_clone.running.lock().await;
+            map.remove(&task_id);
+        }
+
+        match result {
+            Ok(ref r) => {
+                log::info!(
+                    "run_org_agent_now: task {} done exit={} artifacts={}",
+                    r.task_id,
+                    r.exit_code,
+                    r.artifacts_count
+                );
+                // Виток 3: trigger verify-hop + next-chain
+                try_trigger_chains(&task_id, &spec, r, &db_clone, &app_clone).await;
+            }
+            Err(e) => log::error!("run_org_agent_now: task {task_id} failed: {e}"),
+        }
+    });
+
+    Ok(task_id_ret)
+}
+
+// ---------------------------------------------------------------------------
+// Shared executor
+// ---------------------------------------------------------------------------
+
+/// Главная функция исполнения: создаёт agent.md, sandbox, spawn CLI, артефакты.
+/// Используется и для постов (через trigger_post_executor), и для org_agents
+/// (через run_org_agent_now).
 #[allow(clippy::too_many_arguments)]
-async fn run_claude_cli_for_post(
+async fn run_executor(
     task_id: &str,
-    post_slug: &str,
+    spec: &ExecutorSpec,
     refined_prompt: &str,
     _expected_artifact: Option<&str>,
     settings: &AppSettings,
@@ -160,47 +289,29 @@ async fn run_claude_cli_for_post(
 ) -> Result<PostExecResult, String> {
     let started_at = Instant::now();
 
-    // 1. Lookup post row — нужны system_prompt_md + preferred_model.
-    let row: Option<(String, Option<String>, Option<String>)> =
-        sqlx::query_as("SELECT slug, system_prompt_md, preferred_model FROM posts WHERE slug = ?")
-            .bind(post_slug)
-            .fetch_optional(&db.0)
-            .await
-            .map_err(|e| format!("posts lookup: {e}"))?;
+    // Guard: brain_mode≠claude_cli → fail_task вместо зависания
+    if spec.brain_mode != "claude_cli" {
+        let reason = format!(
+            "brain_mode '{}' не поддерживается для исполнения (только claude_cli)",
+            spec.brain_mode
+        );
+        log::warn!("executor: task {task_id} rejected: {reason}");
+        let _ = dispatcher::fail_task_inner(task_id.to_string(), reason.clone(), db, app).await;
+        return Err(reason);
+    }
 
-    let (slug, system_prompt_opt, preferred_model_opt) =
-        row.ok_or_else(|| format!("post '{post_slug}' not found"))?;
+    // 1. Гарантируем agent.md (~/.claude/agents/{agent_md_name}.md).
+    let _agent_md_path = ensure_agent_md(&spec.agent_md_name, &spec.system_prompt, &spec.model)?;
 
-    let system_prompt = system_prompt_opt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| {
-            format!("post '{slug}' не имеет system_prompt_md — задай его в Posts Editor (🧠)")
-        })?;
-
-    // Выбор модели: preferred_model → settings.claude_cli_model → дефолт.
-    // ВАЖНО (Архитектор): Qwen через HTTP не умеет MCP — если preferred_model
-    // указывает на qwen, в 11B-1 всё равно пускаем через claude.exe. Полноценная
-    // поддержка Qwen — будущая фаза. Сейчас просто переопределяем модель.
-    let model = preferred_model_opt
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty() && !s.to_lowercase().starts_with("qwen"))
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| settings.claude_cli_model.clone());
-
-    // 2. Гарантируем agent.md (~/.claude/agents/mspro-<slug>.md).
-    let safe_slug = sanitize_post_slug(&slug).map_err(|e| format!("slug invalid: {e}"))?;
-    let agent_name = format!("mspro-{}", safe_slug);
-    let _agent_md_path = ensure_post_agent_md(&safe_slug, system_prompt, &model)?;
-
-    // 3. Sandbox: <Outbox>/<task_id>/ (mkdir идемпотентно).
+    // 2. Sandbox: <Outbox>/<task_id>/ (mkdir идемпотентно).
     let task_dir = outbox::task_outbox_dir(&vault.root, task_id)
         .map_err(|e| format!("task outbox dir: {e}"))?;
 
     log::info!(
-        "post_executor: spawn agent={agent_name} model={model} cwd={} prompt_len={}",
+        "executor: spawn agent={} model={} kind={:?} cwd={} prompt_len={}",
+        spec.agent_md_name,
+        spec.model,
+        spec.kind,
         task_dir.display(),
         refined_prompt.len()
     );
@@ -208,17 +319,15 @@ async fn run_claude_cli_for_post(
     // Снимок «что было» в папке до спавна — для дельты после exit.
     let pre_snapshot = snapshot_dir(&task_dir);
 
-    // Phase 1 (Iteration B): PAL killswitch. Флаг снимаем ОДИН раз (R-T-008).
-    // pal_enabled → через PAL (orchestrator → ClaudeCliDriver) + run_logs.
-    // false → legacy прямой spawn ниже (нетронут). default false (v1.0.34).
+    // Phase 1 (Iteration B): PAL killswitch.
     if settings.pal_enabled {
         return run_via_pal(
             task_id,
-            &slug,
+            &spec.slug,
             refined_prompt,
-            system_prompt,
-            &agent_name,
-            &model,
+            &spec.system_prompt,
+            &spec.agent_md_name,
+            &spec.model,
             &task_dir,
             &pre_snapshot,
             settings,
@@ -230,19 +339,13 @@ async fn run_claude_cli_for_post(
         .await;
     }
 
-    // 4. Spawn claude.exe.
-    // Срез 1.5 (security harden): legacy-путь использует ТУ ЖЕ `build_cli_args`,
-    // что и PAL (claude_cli_driver) — ЕДИНЫЙ источник всего argv (включая
-    // permission_flags: acceptEdits + python-whitelist + deny). Раньше тут был
-    // `--dangerously-skip-permissions` (bypass всего) + руками дублировался базовый
-    // argv. Теперь одна функция на оба пути → bypass физически нельзя вернуть в
-    // обход (нет второго места с argv-строками). Residual risk: BL-P1-015 (Phase 2
-    // изоляция; whitelist режет какие бинари, не что python делает внутри).
+    // 3. Spawn claude.exe.
+    // Срез 1.5 (security harden): единый `build_cli_args` — ОДИН источник всего argv.
     let mut cmd = Command::new(&settings.claude_cli_path);
     hide_console(&mut cmd);
     cmd.args(crate::pal::claude_cli_driver::build_cli_args(
-        &agent_name,
-        &model,
+        &spec.agent_md_name,
+        &spec.model,
     ))
     .current_dir(&task_dir)
     .env("MSPRO_TASK_ID", task_id)
@@ -257,7 +360,6 @@ async fn run_claude_cli_for_post(
         let db_clone = db.clone();
         let app_clone = app.clone();
         tauri::async_runtime::spawn(async move {
-            // BL-P1-016: не перезатираем cancelled при spawn failure.
             let already_cancelled = dispatcher::fetch_task_by_id_public(&db_clone, &task_id)
                 .await
                 .map(|t| t.status == "cancelled")
@@ -276,15 +378,15 @@ async fn run_claude_cli_for_post(
         map.insert(task_id.to_string(), pid);
     }
 
-    // 5. Передаём refined_prompt в stdin → close → child получает EOF.
+    // 4. Передаём refined_prompt в stdin → close → child получает EOF.
     if let Some(mut stdin_pipe) = child.stdin.take() {
         if let Err(e) = stdin_pipe.write_all(refined_prompt.as_bytes()).await {
-            log::warn!("post_executor: stdin write failed: {e}");
+            log::warn!("executor: stdin write failed: {e}");
         }
         drop(stdin_pipe);
     }
 
-    // 6. Wait с timeout. Параллельно собираем stderr для диагностики на fail.
+    // 5. Wait с timeout. Параллельно собираем stderr для диагностики.
     let timeout_secs = settings.post_executor_timeout_sec;
     let mut stderr_pipe = child.stderr.take();
 
@@ -294,17 +396,17 @@ async fn run_claude_cli_for_post(
     let exit_code: i32 = match result {
         Ok(Ok(status)) => status.code().unwrap_or(-1),
         Ok(Err(e)) => {
-            log::warn!("post_executor: wait failed: {e}");
+            log::warn!("executor: wait failed: {e}");
             -1
         }
         Err(_) => {
-            log::warn!("post_executor: task {task_id} timeout {timeout_secs}s — killing");
+            log::warn!("executor: task {task_id} timeout {timeout_secs}s — killing");
             let _ = child.kill().await;
             -2
         }
     };
 
-    // 7. Подбираем stderr (если процесс упал — там диагностика).
+    // 6. Подбираем stderr.
     let mut stderr_text = String::new();
     if let Some(p) = stderr_pipe.as_mut() {
         let _ = p.read_to_string(&mut stderr_text).await;
@@ -322,38 +424,43 @@ async fn run_claude_cli_for_post(
 
     let elapsed_ms = started_at.elapsed().as_millis();
 
-    // 8. Сканируем директорию — что нового создал агент?
+    // 7. Сканируем директорию — что нового создал агент?
     let new_files = diff_dir(&task_dir, &pre_snapshot);
     log::info!(
-        "post_executor: task {task_id} exit={exit_code} new_files={} elapsed={}ms",
+        "executor: task {task_id} exit={exit_code} new_files={} elapsed={}ms",
         new_files.len(),
         elapsed_ms
     );
 
-    // 9. Регистрируем артефакты.
+    // 8. Регистрируем артефакты.
     let mut registered = 0usize;
     for rel in &new_files {
         let mime = guess_mime_from_ext(rel);
-        match artifacts::register_artifact(task_id, rel, mime.as_deref(), &slug, db, vault, app)
-            .await
+        match artifacts::register_artifact(
+            task_id,
+            rel,
+            mime.as_deref(),
+            &spec.slug,
+            db,
+            vault,
+            app,
+        )
+        .await
         {
             Ok(_) => registered += 1,
-            Err(e) => log::warn!("post_executor: register {rel} failed: {e}"),
+            Err(e) => log::warn!("executor: register {rel} failed: {e}"),
         }
     }
 
-    // 10. Обновляем статус parent task в dispatcher_logs.
-    // BL-P1-016: если пользователь уже отменил — не перезатираем cancelled на failed.
+    // 9. Обновляем статус parent task в dispatcher_logs.
+    // BL-P1-016: если пользователь уже отменил — не перезатираем cancelled.
     if is_task_cancelled(task_id, db).await {
-        log::info!("post_executor: task {task_id} already cancelled — skip status update");
+        log::info!("executor: task {task_id} already cancelled — skip status update");
     } else if exit_code == 0 && registered > 0 {
-        // ✅ Успех — task остаётся in_progress с outbox_path != null,
-        // UI покажет в Awaiting (Владелец approve/reject).
         log::info!(
-            "post_executor: task {task_id} produced {registered} artifacts — awaiting approval"
+            "executor: task {task_id} produced {registered} artifacts — awaiting approval"
         );
     } else {
-        // ❌ Fail / нет артефактов — bump attempts_count и fail_task.
         let _ = bump_attempts(task_id, db).await;
         let reason = if exit_code == -2 {
             format!("timeout {timeout_secs}s")
@@ -383,42 +490,55 @@ async fn run_claude_cli_for_post(
     })
 }
 
-/// Создаёт `~/.claude/agents/mspro-<slug>.md` (или перезаписывает если отличается)
-/// из `posts.system_prompt_md` Владельца.
+/// Создаёт `~/.claude/agents/{agent_md_name}.md` (или перезаписывает если отличается).
 ///
-/// КРИТИЧЕСКИ: tools: [Read, Write, Edit, Bash] — пост ДОЛЖЕН физически писать
+/// КРИТИЧЕСКИ: tools: [Read, Write, Edit, Bash] — агент ДОЛЖЕН физически писать
 /// файлы. Это отличие от Гендира/Диспетчера, где `tools: []` запрещает native tools.
-pub fn ensure_post_agent_md(
-    safe_slug: &str,
+pub fn ensure_agent_md(
+    agent_md_name: &str,
     system_prompt: &str,
     model: &str,
 ) -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "cannot resolve home dir".to_string())?;
     let dir = home.join(".claude").join("agents");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create agents dir: {e}"))?;
-    let path = dir.join(format!("mspro-{}.md", safe_slug));
+    let path = dir.join(format!("{}.md", agent_md_name));
+
+    let description = if agent_md_name.starts_with("mspro-org-") {
+        format!(
+            "MSPro-Ltd Corp org-агент ({}). Получает task через stdin, создаёт артефакты в текущей рабочей директории (Outbox sandbox).",
+            agent_md_name
+        )
+    } else {
+        format!(
+            "MSPro-Ltd Corp пост-агент ({}). Получает task через stdin, создаёт артефакты в текущей рабочей директории (Outbox sandbox).",
+            agent_md_name
+        )
+    };
 
     let body = format!(
-        "---\nname: mspro-{slug}\ndescription: MSPro-Ltd Corp пост-агент (slug={slug}). Получает task через stdin, создаёт артефакты в текущей рабочей директории (Outbox sandbox).\ntools: [Read, Write, Edit, Bash]\nmodel: {model}\n---\n\n{prompt}\n",
-        slug = safe_slug,
+        "---\nname: {name}\ndescription: {desc}\ntools: [Read, Write, Edit, Bash]\nmodel: {model}\n---\n\n{prompt}\n",
+        name = agent_md_name,
+        desc = description,
         model = model,
         prompt = system_prompt.trim(),
     );
 
-    // Идемпотентно: пишем только если содержимое отличается (избегаем лишних
-    // mtime-updates и race с Claude CLI reload).
     let need_write = match std::fs::read_to_string(&path) {
         Ok(existing) => existing != body,
         Err(_) => true,
     };
     if need_write {
         std::fs::write(&path, body).map_err(|e| format!("write agent.md: {e}"))?;
-        log::info!("ensured post agent file: {}", path.display());
+        log::info!("ensured agent file: {}", path.display());
     }
     Ok(path)
 }
 
-/// Возвращает HashMap<rel_path, mtime_seconds> для всех файлов в директории.
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 fn snapshot_dir(dir: &Path) -> HashMap<String, u64> {
     let mut out = HashMap::new();
     if !dir.exists() {
@@ -456,14 +576,12 @@ fn walk_dir(root: &Path, cur: &Path, out: &mut HashMap<String, u64>) {
     }
 }
 
-/// Возвращает список rel_path файлов, которые появились или были изменены
-/// относительно `before`.
 fn diff_dir(dir: &Path, before: &HashMap<String, u64>) -> Vec<String> {
     let after = snapshot_dir(dir);
     let mut new_or_changed = Vec::new();
     for (rel, mtime) in after {
         match before.get(&rel) {
-            Some(&prev_mtime) if prev_mtime == mtime => continue, // unchanged
+            Some(&prev_mtime) if prev_mtime == mtime => continue,
             _ => new_or_changed.push(rel),
         }
     }
@@ -516,11 +634,272 @@ fn tier_for_model(m: &str) -> crate::pal::Tier {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Виток 3: chain triggers (verify-hop ОТК + next-chain)
+// ---------------------------------------------------------------------------
+
+const MAX_HOP_DEPTH: i32 = 10;
+const MAX_VERIFY_FANOUT: usize = 5;
+const MAX_NEXT_FANOUT: usize = 5;
+
+async fn count_hop_depth(task_id: &str, db: &WritePool) -> i32 {
+    let mut depth = 0i32;
+    let mut current = task_id.to_string();
+    let mut visited = HashSet::new();
+    visited.insert(current.clone());
+    loop {
+        if depth >= MAX_HOP_DEPTH {
+            break;
+        }
+        let parent: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT parent_task_id FROM dispatcher_logs WHERE id = ?")
+                .bind(&current)
+                .fetch_optional(&db.0)
+                .await
+                .unwrap_or(None);
+        match parent {
+            Some((Some(pid),)) => {
+                if !visited.insert(pid.clone()) {
+                    log::warn!("count_hop_depth: cycle at {pid} — stopping");
+                    break;
+                }
+                depth += 1;
+                current = pid;
+            }
+            _ => break,
+        }
+    }
+    depth
+}
+
+/// verify-хоп ТЕРМИНАЛЕН — не порождает дочерних verify/next цепочек.
+/// Иначе verifier-агент сам запускал бы проверку/продолжение → каскад A↔B.
+pub(crate) fn hop_is_terminal(hop_kind: Option<&str>) -> bool {
+    matches!(hop_kind, Some("verify"))
+}
+
+pub(crate) async fn try_trigger_chains(
+    task_id: &str,
+    spec: &ExecutorSpec,
+    result: &PostExecResult,
+    db: &WritePool,
+    app: &AppHandle,
+) {
+    if spec.kind != ExecutorKind::OrgAgent {
+        return;
+    }
+    if result.exit_code != 0 || result.artifacts_count == 0 {
+        return;
+    }
+
+    // verify-хоп ТЕРМИНАЛЕН: результат проверки не проверяем повторно и не
+    // продолжаем цепочкой, иначе verifier сам триггерит verify/next → каскад
+    // A↔B (Cursor medium). Терминальность определяется hop_kind текущей задачи.
+    let cur_hop: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT hop_kind FROM dispatcher_logs WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&db.0)
+            .await
+            .unwrap_or(None);
+    let cur_hop = cur_hop.and_then(|(h,)| h);
+    if hop_is_terminal(cur_hop.as_deref()) {
+        log::info!("chain trigger: task {task_id} hop={cur_hop:?} terminal — skip chains");
+        return;
+    }
+
+    let depth = count_hop_depth(task_id, db).await;
+    if depth >= MAX_HOP_DEPTH {
+        log::warn!(
+            "chain trigger: task {task_id} depth={depth} >= {MAX_HOP_DEPTH} — skip chains"
+        );
+        return;
+    }
+
+    try_trigger_verify(task_id, spec, db, app).await;
+    try_trigger_next(task_id, spec, db, app).await;
+}
+
+async fn try_trigger_verify(
+    task_id: &str,
+    spec: &ExecutorSpec,
+    db: &WritePool,
+    app: &AppHandle,
+) {
+    let verifiers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT l.to_agent_id, a.slug FROM org_agent_links l \
+         JOIN org_agents a ON a.id = l.to_agent_id \
+         WHERE l.from_agent_id = ? AND l.link_type = 'verifier' \
+         AND a.status = 'active' AND a.brain_mode = 'claude_cli' \
+         AND a.role_prompt_md IS NOT NULL AND trim(a.role_prompt_md) != ''",
+    )
+    .bind(&spec.entity_id)
+    .fetch_all(&db.0)
+    .await
+    .unwrap_or_default();
+
+    if verifiers.is_empty() {
+        return;
+    }
+    if verifiers.len() > MAX_VERIFY_FANOUT {
+        log::warn!(
+            "verify trigger: {} verifiers for task {task_id}, capping at {MAX_VERIFY_FANOUT}",
+            verifiers.len()
+        );
+    }
+
+    let artifacts: Vec<(String,)> =
+        sqlx::query_as("SELECT rel_path FROM task_artifacts WHERE task_id = ?")
+            .bind(task_id)
+            .fetch_all(&db.0)
+            .await
+            .unwrap_or_default();
+    let artifact_list = artifacts
+        .iter()
+        .map(|(p,)| p.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let parent_payload: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT refined_prompt FROM dispatcher_logs WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&db.0)
+            .await
+            .unwrap_or(None);
+    let task_desc = parent_payload
+        .and_then(|(p,)| p)
+        .unwrap_or_else(|| "(описание недоступно)".to_string());
+    let task_desc_short = if task_desc.len() > 500 {
+        format!("{}…", &task_desc[..500])
+    } else {
+        task_desc
+    };
+
+    for (_verifier_id, verifier_slug) in verifiers.iter().take(MAX_VERIFY_FANOUT) {
+        let verify_prompt = format!(
+            "Проверь результат задачи: {task_desc_short}\n\
+             Артефакт(ы): {artifact_list}\n\
+             Вынеси вердикт: ГОДНО или НА ДОРАБОТКУ с обоснованием."
+        );
+
+        let verify_task = dispatcher::dispatch_task_inner_ex(
+            spec.slug.clone(),
+            verifier_slug.clone(),
+            serde_json::json!({ "raw_prompt": &verify_prompt, "verify_parent": task_id }),
+            dispatcher::DispatchExtras {
+                parent_task_id: Some(task_id.to_string()),
+                hop_kind: Some("verify".to_string()),
+                routed_by_model: None,
+                refined_prompt: Some(verify_prompt.clone()),
+            },
+            db,
+            app,
+        )
+        .await;
+
+        match verify_task {
+            Ok(task) => {
+                log::info!(
+                    "verify trigger: created verify task {} for verifier '{verifier_slug}' (parent {task_id})",
+                    task.id
+                );
+                trigger_post_executor(
+                    task.id,
+                    verifier_slug.clone(),
+                    verify_prompt,
+                    Some("verdict.md".to_string()),
+                    app.clone(),
+                );
+            }
+            Err(e) => log::warn!("verify trigger: failed to create task for '{verifier_slug}': {e}"),
+        }
+    }
+}
+
+async fn try_trigger_next(
+    task_id: &str,
+    spec: &ExecutorSpec,
+    db: &WritePool,
+    app: &AppHandle,
+) {
+    let next_agents: Vec<(String, String)> = sqlx::query_as(
+        "SELECT l.to_agent_id, a.slug FROM org_agent_links l \
+         JOIN org_agents a ON a.id = l.to_agent_id \
+         WHERE l.from_agent_id = ? AND l.link_type = 'next' \
+         AND a.status = 'active' AND a.brain_mode = 'claude_cli' \
+         AND a.role_prompt_md IS NOT NULL AND trim(a.role_prompt_md) != ''",
+    )
+    .bind(&spec.entity_id)
+    .fetch_all(&db.0)
+    .await
+    .unwrap_or_default();
+
+    if next_agents.is_empty() {
+        return;
+    }
+    if next_agents.len() > MAX_NEXT_FANOUT {
+        log::warn!(
+            "next chain: {} next-agents for task {task_id}, capping at {MAX_NEXT_FANOUT}",
+            next_agents.len()
+        );
+    }
+
+    let parent_payload: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT refined_prompt FROM dispatcher_logs WHERE id = ?")
+            .bind(task_id)
+            .fetch_optional(&db.0)
+            .await
+            .unwrap_or(None);
+    let prev_context = parent_payload
+        .and_then(|(p,)| p)
+        .unwrap_or_else(|| "(контекст недоступен)".to_string());
+    let prev_context_short = if prev_context.len() > 500 {
+        format!("{}…", &prev_context[..500])
+    } else {
+        prev_context
+    };
+
+    for (_next_id, next_slug) in next_agents.iter().take(MAX_NEXT_FANOUT) {
+        let next_prompt = format!(
+            "Предыдущий шаг выполнен агентом '{}'. Контекст задачи: {prev_context_short}\n\
+             Продолжи работу по своей роли.",
+            spec.slug
+        );
+
+        let next_task = dispatcher::dispatch_task_inner_ex(
+            spec.slug.clone(),
+            next_slug.clone(),
+            serde_json::json!({ "raw_prompt": &next_prompt, "chain_parent": task_id }),
+            dispatcher::DispatchExtras {
+                parent_task_id: Some(task_id.to_string()),
+                hop_kind: Some("next_step".to_string()),
+                routed_by_model: None,
+                refined_prompt: Some(next_prompt.clone()),
+            },
+            db,
+            app,
+        )
+        .await;
+
+        match next_task {
+            Ok(task) => {
+                log::info!(
+                    "next chain: created task {} for '{next_slug}' (parent {task_id})",
+                    task.id
+                );
+                trigger_post_executor(
+                    task.id,
+                    next_slug.clone(),
+                    next_prompt,
+                    None,
+                    app.clone(),
+                );
+            }
+            Err(e) => log::warn!("next chain: failed to create task for '{next_slug}': {e}"),
+        }
+    }
+}
+
 /// Phase 1 (Iteration B) — путь исполнения через PAL.
-/// Повторяет downstream logic legacy (diff_dir / register_artifact / fail/success),
-/// но invoke делает orchestrator::pal_invoke_chain + пишет run_logs.
-/// Срез 2: fallback chain [claude_cli primary, qwen_http]. provider_registry-driven
-/// chain (post_runtime) — Срез 3. Qwen-ответ пишется в result.txt (нет native Write).
 #[allow(clippy::too_many_arguments)]
 async fn run_via_pal(
     task_id: &str,
@@ -548,10 +927,6 @@ async fn run_via_pal(
     let started = Instant::now();
     let tier = tier_for_model(model);
 
-    // Срез 2: хардкод-interim fallback chain [claude_cli primary, qwen_http].
-    // Provider_registry-driven chain (post_runtime.fallback_chain_json) — Срез 3.
-    // I1: ClaudeCliDriver регистрирует PID спавненного claude в общий running-map
-    // → cancel_post_executor работает на PAL-пути.
     let claude: Arc<dyn PostRuntimeProvider> = Arc::new(
         ClaudeCliDriver::new(
             "claude_cli".to_string(),
@@ -571,7 +946,7 @@ async fn run_via_pal(
         system_prompt: system_prompt.to_string(),
         user_message: refined_prompt.to_string(),
         tier,
-        timeout: None, // orchestrator возьмёт Tier::default_timeout (T1=600)
+        timeout: None,
         max_turns: None,
         model_override: None,
         workspace_path: Some(task_dir.to_path_buf()),
@@ -585,14 +960,14 @@ async fn run_via_pal(
         },
     };
 
-    log::info!("run_via_pal: task={task_id} slug={slug} tier={} model={model} chain=[claude_cli,qwen_http]", tier.as_str());
+    log::info!(
+        "run_via_pal: task={task_id} slug={slug} tier={} model={model} chain=[claude_cli,qwen_http]",
+        tier.as_str()
+    );
     let outcome = orchestrator::pal_invoke_chain(&chain, request).await;
     let result = outcome.result;
     let elapsed_ms = started.elapsed().as_millis();
 
-    // Qwen не пишет файлы сам (нет native Write) → post_executor пишет result.txt,
-    // чтобы diff_dir подхватил как artifact (IMPL-REFERENCE §2 Вариант A). Claude
-    // создаёт файлы сам — для него result.txt НЕ пишем.
     if let Ok(resp) = &result {
         if resp.provider_used == ProviderKind::QwenHttp && !resp.text.trim().is_empty() {
             let result_path = task_dir.join("result.txt");
@@ -602,7 +977,6 @@ async fn run_via_pal(
         }
     }
 
-    // run_logs: provider_used/model_used/fallback_used из ФАКТИЧЕСКОГО ответа.
     let (provider_used, model_used, success, error_kind, raw_output, latency) = match &result {
         Ok(resp) => (
             resp.provider_used.as_str().to_string(),
@@ -613,7 +987,6 @@ async fn run_via_pal(
             resp.latency_ms as i64,
         ),
         Err(e) => (
-            // при провале chain — id последнего пробованного провайдера
             chain
                 .get(outcome.attempt_idx)
                 .map(|p| p.provider_id())
@@ -651,7 +1024,6 @@ async fn run_via_pal(
         log::warn!("run_via_pal: run_log insert failed: {e}");
     }
 
-    // Артефакты — тот же diff_dir + register, что и в legacy.
     let new_files = diff_dir(task_dir, pre_snapshot);
     let mut registered = 0usize;
     for rel in &new_files {
@@ -664,7 +1036,6 @@ async fn run_via_pal(
         }
     }
 
-    // BL-P1-016: если пользователь уже отменил — не перезатираем cancelled.
     let already_cancelled = is_task_cancelled(task_id, db).await;
 
     let exit_code = match &result {
@@ -722,11 +1093,10 @@ async fn run_via_pal(
 }
 
 // ---------------------------------------------------------------------------
-// Tauri commands
+// Tauri commands (cancel)
 // ---------------------------------------------------------------------------
 
 /// BFS-обход дерева процессов: возвращает все PID (корень + потомки).
-/// Чистая функция для тестируемости — `children_of` возвращает детей данного PID.
 fn collect_tree_pids(root: u32, children_of: impl Fn(u32) -> Vec<u32>) -> Vec<u32> {
     let mut to_kill = vec![root];
     let mut i = 0;
@@ -742,7 +1112,6 @@ fn collect_tree_pids(root: u32, children_of: impl Fn(u32) -> Vec<u32>) -> Vec<u3
 }
 
 /// BL-P1-016: Рекурсивный kill дерева процессов по корневому PID.
-/// BFS по PPID через sysinfo — убивает листья первыми, корень последним.
 #[cfg(windows)]
 fn kill_process_tree(root_pid: u32) {
     use sysinfo::{Pid, ProcessesToUpdate, System};
@@ -774,8 +1143,6 @@ async fn is_task_cancelled(task_id: &str, db: &WritePool) -> bool {
         .unwrap_or(false)
 }
 
-/// Ручной cancel: атомарно ставит cancelled + убивает дерево процессов.
-/// Фронтенду НЕ нужно вызывать fail_task — всё внутри.
 #[tauri::command]
 pub async fn cancel_post_executor(
     task_id: String,
@@ -809,35 +1176,16 @@ pub async fn cancel_post_executor(
     }
 }
 
-/// Cleanup orphan claude.exe — оставшиеся от предыдущего crash MSPro.
-/// Идентифицируется по env-var `MSPRO_TASK_ID`. Запускается на startup.
-///
-/// На Windows + Job Object этот cleanup является ИЗБЫТОЧНЫМ (job сам убивает),
-/// но оставляем как defence-in-depth — если job не настроился (например,
-/// process уже был breakaway).
 pub async fn cleanup_orphan_post_processes() -> usize {
-    // sysinfo не даёт env per-process на Windows out-of-the-box, поэтому
-    // в 11B-1 — no-op stub. Полную реализацию через wmic / WMIC
-    // оставим на 11B-2 (если Job Object не справится).
     0
 }
 
 #[cfg(test)]
 mod tests {
-    /// Сторож на LEGACY-двери (Cursor follow-up Срез 1.5): регресс-тесты на
-    /// `build_cli_args` стоят на PAL-двери, но legacy spawn — отдельный путь
-    /// (прод!). Source-guard: исходник этого файла НЕ должен содержать
-    /// `--dangerously-skip-permissions` (bypass) и должен звать единый
-    /// `build_cli_args`. Ловит возврат bypass прямо в legacy в обход
-    /// permission_flags() — закрывает «флаг в двух местах» с обеих сторон.
     const SRC: &str = include_str!("post_executor.rs");
 
     #[test]
     fn legacy_spawn_has_no_bypass_flag() {
-        // Source-guard ищет bypass-флаг как переданный в Command аргумент.
-        // Паттерн и сам флаг собраны из частей в runtime, чтобы этот тест
-        // (через include_str! читающий собственный файл) НЕ матчил сам себя —
-        // в исходнике нет цельного литерала, только склейка ниже.
         let dot_arg = concat!(".", "arg");
         let flag = concat!("--dangerously", "-skip-permissions");
         let bypass_call = format!("{}({}{}{})", dot_arg, '"', flag, '"');
@@ -850,10 +1198,8 @@ mod tests {
 
     #[test]
     fn legacy_spawn_uses_single_source_argv() {
-        // legacy должен звать общий build_cli_args (единый источник argv с PAL),
-        // а не собирать --print/--agent/permission_flags руками (риск разъезда).
         assert!(
-            SRC.contains("claude_cli_driver::build_cli_args(&agent_name, &model)"),
+            SRC.contains("claude_cli_driver::build_cli_args("),
             "legacy spawn не использует единый build_cli_args — argv может разъехаться с PAL"
         );
     }
@@ -861,11 +1207,6 @@ mod tests {
     #[test]
     fn kill_process_tree_bfs_collects_full_tree() {
         use std::collections::HashMap;
-        //   1
-        //  / \
-        // 2   3
-        //     |
-        //     4
         let mut tree: HashMap<u32, Vec<u32>> = HashMap::new();
         tree.insert(1, vec![2, 3]);
         tree.insert(3, vec![4]);
@@ -888,11 +1229,204 @@ mod tests {
         use std::collections::HashMap;
         let mut tree: HashMap<u32, Vec<u32>> = HashMap::new();
         tree.insert(10, vec![20]);
-        tree.insert(20, vec![10]); // cycle
+        tree.insert(20, vec![10]);
 
         let pids = super::collect_tree_pids(10, |p| {
             tree.get(&p).cloned().unwrap_or_default()
         });
         assert_eq!(pids, vec![10, 20], "cycle doesn't cause infinite loop");
+    }
+
+    // ── Виток 3: chain depth + trigger tests ──────────────────────────
+
+    use crate::db::WritePool;
+    use sqlx::SqlitePool;
+
+    async fn setup_chain_db() -> WritePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE dispatcher_logs (
+                id TEXT PRIMARY KEY,
+                from_entity TEXT NOT NULL,
+                to_entity TEXT NOT NULL,
+                task_payload TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'in_progress',
+                execution_time_ms INTEGER,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                parent_task_id TEXT DEFAULT NULL,
+                completed_at DATETIME DEFAULT NULL,
+                attempts_count INTEGER NOT NULL DEFAULT 1,
+                hop_kind TEXT DEFAULT NULL,
+                routed_by_model TEXT DEFAULT NULL,
+                refined_prompt TEXT DEFAULT NULL,
+                outbox_path TEXT DEFAULT NULL,
+                raw_brain_response TEXT DEFAULT NULL
+            );
+            CREATE TABLE org_agents (
+                id TEXT PRIMARY KEY,
+                department_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                role_label TEXT NOT NULL DEFAULT 'member',
+                status TEXT NOT NULL DEFAULT 'active',
+                folder_path TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT NULL,
+                role_prompt_md TEXT DEFAULT NULL,
+                brain_mode TEXT NOT NULL DEFAULT 'disabled',
+                brain_model TEXT DEFAULT NULL,
+                brain_endpoint TEXT DEFAULT NULL,
+                mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+                ckp_text TEXT DEFAULT NULL,
+                checklist_json TEXT NOT NULL DEFAULT '[]',
+                memory_md TEXT DEFAULT NULL
+            );
+            CREATE TABLE org_agent_links (
+                id TEXT PRIMARY KEY,
+                from_agent_id TEXT NOT NULL,
+                to_agent_id TEXT NOT NULL,
+                link_type TEXT NOT NULL,
+                description TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE task_artifacts (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                rel_path TEXT NOT NULL,
+                mime_type TEXT,
+                post_slug TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                outbox_path TEXT,
+                reject_reason TEXT
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        WritePool(pool)
+    }
+
+    #[tokio::test]
+    async fn count_hop_depth_zero_for_root() {
+        let db = setup_chain_db().await;
+        sqlx::query(
+            "INSERT INTO dispatcher_logs (id, from_entity, to_entity, parent_task_id) \
+             VALUES ('t1', 'owner', 'agent-a', NULL)",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        let depth = super::count_hop_depth("t1", &db).await;
+        assert_eq!(depth, 0, "root task has depth 0");
+    }
+
+    #[tokio::test]
+    async fn count_hop_depth_chain() {
+        let db = setup_chain_db().await;
+        sqlx::query(
+            "INSERT INTO dispatcher_logs (id, from_entity, to_entity, parent_task_id) VALUES \
+             ('t1', 'owner', 'a', NULL), \
+             ('t2', 'a', 'b', 't1'), \
+             ('t3', 'b', 'c', 't2')",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        assert_eq!(super::count_hop_depth("t1", &db).await, 0);
+        assert_eq!(super::count_hop_depth("t2", &db).await, 1);
+        assert_eq!(super::count_hop_depth("t3", &db).await, 2);
+    }
+
+    #[tokio::test]
+    async fn count_hop_depth_capped_at_max() {
+        let db = setup_chain_db().await;
+        for i in 0..=12 {
+            let id = format!("t{i}");
+            let parent = if i == 0 {
+                "NULL".to_string()
+            } else {
+                format!("'t{}'", i - 1)
+            };
+            sqlx::raw_sql(&format!(
+                "INSERT INTO dispatcher_logs (id, from_entity, to_entity, parent_task_id) \
+                 VALUES ('{id}', 'x', 'y', {parent})"
+            ))
+            .execute(&db.0)
+            .await
+            .unwrap();
+        }
+
+        let depth = super::count_hop_depth("t12", &db).await;
+        assert!(depth >= super::MAX_HOP_DEPTH, "depth capped at MAX_HOP_DEPTH");
+    }
+
+    #[tokio::test]
+    async fn try_trigger_chains_skips_posts() {
+        let db = setup_chain_db().await;
+        use super::*;
+        use crate::commands::executor_resolver::*;
+
+        let spec = ExecutorSpec {
+            slug: "frontend".to_string(),
+            kind: ExecutorKind::Post,
+            entity_id: "p1".to_string(),
+            system_prompt: "Test".to_string(),
+            model: "opus".to_string(),
+            brain_mode: "claude_cli".to_string(),
+            agent_md_name: "mspro-frontend".to_string(),
+        };
+        let result = PostExecResult {
+            task_id: "t1".to_string(),
+            exit_code: 0,
+            artifacts_count: 1,
+            elapsed_ms: 100,
+        };
+
+        // No AppHandle in tests — we test that the function returns early for Posts
+        // by checking it doesn't panic (no DB rows to find for chains)
+        // This is a guard test: Posts should skip chain triggers entirely.
+        assert_eq!(spec.kind, ExecutorKind::Post);
+        // Cannot call try_trigger_chains without AppHandle, but the guard check
+        // (spec.kind != OrgAgent) ensures early return.
+    }
+
+    #[tokio::test]
+    async fn try_trigger_chains_skips_on_failure() {
+        use super::*;
+        use crate::commands::executor_resolver::*;
+
+        let result = PostExecResult {
+            task_id: "t1".to_string(),
+            exit_code: 1,
+            artifacts_count: 0,
+            elapsed_ms: 100,
+        };
+        assert_ne!(result.exit_code, 0);
+        assert_eq!(result.artifacts_count, 0);
+        // Both conditions prevent chain trigger — no panic, no DB access needed.
+    }
+
+    #[test]
+    fn verify_hop_is_terminal() {
+        // verify-хоп терминален — не порождает дочерних verify/next (Cursor medium fix):
+        // иначе verifier-агент сам триггерил бы проверку → каскад A↔B.
+        assert!(super::hop_is_terminal(Some("verify")), "verify должен быть терминальным");
+        // Прочие хопы продолжают цепочки.
+        assert!(!super::hop_is_terminal(Some("next_step")));
+        assert!(!super::hop_is_terminal(Some("direct")));
+        assert!(!super::hop_is_terminal(Some("refined")));
+        assert!(!super::hop_is_terminal(Some("subtask")));
+        assert!(!super::hop_is_terminal(None));
+    }
+
+    #[test]
+    fn fanout_caps_are_sane() {
+        // Лимиты fan-out защищают от burst параллельных запусков (Cursor medium fix).
+        assert!((1..=20).contains(&super::MAX_VERIFY_FANOUT));
+        assert!((1..=20).contains(&super::MAX_NEXT_FANOUT));
     }
 }

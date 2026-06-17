@@ -12,5 +12,6 @@ pub mod posts;
 pub mod qwen_bridge;
 pub mod tool_calls;
 pub mod agent_card;
+pub mod executor_resolver;
 pub mod vault;
 pub mod vault_io;

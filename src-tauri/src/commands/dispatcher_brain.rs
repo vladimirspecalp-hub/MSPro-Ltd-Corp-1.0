@@ -28,6 +28,7 @@ use crate::commands::dispatcher::{
     self, DispatchExtras, DispatcherTask,
 };
 use crate::commands::dispatcher_tools::DISPATCHER_TOOLS_PREAMBLE;
+use crate::commands::executor_resolver::resolve_executor;
 use crate::commands::qwen_bridge;
 use crate::commands::tool_calls::{parse_tool_calls, ToolCall};
 use crate::db::WritePool;
@@ -106,14 +107,40 @@ pub async fn build_dispatcher_prompt(
     .await
     .unwrap_or_default();
 
-    let posts_block = if posts.is_empty() {
-        "(нет активных постов)".to_string()
+    // Org-агенты готовые к исполнению (claude_cli + role_prompt_md заполнен).
+    let org_agents: Vec<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT slug, name, ckp_text FROM org_agents \
+         WHERE status='active' AND brain_mode='claude_cli' \
+         AND role_prompt_md IS NOT NULL AND trim(role_prompt_md)!='' \
+         ORDER BY slug",
+    )
+    .fetch_all(&db.0)
+    .await
+    .unwrap_or_default();
+
+    let post_slugs: std::collections::HashSet<&str> =
+        posts.iter().map(|(s, _, _)| s.as_str()).collect();
+
+    let executors_block = if posts.is_empty() && org_agents.is_empty() {
+        "(нет активных исполнителей)".to_string()
     } else {
         let mut s = String::new();
         for (slug, title, cp) in &posts {
             s.push_str(&format!(
-                "- `{slug}` — {title}{}\n",
+                "- `{slug}` [пост] — {title}{}\n",
                 cp.as_deref()
+                    .map(|c| format!(" (ЦКП: {c})"))
+                    .unwrap_or_default()
+            ));
+        }
+        for (slug, name, ckp) in &org_agents {
+            if post_slugs.contains(slug.as_str()) {
+                continue;
+            }
+            s.push_str(&format!(
+                "- `{slug}` [агент оргструктуры] — {name}{}\n",
+                ckp.as_deref()
+                    .filter(|c| !c.trim().is_empty())
                     .map(|c| format!(" (ЦКП: {c})"))
                     .unwrap_or_default()
             ));
@@ -132,10 +159,10 @@ pub async fn build_dispatcher_prompt(
     let system_prompt = format!(
         "# SYSTEM CONTEXT (DISPATCHER)\n\
         Ты — Интеллектуальный Диспетчер MSPro-Ltd Corp. Hub-and-Spoke брокер задач.\n\
-        Прямое общение между Гендиром и постами запрещено — всё через тебя.\n\
+        Прямое общение между Гендиром и исполнителями запрещено — всё через тебя.\n\
         \n\
-        ## Текущие посты (можно использовать как target_slug)\n\
-        {posts_block}\n\
+        ## Текущие Исполнители (можно использовать как target_slug)\n\
+        {executors_block}\n\
         {DISPATCHER_TOOLS_PREAMBLE}\n\
         ---\n\
         Помни: ОДИН tool_call в ответе. Не выполняй задачу сам — переписывай и адресуй.\n"
@@ -387,10 +414,10 @@ pub async fn process_pending(
 
     let decision_outcome = match call.name.as_str() {
         "forward_to_post" => {
-            execute_forward(&task, args, &final_model, &db, &app).await
+            execute_forward(&task, args, &final_model, &settings, &db, &app).await
         }
         "decompose_task" => {
-            execute_decompose(&task, args, &final_model, &db, &app).await
+            execute_decompose(&task, args, &final_model, &settings, &db, &app).await
         }
         "escalate_to_ceo" => {
             let reason = args
@@ -596,6 +623,7 @@ async fn execute_forward(
     parent: &DispatcherTask,
     args: &Value,
     model: &str,
+    settings: &AppSettings,
     db: &WritePool,
     app: &AppHandle,
 ) -> Result<(&'static str, Option<String>, String), String> {
@@ -607,14 +635,11 @@ async fn execute_forward(
     // v1.0.23: если Opus забыл target_slug — пробуем три fallback'а по очереди:
     // 1) parent.payload.target_hint (если Гендир указал)
     // 2) Любой реальный slug встретившийся в refined_prompt или raw_prompt
-    // 3) Если только один активный пост в БД — берём его
+    // 3) Если только один активный исполнитель — берём его
     let target_owned: String;
     let target: &str = match args.get("target_slug").and_then(Value::as_str) {
         Some(s) if !s.trim().is_empty() => s,
         _ => {
-            // target_slug не задан явно → резолвим через resolve_target_slug.
-            // hint берём из parent.task_payload; raw_prompt + active-слаги читаем
-            // ТОЛЬКО когда hint отсутствует (как в оригинале — без лишнего запроса).
             let payload_json = serde_json::from_str::<Value>(&parent.task_payload).ok();
             let hint = payload_json.as_ref().and_then(|v| {
                 v.get("target_hint")
@@ -629,7 +654,7 @@ async fn execute_forward(
                     .as_ref()
                     .and_then(|v| v.get("raw_prompt").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_default();
-                let slugs: Vec<String> =
+                let mut slugs: Vec<String> =
                     sqlx::query_as::<_, (String,)>("SELECT slug FROM posts WHERE status = 'active'")
                         .fetch_all(&db.0)
                         .await
@@ -637,6 +662,22 @@ async fn execute_forward(
                         .into_iter()
                         .map(|(s,)| s)
                         .collect();
+                let agent_slugs: Vec<String> = sqlx::query_as::<_, (String,)>(
+                    "SELECT slug FROM org_agents \
+                     WHERE status='active' AND brain_mode='claude_cli' \
+                     AND role_prompt_md IS NOT NULL AND trim(role_prompt_md)!=''",
+                )
+                .fetch_all(&db.0)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(s,)| s)
+                .collect();
+                for s in agent_slugs {
+                    if !slugs.contains(&s) {
+                        slugs.push(s);
+                    }
+                }
                 (format!("{refined} {raw}"), slugs)
             };
             target_owned = resolve_target_slug(hint.as_deref(), &haystack, &slugs)?;
@@ -645,15 +686,14 @@ async fn execute_forward(
     };
     let expected_artifact = args.get("expected_artifact").and_then(Value::as_str);
 
-    // Проверка существования поста
-    let exists: Option<(String,)> = sqlx::query_as("SELECT slug FROM posts WHERE slug = ?")
-        .bind(target)
-        .fetch_optional(&db.0)
-        .await
-        .map_err(|e| format!("post lookup: {e}"))?;
-    if exists.is_none() {
+    // Проверка существования исполнителя через единый резолвер (post или org_agent)
+    let spec = resolve_executor(db, target, settings).await.map_err(|e| {
+        format!("исполнитель '{target}' не найден: {e}")
+    })?;
+    if spec.brain_mode != "claude_cli" {
         return Err(format!(
-            "post '{target}' не существует — нельзя forward"
+            "исполнитель '{target}' имеет brain_mode='{}' — поддерживается только claude_cli",
+            spec.brain_mode
         ));
     }
 
@@ -696,6 +736,7 @@ async fn execute_decompose(
     parent: &DispatcherTask,
     args: &Value,
     model: &str,
+    settings: &AppSettings,
     db: &WritePool,
     app: &AppHandle,
 ) -> Result<(&'static str, Option<String>, String), String> {
@@ -723,6 +764,18 @@ async fn execute_decompose(
             .get("refined_prompt")
             .and_then(Value::as_str)
             .ok_or_else(|| format!("subtask[{i}]: refined_prompt missing"))?;
+
+        // Валидация исполнителя через единый резолвер
+        let spec = resolve_executor(db, target, settings).await.map_err(|e| {
+            format!("subtask[{i}]: исполнитель '{target}' не найден: {e}")
+        })?;
+        if spec.brain_mode != "claude_cli" {
+            return Err(format!(
+                "subtask[{i}]: исполнитель '{target}' имеет brain_mode='{}' — только claude_cli",
+                spec.brain_mode
+            ));
+        }
+
         let payload = serde_json::json!({
             "from_parent_task_id": parent.id,
             "subtask_index": i,

@@ -68,6 +68,9 @@ export default function AgentCardEditor({ agentId, allAgents }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
+  const [taskPrompt, setTaskPrompt] = useState("");
+  const [running, setRunning] = useState(false);
+  const [runResult, setRunResult] = useState<string | null>(null);
 
   // Form fields
   const [rolePrompt, setRolePrompt] = useState("");
@@ -213,6 +216,25 @@ export default function AgentCardEditor({ agentId, allAgents }: Props) {
     }
   }
 
+  async function runAgent() {
+    if (!taskPrompt.trim()) return;
+    setRunning(true);
+    setRunResult(null);
+    setError(null);
+    try {
+      const taskId = await invoke<string>("run_org_agent_now", {
+        agentId,
+        taskPrompt: taskPrompt.trim(),
+      });
+      setRunResult(taskId);
+      setTaskPrompt("");
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setRunning(false);
+    }
+  }
+
   const otherAgents = allAgents.filter((a) => a.id !== agentId);
   const agentName = (id: string) => allAgents.find((a) => a.id === id)?.name ?? id;
 
@@ -233,6 +255,35 @@ export default function AgentCardEditor({ agentId, allAgents }: Props) {
 
       {error && (
         <div style={errorBox}>{error}</div>
+      )}
+
+      {/* === Запуск задачи (Виток 1 MVP) === */}
+      {card.brain_mode === "claude_cli" && card.status === "active" && (
+        <Section title="Запуск задачи">
+          <textarea
+            style={textareaStyle}
+            rows={3}
+            value={taskPrompt}
+            onChange={(e) => setTaskPrompt(e.target.value)}
+            placeholder="Опишите задачу для агента..."
+            disabled={running}
+          />
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 6 }}>
+            <button
+              type="button"
+              style={{ ...saveBtn, opacity: !taskPrompt.trim() || running ? 0.5 : 1 }}
+              disabled={!taskPrompt.trim() || running}
+              onClick={runAgent}
+            >
+              {running ? "Выполняется..." : "Запустить"}
+            </button>
+            {runResult && (
+              <span style={{ fontSize: 12, color: "#1b5e20" }}>
+                Задача запущена: <code>{runResult}</code>
+              </span>
+            )}
+          </div>
+        </Section>
       )}
 
       {/* === СВЯЗИ В ПОТОКЕ (mini-schema) === */}

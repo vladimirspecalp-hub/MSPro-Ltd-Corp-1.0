@@ -900,6 +900,8 @@ CREATE TABLE IF NOT EXISTS org_disk_sync ( \
             commands::artifacts::create_fake_artifact,
             // v1.0.24 Phase 11B-1: Post Agent Spawn
             commands::post_executor::cancel_post_executor,
+            // Виток 1 MVP: org_agent execution
+            commands::post_executor::run_org_agent_now,
             // Step 6 — HMT-engine (statistics + Hubbard conditions)
             commands::hmt::add_statistic_value,
             commands::hmt::get_post_hmt,
