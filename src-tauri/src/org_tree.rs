@@ -1317,4 +1317,77 @@ mod tests {
         let hash = get_stored_hash(&pool, "agent", "a1", "existing.md").await;
         assert!(hash.is_some(), "hash of existing file must be stored (adopted)");
     }
+
+    // --- REGRESSION (Заход 3, хвост): rebuild материализует агента, созданного ДО диска ---
+    // Боевой кейс из app.db: агент со slug у себя и родителей, но folder_path=NULL
+    // и org_disk_sync пуст (создан в Заходе 2 до появления диска). Авто-rebuild при
+    // старте обязан создать папку, записать файлы и проставить folder_path.
+    #[tokio::test]
+    async fn rebuild_materializes_preexisting_agent() {
+        let pool = setup_db().await;
+        let root = tempdir().unwrap();
+
+        sqlx::raw_sql(
+            "INSERT INTO org_divisions (id, name, slug) VALUES ('d1', 'Сайт', 'sayt'); \
+             INSERT INTO org_departments (id, division_id, name, slug) VALUES ('p1', 'd1', 'SEO', 'seo'); \
+             INSERT INTO org_agents (id, department_id, name, slug, role_prompt_md, folder_path) \
+                VALUES ('a1', 'p1', 'SEO-spec', 'seo-spec', '# SEO agent', NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // До rebuild: ни папки, ни записей синка, folder_path = NULL
+        let agent_dir = root.path().join("sayt").join("seo").join("seo-spec");
+        assert!(!agent_dir.exists(), "до rebuild папки быть не должно");
+        let sync_before: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_disk_sync")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(sync_before.0, 0, "до rebuild синк пуст");
+
+        // Авто-rebuild как при старте приложения
+        rebuild_all(&pool, root.path(), false).await.unwrap();
+
+        // После: папка + CLAUDE.md с ВЕРНЫМ содержимым (а не просто существует)
+        let claude_md = agent_dir.join("CLAUDE.md");
+        assert!(claude_md.exists(), "CLAUDE.md должен появиться после rebuild");
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).unwrap(),
+            "# SEO agent",
+            "содержимое CLAUDE.md = role_prompt_md из БД"
+        );
+        // folder_path проставлен и указывает именно на папку агента
+        let fp: (Option<String>,) =
+            sqlx::query_as("SELECT folder_path FROM org_agents WHERE id = 'a1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let fp = fp.0.expect("folder_path должен проставиться после rebuild");
+        assert!(
+            fp.ends_with("seo-spec"),
+            "folder_path должен указывать на папку агента, получено: {fp}"
+        );
+        let sync_after: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_disk_sync")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(sync_after.0 > 0, "записи синка должны появиться");
+
+        // Идемпотентность: повторный rebuild не плодит записи синка и не трогает файл
+        rebuild_all(&pool, root.path(), false).await.unwrap();
+        let sync_after2: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM org_disk_sync")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            sync_after2.0, sync_after.0,
+            "повторный rebuild идемпотентен — записи синка не растут"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).unwrap(),
+            "# SEO agent",
+            "повторный rebuild не меняет содержимое файла"
+        );
+    }
 }

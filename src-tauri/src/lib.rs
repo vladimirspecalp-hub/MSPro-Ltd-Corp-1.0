@@ -768,6 +768,21 @@ CREATE TABLE IF NOT EXISTS org_disk_sync ( \
                         // Data-fix: transliterate existing names → ASCII slugs
                         org_tree::datafix_slugs(&pool.0).await;
 
+                        // Заход 3 (закрытие хвоста): авто-материализация дерева на диск.
+                        // До-синкает агентов, созданных ДО появления диска (folder_path=NULL,
+                        // org_disk_sync пуст). Идемпотентно: force=false уважает ручные правки
+                        // и хэши, повторный старт = no-op. Ошибки диска → warn, старт не падает.
+                        match org_tree::rebuild_all(
+                            &pool.0,
+                            std::path::Path::new(org_tree::ORG_TREE_ROOT),
+                            false,
+                        )
+                        .await
+                        {
+                            Ok(msg) => log::info!("Заход3 auto-rebuild: {msg}"),
+                            Err(e) => log::warn!("Заход3 auto-rebuild: {e}"),
+                        }
+
                         // ----- BL-P1-016: cleanup orphan post processes from previous crash -----
                         let orphans = commands::post_executor::cleanup_orphan_post_processes().await;
                         if orphans > 0 {
