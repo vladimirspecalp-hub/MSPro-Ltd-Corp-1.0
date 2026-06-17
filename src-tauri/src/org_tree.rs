@@ -131,7 +131,7 @@ pub async fn dedup_slug_in_table(
     base: &str,
     exclude_id: Option<&str>,
 ) -> Result<String, String> {
-    if !matches!(table, "org_divisions" | "org_departments") {
+    if !matches!(table, "org_divisions" | "org_departments" | "org_agents") {
         return Err("invalid table for slug dedup".into());
     }
     for i in 0..100 {
@@ -158,9 +158,23 @@ pub async fn dedup_slug_in_table(
             .await
             .map_err(|e| format!("dedup slug: {e}"))?
         };
-        if exists.is_none() {
-            return Ok(candidate);
+        if exists.is_some() {
+            continue;
         }
+        // org_agents: also reject slugs that collide with posts.slug
+        // (resolve_executor gives posts priority → agent becomes unreachable)
+        if table == "org_agents" {
+            let post_clash: Option<(i64,)> =
+                sqlx::query_as("SELECT 1 FROM posts WHERE slug = ? LIMIT 1")
+                    .bind(&candidate)
+                    .fetch_optional(pool)
+                    .await
+                    .map_err(|e| format!("dedup slug (posts): {e}"))?;
+            if post_clash.is_some() {
+                continue;
+            }
+        }
+        return Ok(candidate);
     }
     Err(format!("cannot deduplicate slug '{base}' in {table}"))
 }
@@ -870,6 +884,28 @@ pub async fn datafix_slugs(pool: &SqlitePool) {
             .execute(pool)
             .await;
         log::info!("datafix: department '{name}' → slug '{final_slug}'");
+    }
+
+    // Agents: transliterate Cyrillic slugs to Latin
+    let agents: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, slug FROM org_agents")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    for (id, slug) in &agents {
+        if slug.is_ascii() {
+            continue;
+        }
+        let base = to_disk_slug(slug);
+        let final_slug = dedup_slug_in_table(pool, "org_agents", &base, Some(id))
+            .await
+            .unwrap_or(base);
+        let _ = sqlx::query("UPDATE org_agents SET slug = ? WHERE id = ?")
+            .bind(&final_slug)
+            .bind(id)
+            .execute(pool)
+            .await;
+        log::info!("datafix: agent slug '{slug}' → '{final_slug}'");
     }
 }
 

@@ -89,8 +89,7 @@ pub async fn resolve_executor(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| format!("у агента '{agent_slug}' нет роли (CLAUDE.md)"))?;
 
-        let safe_slug =
-            sanitize_post_slug(&agent_slug).map_err(|e| format!("slug invalid: {e}"))?;
+        let disk_slug = crate::org_tree::to_disk_slug(&agent_slug);
 
         let model = brain_model_opt
             .as_deref()
@@ -106,7 +105,7 @@ pub async fn resolve_executor(
             system_prompt: system_prompt.to_string(),
             model,
             brain_mode,
-            agent_md_name: format!("mspro-org-{}", safe_slug),
+            agent_md_name: format!("mspro-org-{}", disk_slug),
         });
     }
 
@@ -157,8 +156,7 @@ pub async fn resolve_org_agent_by_id(
         .filter(|s| !s.is_empty())
         .ok_or_else(|| "у агента нет роли (CLAUDE.md)".to_string())?;
 
-    let safe_slug =
-        sanitize_post_slug(&agent_slug).map_err(|e| format!("slug invalid: {e}"))?;
+    let disk_slug = crate::org_tree::to_disk_slug(&agent_slug);
 
     let model = brain_model_opt
         .as_deref()
@@ -174,7 +172,7 @@ pub async fn resolve_org_agent_by_id(
         system_prompt: system_prompt.to_string(),
         model,
         brain_mode,
-        agent_md_name: format!("mspro-org-{}", safe_slug),
+        agent_md_name: format!("mspro-org-{}", disk_slug),
     })
 }
 

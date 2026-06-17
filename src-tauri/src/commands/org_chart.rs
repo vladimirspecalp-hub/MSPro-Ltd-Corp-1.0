@@ -80,33 +80,6 @@ struct DepartmentRow {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Простой slug из имени (для будущего имени папки в Заходе 3). Сохраняет
-/// буквы/цифры (в т.ч. кириллицу через is_alphanumeric), остальное → '-'.
-/// На Заходе 1 это только метаданные — уникальность папок решается в Заходе 3.
-fn make_slug(name: &str) -> String {
-    let lowered = name.trim().to_lowercase();
-    let mut s: String = lowered
-        .chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect();
-    while s.contains("--") {
-        s = s.replace("--", "-");
-    }
-    let s = s.trim_matches('-').to_string();
-    let s: String = s.chars().take(64).collect();
-    if s.is_empty() {
-        "agent".to_string()
-    } else {
-        s
-    }
-}
-
 fn validate_name(name: &str) -> Result<String, String> {
     let t = name.trim();
     if t.is_empty() {
@@ -558,7 +531,8 @@ pub async fn create_agent(
         return Err("отдел-родитель не найден".into());
     }
     let id = format!("agt-{}", uuid::Uuid::new_v4());
-    let slug = make_slug(&name);
+    let slug = org_tree::to_disk_slug(&name);
+    let slug = org_tree::dedup_slug_in_table(&db.0, "org_agents", &slug, None).await?;
     sqlx::query(
         "INSERT INTO org_agents (id, department_id, name, slug, role_label) VALUES (?, ?, ?, ?, ?)",
     )
@@ -593,12 +567,14 @@ pub async fn rename_agent(
     .await
     .ok()
     .flatten();
-    let slug = make_slug(&name);
+    let new_slug = org_tree::to_disk_slug(&name);
+    let new_slug =
+        org_tree::dedup_slug_in_table(&db.0, "org_agents", &new_slug, Some(&id)).await?;
     let rows = sqlx::query(
         "UPDATE org_agents SET name = ?, slug = ?, updated_at = datetime('now') WHERE id = ?",
     )
     .bind(&name)
-    .bind(&slug)
+    .bind(&new_slug)
     .bind(&id)
     .execute(&db.0)
     .await
@@ -608,12 +584,11 @@ pub async fn rename_agent(
         return Err("агент не найден".into());
     }
     if let Some((old_slug, Some(dept_slug), Some(div_slug))) = old_info {
-        let new_disk_slug = org_tree::to_disk_slug(&slug);
         let old_disk_slug = org_tree::to_disk_slug(&old_slug);
-        if old_disk_slug != new_disk_slug {
+        if old_disk_slug != new_slug {
             if let (Ok(old_path), Ok(new_path)) = (
                 org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug, &old_disk_slug]),
-                org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug, &new_disk_slug]),
+                org_tree::safe_org_path(&tree.root, &[&div_slug, &dept_slug, &new_slug]),
             ) {
                 if old_path.exists() && !new_path.exists() {
                     let _ = std::fs::rename(&old_path, &new_path);
@@ -784,10 +759,29 @@ mod tests {
 
     #[test]
     fn slug_basic_and_cyrillic() {
-        assert_eq!(make_slug("Office Manager"), "office-manager");
-        assert_eq!(make_slug("  Юрист!! "), "юрист");
-        assert_eq!(make_slug("a---b"), "a-b");
-        assert_eq!(make_slug("!!!"), "agent");
+        assert_eq!(org_tree::to_disk_slug("Office Manager"), "office-manager");
+        assert_eq!(org_tree::to_disk_slug("  Юрист!! "), "yurist");
+        assert_eq!(org_tree::to_disk_slug("SEO-Специалист"), "seo-spetsialist");
+        assert_eq!(org_tree::to_disk_slug("a---b"), "a-b");
+        assert_eq!(org_tree::to_disk_slug("!!!"), "entity");
+    }
+
+    #[test]
+    fn slug_passes_entity_validation() {
+        use once_cell::sync::Lazy;
+        use regex::Regex;
+        static ENTITY_RE: Lazy<Regex> = Lazy::new(|| {
+            Regex::new(r"^[a-zA-Z0-9](?:[a-zA-Z0-9_\-/:]{0,78}[a-zA-Z0-9])?$").unwrap()
+        });
+
+        let cases = ["Юрист", "SEO-Специалист", "Программист", "Office Manager", "dev-ops"];
+        for name in &cases {
+            let slug = org_tree::to_disk_slug(name);
+            assert!(
+                ENTITY_RE.is_match(&slug),
+                "to_disk_slug({name:?}) = {slug:?} must pass ENTITY_RE"
+            );
+        }
     }
 
     #[test]
@@ -804,6 +798,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dedup_agent_slug_within_table() {
+        use sqlx::SqlitePool;
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE org_agents (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, \
+             name TEXT NOT NULL, slug TEXT NOT NULL, role_label TEXT NOT NULL DEFAULT 'member', \
+             status TEXT NOT NULL DEFAULT 'active', folder_path TEXT, sort_order INTEGER NOT NULL DEFAULT 0, \
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at TEXT); \
+             CREATE TABLE posts (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, \
+             title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', \
+             department_id TEXT NOT NULL DEFAULT 'd1', central_product TEXT NOT NULL DEFAULT '', \
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO org_agents (id, department_id, name, slug) VALUES ('a1', 'd1', 'Юрист', 'yurist')")
+            .execute(&pool).await.unwrap();
+
+        let slug2 = org_tree::dedup_slug_in_table(&pool, "org_agents", "yurist", None)
+            .await
+            .unwrap();
+        assert_eq!(slug2, "yurist-1", "second 'yurist' must get suffix");
+    }
+
+    #[tokio::test]
+    async fn dedup_agent_slug_cross_posts() {
+        use sqlx::SqlitePool;
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE org_agents (id TEXT PRIMARY KEY, department_id TEXT NOT NULL, \
+             name TEXT NOT NULL, slug TEXT NOT NULL, role_label TEXT NOT NULL DEFAULT 'member', \
+             status TEXT NOT NULL DEFAULT 'active', folder_path TEXT, sort_order INTEGER NOT NULL DEFAULT 0, \
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at TEXT); \
+             CREATE TABLE posts (id TEXT PRIMARY KEY, slug TEXT NOT NULL UNIQUE, \
+             title TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', \
+             department_id TEXT NOT NULL DEFAULT 'd1', central_product TEXT NOT NULL DEFAULT '', \
+             created_at DATETIME DEFAULT CURRENT_TIMESTAMP);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query("INSERT INTO posts (id, title, slug) VALUES ('p1', 'Frontend', 'frontend')")
+            .execute(&pool).await.unwrap();
+
+        let slug = org_tree::dedup_slug_in_table(&pool, "org_agents", "frontend", None)
+            .await
+            .unwrap();
+        assert_eq!(slug, "frontend-1", "agent slug must avoid collision with posts.slug");
+    }
+
+    #[tokio::test]
     async fn tree_crud_roundtrip_db_only() {
         use sqlx::SqlitePool;
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
@@ -816,7 +864,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Вставляем: 1 отделение → 1 отдел → 1 агент (вручную, без State).
         sqlx::query("INSERT INTO org_divisions (id, name) VALUES ('d1', 'Продажи')")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO org_departments (id, division_id, name) VALUES ('p1', 'd1', 'Полевые')")
@@ -824,7 +871,6 @@ mod tests {
         sqlx::query("INSERT INTO org_agents (id, department_id, name, slug) VALUES ('a1', 'p1', 'Алекс', 'aleks')")
             .execute(&pool).await.unwrap();
 
-        // Каскад delete отделения убирает отдел и агента (логика delete_division).
         sqlx::query("DELETE FROM org_agents WHERE department_id IN (SELECT id FROM org_departments WHERE division_id = 'd1')")
             .execute(&pool).await.unwrap();
         sqlx::query("DELETE FROM org_departments WHERE division_id = 'd1'").execute(&pool).await.unwrap();
