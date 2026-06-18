@@ -33,6 +33,7 @@ use crate::commands::artifacts;
 use crate::commands::claude_bridge::hide_console;
 use crate::commands::dispatcher;
 use crate::commands::executor_resolver::{resolve_executor, resolve_org_agent_by_id, ExecutorKind, ExecutorSpec};
+use crate::commands::verdict_parser::{self, VerdictStatus};
 use crate::db::WritePool;
 use crate::outbox;
 use crate::settings::{AppSettings, SettingsStore};
@@ -641,6 +642,7 @@ fn tier_for_model(m: &str) -> crate::pal::Tier {
 const MAX_HOP_DEPTH: i32 = 10;
 const MAX_VERIFY_FANOUT: usize = 5;
 const MAX_NEXT_FANOUT: usize = 5;
+const MAX_REWORK: i32 = 3;
 
 async fn count_hop_depth(task_id: &str, db: &WritePool) -> i32 {
     let mut depth = 0i32;
@@ -703,14 +705,22 @@ pub(crate) async fn try_trigger_chains(
             .unwrap_or(None);
     let cur_hop = cur_hop.and_then(|(h,)| h);
     if hop_is_terminal(cur_hop.as_deref()) {
-        log::info!("chain trigger: task {task_id} hop={cur_hop:?} terminal — skip chains");
+        log::info!("chain trigger: task {task_id} hop={cur_hop:?} terminal — rework check");
+        try_trigger_rework(task_id, db, app).await;
         return;
     }
 
     let depth = count_hop_depth(task_id, db).await;
     if depth >= MAX_HOP_DEPTH {
         log::warn!(
-            "chain trigger: task {task_id} depth={depth} >= {MAX_HOP_DEPTH} — skip chains"
+            "chain trigger: task {task_id} depth={depth} >= {MAX_HOP_DEPTH} — escalation"
+        );
+        let _ = app.emit(
+            "rework-escalation",
+            serde_json::json!({
+                "task_id": task_id,
+                "reason": format!("Цепочка достигла максимальной глубины {MAX_HOP_DEPTH}"),
+            }),
         );
         return;
     }
@@ -777,8 +787,11 @@ async fn try_trigger_verify(
     for (_verifier_id, verifier_slug) in verifiers.iter().take(MAX_VERIFY_FANOUT) {
         let verify_prompt = format!(
             "Проверь результат задачи: {task_desc_short}\n\
-             Артефакт(ы): {artifact_list}\n\
-             Вынеси вердикт: ГОДНО или НА ДОРАБОТКУ с обоснованием."
+             Артефакт(ы): {artifact_list}\n\n\
+             Запиши результат в файл verdict.md СТРОГО по формату:\n\
+             - Первая строка: ровно `ВЕРДИКТ: ГОДНО` или `ВЕРДИКТ: БРАК`\n\
+             - Далее — обоснование. При браке: нумерованный список замечаний \
+             (что именно исправить, со ссылками на конкретные места в артефакте)."
         );
 
         let verify_task = dispatcher::dispatch_task_inner_ex(
@@ -812,6 +825,334 @@ async fn try_trigger_verify(
             }
             Err(e) => log::warn!("verify trigger: failed to create task for '{verifier_slug}': {e}"),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ККИ rework loop: verdict parser → rework/accept
+// ---------------------------------------------------------------------------
+
+async fn find_root_prompt(start_task_id: &str, db: &WritePool) -> Option<String> {
+    let mut current = start_task_id.to_string();
+    let mut visited = HashSet::new();
+    visited.insert(current.clone());
+    loop {
+        let row: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT parent_task_id, hop_kind, refined_prompt FROM dispatcher_logs WHERE id = ?",
+        )
+        .bind(&current)
+        .fetch_optional(&db.0)
+        .await
+        .unwrap_or(None);
+
+        match row {
+            Some((parent_opt, hop, prompt)) => {
+                let is_intermediate =
+                    matches!(hop.as_deref(), Some("rework") | Some("verify"));
+                if !is_intermediate {
+                    return prompt;
+                }
+                match parent_opt {
+                    Some(pid) if visited.insert(pid.clone()) => {
+                        current = pid;
+                    }
+                    _ => return prompt,
+                }
+            }
+            None => return None,
+        }
+    }
+}
+
+async fn count_rework_in_chain(start_task_id: &str, db: &WritePool) -> i32 {
+    let mut count = 0i32;
+    let mut current = start_task_id.to_string();
+    let mut visited = HashSet::new();
+    visited.insert(current.clone());
+    loop {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT parent_task_id, hop_kind FROM dispatcher_logs WHERE id = ?")
+                .bind(&current)
+                .fetch_optional(&db.0)
+                .await
+                .unwrap_or(None);
+        match row {
+            Some((parent_opt, hop)) => {
+                if hop.as_deref() == Some("rework") {
+                    count += 1;
+                }
+                match parent_opt {
+                    Some(pid) if visited.insert(pid.clone()) => {
+                        current = pid;
+                    }
+                    _ => break,
+                }
+            }
+            None => break,
+        }
+    }
+    count
+}
+
+async fn try_trigger_rework(
+    verify_task_id: &str,
+    db: &WritePool,
+    app: &AppHandle,
+) {
+    // 1. Find parent (executor) task of this verify-hop.
+    let verify_row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT parent_task_id FROM dispatcher_logs WHERE id = ?")
+            .bind(verify_task_id)
+            .fetch_optional(&db.0)
+            .await
+            .unwrap_or(None);
+
+    let Some((Some(executor_task_id),)) = verify_row else {
+        log::warn!("rework trigger: verify {verify_task_id} has no parent — skip");
+        return;
+    };
+
+    let exec_row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT to_entity, refined_prompt FROM dispatcher_logs WHERE id = ?")
+            .bind(&executor_task_id)
+            .fetch_optional(&db.0)
+            .await
+            .unwrap_or(None);
+
+    let Some((executor_slug, orig_prompt_opt)) = exec_row else {
+        log::warn!("rework trigger: executor task {executor_task_id} not found — skip");
+        return;
+    };
+
+    // 2. Read verdict.md from verify-task outbox.
+    let vault = match app.try_state::<VaultState>() {
+        Some(s) => s.inner().clone(),
+        None => {
+            log::error!("rework trigger: VaultState not available — skip");
+            return;
+        }
+    };
+
+    let verdict_path = match crate::outbox::task_outbox_dir(&vault.root, verify_task_id) {
+        Ok(dir) => dir.join("verdict.md"),
+        Err(e) => {
+            log::warn!("rework trigger: outbox dir for {verify_task_id}: {e} — treating as uncertain");
+            let _ = app.emit(
+                "rework-verdict",
+                serde_json::json!({
+                    "task_id": executor_task_id,
+                    "verdict": "uncertain",
+                    "verify_task_id": verify_task_id,
+                    "reason": format!("outbox dir не найден: {e}"),
+                }),
+            );
+            return;
+        }
+    };
+
+    let content = match std::fs::read_to_string(&verdict_path) {
+        Ok(c) => c,
+        Err(e) => {
+            log::warn!(
+                "rework trigger: read {}: {e} — treating as uncertain",
+                verdict_path.display()
+            );
+            let _ = app.emit(
+                "rework-verdict",
+                serde_json::json!({
+                    "task_id": executor_task_id,
+                    "verdict": "uncertain",
+                    "verify_task_id": verify_task_id,
+                    "reason": format!("verdict.md не найден: {e}"),
+                }),
+            );
+            return;
+        }
+    };
+
+    // 3. Parse verdict.
+    let verdict = verdict_parser::parse_verdict(&content);
+    log::info!(
+        "rework trigger: verify {verify_task_id} → {} (reasons {} chars)",
+        verdict.status,
+        verdict.reasons.len()
+    );
+
+    match verdict.status {
+        VerdictStatus::Pass => {
+            // ГОДНО → approve executor's artifacts.
+            let arts: Vec<(String,)> = sqlx::query_as(
+                "SELECT id FROM task_artifacts \
+                 WHERE task_id = ? AND approved_at IS NULL AND rejected_at IS NULL",
+            )
+            .bind(&executor_task_id)
+            .fetch_all(&db.0)
+            .await
+            .unwrap_or_default();
+
+            for (art_id,) in &arts {
+                let _ = sqlx::query(
+                    "UPDATE task_artifacts SET approved_at = CURRENT_TIMESTAMP WHERE id = ?",
+                )
+                .bind(art_id)
+                .execute(&db.0)
+                .await;
+            }
+
+            log::info!(
+                "rework trigger: PASS — approved {} artifacts for task {executor_task_id}",
+                arts.len()
+            );
+            let _ = app.emit(
+                "rework-verdict",
+                serde_json::json!({
+                    "task_id": executor_task_id,
+                    "verdict": "pass",
+                    "artifacts_approved": arts.len(),
+                }),
+            );
+        }
+
+        VerdictStatus::Fail => {
+            // БРАК → check rework limit, then create rework task.
+            let rework_count = count_rework_in_chain(&executor_task_id, db).await;
+            if rework_count >= MAX_REWORK {
+                let reason = format!(
+                    "Исчерпаны попытки доработки ({}/{}). Замечания контролёра: {}",
+                    rework_count,
+                    MAX_REWORK,
+                    truncate_str(&verdict.reasons, 300)
+                );
+                log::warn!(
+                    "rework trigger: FAIL but rework_count={rework_count} >= {MAX_REWORK} — escalation"
+                );
+                let _ = sqlx::query(
+                    "UPDATE dispatcher_logs SET status = 'failed', error_msg = ? WHERE id = ?",
+                )
+                .bind(&reason)
+                .bind(&executor_task_id)
+                .execute(&db.0)
+                .await;
+                let _ = app.emit(
+                    "rework-escalation",
+                    serde_json::json!({
+                        "task_id": executor_task_id,
+                        "rework_count": rework_count,
+                        "reason": &reason,
+                    }),
+                );
+                return;
+            }
+
+            // Reject executor's pending artifacts.
+            let reject_reason = if verdict.reasons.is_empty() {
+                "Вердикт БРАК без подробностей".to_string()
+            } else {
+                truncate_str(&verdict.reasons, 500).to_string()
+            };
+            let _ = sqlx::query(
+                "UPDATE task_artifacts \
+                 SET rejected_at = CURRENT_TIMESTAMP, reject_reason = ? \
+                 WHERE task_id = ? AND approved_at IS NULL AND rejected_at IS NULL",
+            )
+            .bind(&reject_reason)
+            .bind(&executor_task_id)
+            .execute(&db.0)
+            .await;
+
+            // Build rework prompt — walk chain to find original (non-rework) description.
+            let root_desc = find_root_prompt(&executor_task_id, db).await;
+            let orig_desc = root_desc
+                .as_deref()
+                .or(orig_prompt_opt.as_deref())
+                .unwrap_or("(описание недоступно)");
+            let rework_prompt = format!(
+                "ДОРАБОТКА.\n\
+                 Исходное ТЗ: {orig_desc}\n\n\
+                 Контролёр забраковал результат. Замечания:\n{}\n\n\
+                 Исправь указанные проблемы. Выдай исправленный артефакт.",
+                if verdict.reasons.is_empty() {
+                    "Без подробностей."
+                } else {
+                    &verdict.reasons
+                }
+            );
+
+            // Resolve expected_artifact from executor's artifacts.
+            let expected: Option<(String,)> = sqlx::query_as(
+                "SELECT rel_path FROM task_artifacts \
+                 WHERE task_id = ? ORDER BY created_at ASC LIMIT 1",
+            )
+            .bind(&executor_task_id)
+            .fetch_optional(&db.0)
+            .await
+            .unwrap_or(None);
+            let expected_artifact = expected.map(|(p,)| p);
+
+            let rework_task = dispatcher::dispatch_task_inner_ex(
+                "dispatcher".to_string(),
+                executor_slug.clone(),
+                serde_json::json!({
+                    "raw_prompt": &rework_prompt,
+                    "rework_of": &executor_task_id,
+                    "verify_task": verify_task_id,
+                }),
+                dispatcher::DispatchExtras {
+                    parent_task_id: Some(executor_task_id.clone()),
+                    hop_kind: Some("rework".to_string()),
+                    routed_by_model: None,
+                    refined_prompt: Some(rework_prompt.clone()),
+                },
+                db,
+                app,
+            )
+            .await;
+
+            match rework_task {
+                Ok(task) => {
+                    log::info!(
+                        "rework trigger: FAIL — created rework {} for '{}' (parent {executor_task_id}, attempt {})",
+                        task.id,
+                        executor_slug,
+                        rework_count + 1
+                    );
+                    trigger_post_executor(
+                        task.id,
+                        executor_slug,
+                        rework_prompt,
+                        expected_artifact,
+                        app.clone(),
+                    );
+                }
+                Err(e) => log::warn!("rework trigger: failed to create task: {e}"),
+            }
+        }
+
+        VerdictStatus::Uncertain => {
+            log::warn!(
+                "rework trigger: verify {verify_task_id} — uncertain verdict, leaving for manual review"
+            );
+            let _ = app.emit(
+                "rework-verdict",
+                serde_json::json!({
+                    "task_id": executor_task_id,
+                    "verdict": "uncertain",
+                    "verify_task_id": verify_task_id,
+                }),
+            );
+        }
+    }
+}
+
+fn truncate_str(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        s
+    } else {
+        let mut end = max;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        &s[..end]
     }
 }
 
@@ -1428,5 +1769,89 @@ mod tests {
         // Лимиты fan-out защищают от burst параллельных запусков (Cursor medium fix).
         assert!((1..=20).contains(&super::MAX_VERIFY_FANOUT));
         assert!((1..=20).contains(&super::MAX_NEXT_FANOUT));
+    }
+
+    // ── ККИ rework loop tests ────────────────────────────────────────
+
+    #[test]
+    fn rework_hop_is_not_terminal() {
+        assert!(
+            !super::hop_is_terminal(Some("rework")),
+            "rework НЕ терминальный — после него должен запуститься verify"
+        );
+    }
+
+    #[test]
+    fn max_rework_is_sane() {
+        assert!(
+            (2..=5).contains(&super::MAX_REWORK),
+            "MAX_REWORK должен быть 2-5 (задача говорит 2-3)"
+        );
+    }
+
+    #[tokio::test]
+    async fn count_rework_zero_for_non_rework_chain() {
+        let db = setup_chain_db().await;
+        sqlx::query(
+            "INSERT INTO dispatcher_logs (id, from_entity, to_entity, parent_task_id, hop_kind) VALUES \
+             ('t1', 'owner', 'agent-a', NULL, 'refined'), \
+             ('v1', 'agent-a', 'verifier', 't1', 'verify')",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        assert_eq!(super::count_rework_in_chain("t1", &db).await, 0);
+        assert_eq!(super::count_rework_in_chain("v1", &db).await, 0);
+    }
+
+    #[tokio::test]
+    async fn count_rework_counts_rework_hops() {
+        let db = setup_chain_db().await;
+        sqlx::query(
+            "INSERT INTO dispatcher_logs (id, from_entity, to_entity, parent_task_id, hop_kind) VALUES \
+             ('t1', 'owner', 'agent-a', NULL, 'refined'), \
+             ('r1', 'dispatcher', 'agent-a', 't1', 'rework'), \
+             ('r2', 'dispatcher', 'agent-a', 'r1', 'rework'), \
+             ('r3', 'dispatcher', 'agent-a', 'r2', 'rework')",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        assert_eq!(super::count_rework_in_chain("t1", &db).await, 0);
+        assert_eq!(super::count_rework_in_chain("r1", &db).await, 1);
+        assert_eq!(super::count_rework_in_chain("r2", &db).await, 2);
+        assert_eq!(super::count_rework_in_chain("r3", &db).await, 3);
+    }
+
+    #[tokio::test]
+    async fn count_rework_handles_cycle() {
+        let db = setup_chain_db().await;
+        sqlx::query(
+            "INSERT INTO dispatcher_logs (id, from_entity, to_entity, parent_task_id, hop_kind) VALUES \
+             ('c1', 'a', 'b', 'c2', 'rework'), \
+             ('c2', 'b', 'a', 'c1', 'rework')",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        let count = super::count_rework_in_chain("c1", &db).await;
+        assert!(count <= 2, "cycle should not cause infinite loop");
+    }
+
+    #[test]
+    fn truncate_str_ascii() {
+        assert_eq!(super::truncate_str("hello", 10), "hello");
+        assert_eq!(super::truncate_str("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_str_utf8_boundary() {
+        let s = "Привет мир";
+        let truncated = super::truncate_str(s, 8);
+        assert!(truncated.len() <= 8);
+        assert!(truncated.is_char_boundary(truncated.len()));
     }
 }
