@@ -1,7 +1,7 @@
 //! Единый резолвер исполнителя — определяет «кто и как» будет выполнять задачу.
 //!
-//! Виток 1 MVP: resolve_executor ищет сначала в posts, потом в org_agents.
-//! Post имеет приоритет при коллизии slug'ов.
+//! Phase B: resolve_executor ищет сначала в org_agents, потом fallback в posts.
+//! OrgAgent имеет приоритет при коллизии slug'ов.
 
 use serde::Serialize;
 
@@ -26,13 +26,50 @@ pub struct ExecutorSpec {
     pub agent_md_name: String,
 }
 
-/// Резолвит исполнителя по slug: сначала posts, потом org_agents (active).
+/// Резолвит исполнителя по slug: сначала org_agents (primary), потом posts (legacy fallback).
 pub async fn resolve_executor(
     db: &WritePool,
     slug: &str,
     settings: &AppSettings,
 ) -> Result<ExecutorSpec, String> {
-    // 1. posts WHERE slug = ? AND status = 'active'
+    // 1. org_agents WHERE slug = ? AND status = 'active' (PRIMARY)
+    let agent_row: Option<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+        "SELECT id, slug, role_prompt_md, brain_model, brain_mode \
+         FROM org_agents WHERE slug = ? AND status = 'active'",
+    )
+    .bind(slug)
+    .fetch_optional(&db.0)
+    .await
+    .map_err(|e| format!("org_agents lookup: {e}"))?;
+
+    if let Some((agent_id, agent_slug, role_prompt_opt, brain_model_opt, brain_mode)) = agent_row {
+        let system_prompt = role_prompt_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("у агента '{agent_slug}' нет роли (CLAUDE.md)"))?;
+
+        let disk_slug = crate::org_tree::to_disk_slug(&agent_slug);
+
+        let model = brain_model_opt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| settings.claude_cli_model.clone());
+
+        return Ok(ExecutorSpec {
+            slug: agent_slug,
+            kind: ExecutorKind::OrgAgent,
+            entity_id: agent_id,
+            system_prompt: system_prompt.to_string(),
+            model,
+            brain_mode,
+            agent_md_name: format!("mspro-org-{}", disk_slug),
+        });
+    }
+
+    // 2. posts WHERE slug = ? AND status = 'active' (LEGACY FALLBACK)
     let post_row: Option<(String, String, Option<String>, Option<String>)> =
         sqlx::query_as("SELECT id, slug, system_prompt_md, preferred_model FROM posts WHERE slug = ? AND status = 'active'")
             .bind(slug)
@@ -69,43 +106,6 @@ pub async fn resolve_executor(
             model,
             brain_mode: "claude_cli".to_string(),
             agent_md_name: format!("mspro-{}", safe_slug),
-        });
-    }
-
-    // 2. org_agents WHERE slug = ? AND status = 'active'
-    let agent_row: Option<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, slug, role_prompt_md, brain_model, brain_mode \
-         FROM org_agents WHERE slug = ? AND status = 'active'",
-    )
-    .bind(slug)
-    .fetch_optional(&db.0)
-    .await
-    .map_err(|e| format!("org_agents lookup: {e}"))?;
-
-    if let Some((agent_id, agent_slug, role_prompt_opt, brain_model_opt, brain_mode)) = agent_row {
-        let system_prompt = role_prompt_opt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| format!("у агента '{agent_slug}' нет роли (CLAUDE.md)"))?;
-
-        let disk_slug = crate::org_tree::to_disk_slug(&agent_slug);
-
-        let model = brain_model_opt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| settings.claude_cli_model.clone());
-
-        return Ok(ExecutorSpec {
-            slug: agent_slug,
-            kind: ExecutorKind::OrgAgent,
-            entity_id: agent_id,
-            system_prompt: system_prompt.to_string(),
-            model,
-            brain_mode,
-            agent_md_name: format!("mspro-org-{}", disk_slug),
         });
     }
 
@@ -313,7 +313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_post_preferred_over_org_agent() {
+    async fn resolve_org_agent_preferred_over_post() {
         let db = setup_db().await;
         sqlx::query(
             "INSERT INTO posts (id, title, slug, system_prompt_md) \
@@ -336,9 +336,27 @@ mod tests {
             .unwrap();
         assert_eq!(
             spec.kind,
-            ExecutorKind::Post,
-            "post should take priority over org_agent"
+            ExecutorKind::OrgAgent,
+            "org_agent should take priority over post (Phase B)"
         );
+    }
+
+    #[tokio::test]
+    async fn resolve_post_fallback_when_no_org_agent() {
+        let db = setup_db().await;
+        sqlx::query(
+            "INSERT INTO posts (id, title, slug, system_prompt_md, preferred_model) \
+             VALUES ('p1', 'Frontend', 'frontend', 'You are frontend dev', 'opus')",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        let spec = resolve_executor(&db, "frontend", &AppSettings::default())
+            .await
+            .unwrap();
+        assert_eq!(spec.kind, ExecutorKind::Post, "post resolves as legacy fallback");
+        assert_eq!(spec.slug, "frontend");
     }
 
     #[tokio::test]

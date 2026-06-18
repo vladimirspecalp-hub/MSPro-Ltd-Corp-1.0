@@ -100,36 +100,13 @@ pub async fn build_ceo_system_prompt(
     let mut sb = String::new();
     sb.push_str(
         "# Ты — Гендир (CEO) AI-компании MSPro-Ltd Corp.\n\n\
-         ⚠️ ОСНОВНАЯ структура компании — ОРГСХЕМА (org_agents), см. раздел «ОРГСХЕМА» ниже. \
-         Для НОВЫХ отделений/отделов/агентов используй org-building инструменты \
-         (create_org_division / create_org_department / create_org_agent / set_agent_card / link_agents), \
-         а НЕ create_post. Раздел departments/posts ниже — LEGACY (исторические посты), \
-         в нём ничего нового не создавай.\n\n\
-         Текущая оргструктура (LEGACY — departments/posts):\n\n",
+         ⚠️ ОСНОВНАЯ структура компании — ОРГСХЕМА (org_agents). \
+         Для НОВЫХ отделений/отделов/агентов используй ТОЛЬКО org-building инструменты \
+         (create_org_division / create_org_department / create_org_agent / set_agent_card / link_agents). \
+         create_post / update_post / archive_post — DEPRECATED, не используй для создания нового.\n\n",
     );
-    for d in &depts {
-        sb.push_str(&format!("## {} — {}\n", d.dept_number, d.name));
-        if let Some(desc) = &d.description {
-            sb.push_str(&format!("_{desc}_\n"));
-        }
-        let dept_posts: Vec<&PostRow> =
-            posts.iter().filter(|p| p.department_id == d.id).collect();
-        if dept_posts.is_empty() {
-            sb.push_str("Постов пока нет.\n\n");
-        } else {
-            for p in dept_posts {
-                sb.push_str(&format!(
-                    "- **{}** (slug: `{}`) — ЦКП: {}\n",
-                    p.title, p.slug, p.central_product
-                ));
-                if let Some(m) = &p.main_statistic_metric {
-                    sb.push_str(&format!("  Главная метрика: `{m}`\n"));
-                }
-            }
-            sb.push('\n');
-        }
-    }
-    // --- ОРГСХЕМА (org_agents) — основная структура компании ---
+
+    // --- ОРГСХЕМА (org_agents) — ОСНОВНАЯ структура компании (ПЕРВЫЙ блок) ---
     {
         let org_divs: Vec<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, name, description FROM org_divisions ORDER BY sort_order ASC, name ASC",
@@ -161,7 +138,7 @@ pub async fn build_ceo_system_prompt(
         .unwrap_or_default();
 
         if !org_divs.is_empty() || !org_agents.is_empty() {
-            sb.push_str("\n## ОРГСХЕМА (org_agents — основная структура компании)\n\n");
+            sb.push_str("## ОРГСХЕМА (org_agents — основная структура компании)\n\n");
             sb.push_str("Для создания/настройки используй `create_org_division`, `create_org_department`, `create_org_agent`, `set_agent_card`, `link_agents`.\n\n");
 
             for (div_id, div_name, div_desc) in &org_divs {
@@ -218,9 +195,35 @@ pub async fn build_ceo_system_prompt(
         }
     }
 
-    // --- Legacy: Текущие Посты (posts) ---
-    // Посты (posts) — устаревшая структура, сохраняется для обратной совместимости.
-    // Для новой структуры используй org_agents (ОРГСХЕМА выше).
+    // --- LEGACY: departments/posts (read-only, историческое наследие) ---
+    sb.push_str(
+        "## LEGACY — departments/posts (read-only)\n\n\
+         ⛔ Посты (posts) — устаревшая структура. НЕ создавай новых постов, НЕ используй create_post. \
+         Эти посты сохранены для обратной совместимости и продолжают исполнять задачи как fallback. \
+         Для нового — используй ОРГСХЕМУ выше.\n\n",
+    );
+    for d in &depts {
+        sb.push_str(&format!("## {} — {}\n", d.dept_number, d.name));
+        if let Some(desc) = &d.description {
+            sb.push_str(&format!("_{desc}_\n"));
+        }
+        let dept_posts: Vec<&PostRow> =
+            posts.iter().filter(|p| p.department_id == d.id).collect();
+        if dept_posts.is_empty() {
+            sb.push_str("Постов пока нет.\n\n");
+        } else {
+            for p in dept_posts {
+                sb.push_str(&format!(
+                    "- **{}** (slug: `{}`) — ЦКП: {}\n",
+                    p.title, p.slug, p.central_product
+                ));
+                if let Some(m) = &p.main_statistic_metric {
+                    sb.push_str(&format!("  Главная метрика: `{m}`\n"));
+                }
+            }
+            sb.push('\n');
+        }
+    }
 
     // --- Step 6: HMT-engine — текущие Состояния постов ---
     let conditions = crate::commands::hmt::list_recent_conditions_inner(&db.0).await?;

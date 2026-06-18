@@ -161,8 +161,9 @@ pub async fn dedup_slug_in_table(
         if exists.is_some() {
             continue;
         }
-        // org_agents: also reject slugs that collide with posts.slug
-        // (resolve_executor gives posts priority → agent becomes unreachable)
+        // org_agents: also reject slugs that collide with posts.slug —
+        // избегаем двойного slug в {posts ∪ org_agents}, чтобы resolve_executor
+        // не путал legacy-пост и агента (после Фазы B приоритет у org_agent).
         if table == "org_agents" {
             let post_clash: Option<(i64,)> =
                 sqlx::query_as("SELECT 1 FROM posts WHERE slug = ? LIMIT 1")

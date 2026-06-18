@@ -118,29 +118,29 @@ pub async fn build_dispatcher_prompt(
     .await
     .unwrap_or_default();
 
-    let post_slugs: std::collections::HashSet<&str> =
-        posts.iter().map(|(s, _, _)| s.as_str()).collect();
+    let agent_slugs: std::collections::HashSet<&str> =
+        org_agents.iter().map(|(s, _, _)| s.as_str()).collect();
 
     let executors_block = if posts.is_empty() && org_agents.is_empty() {
         "(нет активных исполнителей)".to_string()
     } else {
         let mut s = String::new();
-        for (slug, title, cp) in &posts {
-            s.push_str(&format!(
-                "- `{slug}` [пост] — {title}{}\n",
-                cp.as_deref()
-                    .map(|c| format!(" (ЦКП: {c})"))
-                    .unwrap_or_default()
-            ));
-        }
         for (slug, name, ckp) in &org_agents {
-            if post_slugs.contains(slug.as_str()) {
-                continue;
-            }
             s.push_str(&format!(
                 "- `{slug}` [агент оргструктуры] — {name}{}\n",
                 ckp.as_deref()
                     .filter(|c| !c.trim().is_empty())
+                    .map(|c| format!(" (ЦКП: {c})"))
+                    .unwrap_or_default()
+            ));
+        }
+        for (slug, title, cp) in &posts {
+            if agent_slugs.contains(slug.as_str()) {
+                continue;
+            }
+            s.push_str(&format!(
+                "- `{slug}` [LEGACY пост] — {title}{}\n",
+                cp.as_deref()
                     .map(|c| format!(" (ЦКП: {c})"))
                     .unwrap_or_default()
             ));
