@@ -2413,7 +2413,7 @@ dependencies = [
 
 [[package]]
 name = "mspro-ltd-corp"
-version = "1.0.43"
+version = "1.0.44"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
