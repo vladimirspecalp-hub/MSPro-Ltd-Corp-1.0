@@ -99,14 +99,6 @@ pub async fn build_dispatcher_prompt(
     let target_hint = payload.get("target_hint").and_then(Value::as_str);
     let expected_artifact = payload.get("expected_artifact").and_then(Value::as_str);
 
-    // Подгружаем список постов (для list of valid target_slugs).
-    let posts: Vec<(String, String, Option<String>)> = sqlx::query_as(
-        "SELECT slug, title, central_product FROM posts WHERE status='active' ORDER BY slug",
-    )
-    .fetch_all(&db.0)
-    .await
-    .unwrap_or_default();
-
     // Org-агенты готовые к исполнению (claude_cli + role_prompt_md заполнен).
     let org_agents: Vec<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT slug, name, ckp_text FROM org_agents \
@@ -118,29 +110,15 @@ pub async fn build_dispatcher_prompt(
     .await
     .unwrap_or_default();
 
-    let agent_slugs: std::collections::HashSet<&str> =
-        org_agents.iter().map(|(s, _, _)| s.as_str()).collect();
-
-    let executors_block = if posts.is_empty() && org_agents.is_empty() {
+    let executors_block = if org_agents.is_empty() {
         "(нет активных исполнителей)".to_string()
     } else {
         let mut s = String::new();
         for (slug, name, ckp) in &org_agents {
             s.push_str(&format!(
-                "- `{slug}` [агент оргструктуры] — {name}{}\n",
+                "- `{slug}` — {name}{}\n",
                 ckp.as_deref()
                     .filter(|c| !c.trim().is_empty())
-                    .map(|c| format!(" (ЦКП: {c})"))
-                    .unwrap_or_default()
-            ));
-        }
-        for (slug, title, cp) in &posts {
-            if agent_slugs.contains(slug.as_str()) {
-                continue;
-            }
-            s.push_str(&format!(
-                "- `{slug}` [LEGACY пост] — {title}{}\n",
-                cp.as_deref()
                     .map(|c| format!(" (ЦКП: {c})"))
                     .unwrap_or_default()
             ));
@@ -191,6 +169,7 @@ pub async fn build_dispatcher_prompt(
     Ok((system_prompt, user_prompt))
 }
 
+// posts ретайрятся в витке 1: после retire эти пути возвращают пусто. Полное удаление posts-runtime + posts.rs CRUD + фронт — виток 2.
 async fn load_post_knowledge_block(slug: &str, db: &WritePool, app: &AppHandle) -> String {
     let row: Option<(String, Option<String>)> =
         sqlx::query_as("SELECT title, system_prompt_md FROM posts WHERE slug = ?")
@@ -654,6 +633,7 @@ async fn execute_forward(
                     .as_ref()
                     .and_then(|v| v.get("raw_prompt").and_then(Value::as_str).map(str::to_string))
                     .unwrap_or_default();
+                // posts ретайрятся в витке 1: после retire эта выборка возвращает 0 строк. Полное удаление posts-runtime — виток 2.
                 let mut slugs: Vec<String> =
                     sqlx::query_as::<_, (String,)>("SELECT slug FROM posts WHERE status = 'active'")
                         .fetch_all(&db.0)
@@ -1046,15 +1026,34 @@ mod tests {
 
     #[test]
     fn raw_brain_response_routes_through_redaction() {
-        // Сторож (Срез 2 + Cursor BLOCK): канал raw_brain_response НЕ должен писать
-        // сырой ответ мимо redact. Старый код кэпал char-ами без маскировки — регресс
-        // к голому char-капу = дыра. Паттерн собран из частей, чтобы тест не сматчил
-        // сам себя (урок legacy-door source-guard).
         let src = include_str!("dispatcher_brain.rs");
         let forbidden = concat!("chars().", "take(64");
         assert!(
             !src.contains(forbidden),
             "save_raw_brain_response must route raw via run_logger::prepare_sensitive_log, not a raw char-cap"
+        );
+    }
+
+    // Виток 1: acceptance 2b — dispatcher prompt builds executors only from org_agents.
+    // Patterns assembled from parts to avoid self-matching.
+    #[test]
+    fn dispatcher_prompt_no_posts_query() {
+        let src = include_str!("dispatcher_brain.rs");
+        let fn_start = src.find("pub async fn build_dispatcher_prompt").unwrap();
+        let fn_body = &src[fn_start..];
+        let fn_end = fn_body.find("\nasync fn load_post_knowledge")
+            .or_else(|| fn_body.find("\npub async fn process_pending"))
+            .unwrap_or(fn_body.len());
+        let fn_text = &fn_body[..fn_end];
+        let posts_query = concat!("FROM ", "posts");
+        assert!(
+            !fn_text.contains(posts_query),
+            "build_dispatcher_prompt must not query posts table for executor list"
+        );
+        let legacy_marker = concat!("LEGACY", " пост");
+        assert!(
+            !fn_text.contains(legacy_marker),
+            "build_dispatcher_prompt must not reference LEGACY posts in executor list"
         );
     }
 }

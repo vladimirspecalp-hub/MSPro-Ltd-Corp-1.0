@@ -768,6 +768,10 @@ CREATE TABLE IF NOT EXISTS org_disk_sync ( \
                         // Data-fix: transliterate existing names → ASCII slugs
                         org_tree::datafix_slugs(&pool.0).await;
 
+                        // Свод posts → org_agents (Виток 1): retire all posts data.
+                        // Idempotent DELETE — таблицу оставляем пустой оболочкой.
+                        retire_posts(&pool.0).await;
+
                         // Заход 3 (закрытие хвоста): авто-материализация дерева на диск.
                         // До-синкает агентов, созданных ДО появления диска (folder_path=NULL,
                         // org_disk_sync пуст). Идемпотентно: force=false уважает ручные правки
@@ -936,6 +940,30 @@ CREATE TABLE IF NOT EXISTS org_disk_sync ( \
         ])
         .run(tauri::generate_context!())
         .expect("error while running MSPro-Ltd Corp");
+}
+
+/// Свод posts → org_agents (Виток 1): удаляет FK-детей перед posts,
+/// чтобы `DELETE FROM posts` не упал на foreign_keys=ON.
+/// Каждый DELETE best-effort (ошибка → warn, старт не падает), идемпотентно.
+pub(crate) async fn retire_posts(pool: &sqlx::SqlitePool) {
+    let tables = ["statistics", "condition_logs", "agents", "posts"];
+    let mut total_posts_deleted: u64 = 0;
+    for table in tables {
+        let sql = format!("DELETE FROM {table}");
+        match sqlx::raw_sql(&sql).execute(pool).await {
+            Ok(r) if r.rows_affected() > 0 => {
+                log::info!("retire_posts: deleted {} rows from {table}", r.rows_affected());
+                if table == "posts" {
+                    total_posts_deleted = r.rows_affected();
+                }
+            }
+            Ok(_) => { /* already empty — idempotent */ }
+            Err(e) => log::warn!("retire_posts: {table}: {e}"),
+        }
+    }
+    if total_posts_deleted > 0 {
+        log::info!("retire_posts: total {total_posts_deleted} posts retired");
+    }
 }
 
 #[cfg(test)]
@@ -1109,5 +1137,79 @@ PRAGMA foreign_keys=ON;";
         let art_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM task_artifacts")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(art_count.0, 1);
+    }
+
+    /// Виток 1 FIX: retire_posts удаляет FK-детей (statistics, condition_logs,
+    /// agents) ПЕРЕД posts, чтобы DELETE FROM posts не падал с FK-violation
+    /// при foreign_keys=ON. На старой версии (голый DELETE FROM posts) этот
+    /// тест упадёт.
+    #[tokio::test]
+    async fn retire_posts_with_child_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::query("PRAGMA foreign_keys=ON").execute(&pool).await.unwrap();
+
+        sqlx::raw_sql("\
+            CREATE TABLE posts ( \
+                id TEXT PRIMARY KEY, \
+                department_id TEXT NOT NULL DEFAULT 'd1', \
+                slug TEXT NOT NULL, \
+                title TEXT NOT NULL, \
+                status TEXT NOT NULL DEFAULT 'active', \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP \
+            ); \
+            CREATE TABLE agents ( \
+                id TEXT PRIMARY KEY, \
+                post_id TEXT NOT NULL, \
+                name TEXT NOT NULL, \
+                FOREIGN KEY (post_id) REFERENCES posts(id) \
+            ); \
+            CREATE TABLE statistics ( \
+                id TEXT PRIMARY KEY, \
+                post_id TEXT NOT NULL, \
+                value REAL NOT NULL, \
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                FOREIGN KEY (post_id) REFERENCES posts(id) \
+            ); \
+            CREATE TABLE condition_logs ( \
+                id TEXT PRIMARY KEY, \
+                post_id TEXT NOT NULL, \
+                condition TEXT NOT NULL, \
+                assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP, \
+                FOREIGN KEY (post_id) REFERENCES posts(id) \
+            );")
+            .execute(&pool).await.unwrap();
+
+        // Seed 1 post + 1 child row in each FK table
+        sqlx::raw_sql("\
+            INSERT INTO posts(id, slug, title) VALUES ('p1','manager','Manager'); \
+            INSERT INTO agents(id, post_id, name) VALUES ('a1','p1','Agent 1'); \
+            INSERT INTO statistics(id, post_id, value) VALUES ('s1','p1', 42.0); \
+            INSERT INTO condition_logs(id, post_id, condition) VALUES ('cl1','p1','Normal');")
+            .execute(&pool).await.unwrap();
+
+        // Confirm FK is ON
+        let fk: (i64,) = sqlx::query_as("PRAGMA foreign_keys")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(fk.0, 1, "FK must be ON");
+
+        // retire_posts must NOT panic/error even with FK children present
+        retire_posts(&pool).await;
+
+        // All tables must be empty
+        let posts_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM posts")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(posts_count.0, 0, "posts must be empty after retire");
+
+        let stats_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM statistics")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(stats_count.0, 0, "statistics must be empty after retire");
+
+        let cond_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM condition_logs")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(cond_count.0, 0, "condition_logs must be empty after retire");
+
+        let agents_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agents")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(agents_count.0, 0, "agents must be empty after retire");
     }
 }

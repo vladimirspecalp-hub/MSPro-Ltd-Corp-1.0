@@ -48,6 +48,9 @@ __pycache__/
 *.pyc
 .venv/
 
+# Dev-conveyor verification scratch (OTK file-contract, not tracked)
+VERIFY_INBOX/
+
 
 # Iteration B local CI logs (not tracked)
 build.log

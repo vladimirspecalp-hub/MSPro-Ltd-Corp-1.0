@@ -11,7 +11,6 @@
 //!      переключаемся на Qwen, в чате появляется ⚠️ системная плашка.
 //!   5. Intercept tool_calls (Шаг 7.3 + 9) — atomic SQLite ops + ⚡ плашки.
 
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -53,57 +52,19 @@ pub struct ChatMessageOut {
     pub spawned_task_id: Option<String>,
 }
 
-#[derive(Debug, Serialize, FromRow)]
-struct DepartmentRow {
-    id: String,
-    dept_number: i64,
-    name: String,
-    description: Option<String>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-struct PostRow {
-    department_id: String,
-    slug: String,
-    title: String,
-    central_product: String,
-    main_statistic_metric: Option<String>,
-}
-
-/// Builds the system prompt the CEO sees on every turn. The body lists all
-/// departments and the posts within them so Hermes can reason about the
-/// company by name without external lookups. Also injects:
-///  - HMT-engine: текущие Состояния постов (Step 6)
-///  - Vault: накопленный опыт компании из файловой памяти (Step 7 Этап 1)
+/// Builds the system prompt the CEO sees on every turn. The body lists
+/// the org-chart (org_agents) so Hermes can reason about the company.
+/// Also injects Vault context and tool-calling preamble.
 pub async fn build_ceo_system_prompt(
     db: &WritePool,
     app: &AppHandle,
 ) -> Result<String, String> {
-    let depts: Vec<DepartmentRow> = sqlx::query_as(
-        "SELECT id, dept_number, name, description
-         FROM departments
-         ORDER BY dept_number ASC",
-    )
-    .fetch_all(&db.0)
-    .await
-    .map_err(|e| format!("load departments: {e}"))?;
-
-    let posts: Vec<PostRow> = sqlx::query_as(
-        "SELECT department_id, slug, title, central_product, main_statistic_metric
-         FROM posts
-         ORDER BY department_id, created_at ASC",
-    )
-    .fetch_all(&db.0)
-    .await
-    .map_err(|e| format!("load posts: {e}"))?;
-
     let mut sb = String::new();
     sb.push_str(
         "# Ты — Гендир (CEO) AI-компании MSPro-Ltd Corp.\n\n\
-         ⚠️ ОСНОВНАЯ структура компании — ОРГСХЕМА (org_agents). \
-         Для НОВЫХ отделений/отделов/агентов используй ТОЛЬКО org-building инструменты \
-         (create_org_division / create_org_department / create_org_agent / set_agent_card / link_agents). \
-         create_post / update_post / archive_post — DEPRECATED, не используй для создания нового.\n\n",
+         Структура компании — ОРГСХЕМА (org_agents). \
+         Для отделений/отделов/агентов используй org-building инструменты \
+         (create_org_division / create_org_department / create_org_agent / set_agent_card / link_agents).\n\n",
     );
 
     // --- ОРГСХЕМА (org_agents) — ОСНОВНАЯ структура компании (ПЕРВЫЙ блок) ---
@@ -192,51 +153,6 @@ pub async fn build_ceo_system_prompt(
                 }
                 sb.push('\n');
             }
-        }
-    }
-
-    // --- LEGACY: departments/posts (read-only, историческое наследие) ---
-    sb.push_str(
-        "## LEGACY — departments/posts (read-only)\n\n\
-         ⛔ Посты (posts) — устаревшая структура. НЕ создавай новых постов, НЕ используй create_post. \
-         Эти посты сохранены для обратной совместимости и продолжают исполнять задачи как fallback. \
-         Для нового — используй ОРГСХЕМУ выше.\n\n",
-    );
-    for d in &depts {
-        sb.push_str(&format!("## {} — {}\n", d.dept_number, d.name));
-        if let Some(desc) = &d.description {
-            sb.push_str(&format!("_{desc}_\n"));
-        }
-        let dept_posts: Vec<&PostRow> =
-            posts.iter().filter(|p| p.department_id == d.id).collect();
-        if dept_posts.is_empty() {
-            sb.push_str("Постов пока нет.\n\n");
-        } else {
-            for p in dept_posts {
-                sb.push_str(&format!(
-                    "- **{}** (slug: `{}`) — ЦКП: {}\n",
-                    p.title, p.slug, p.central_product
-                ));
-                if let Some(m) = &p.main_statistic_metric {
-                    sb.push_str(&format!("  Главная метрика: `{m}`\n"));
-                }
-            }
-            sb.push('\n');
-        }
-    }
-
-    // --- Step 6: HMT-engine — текущие Состояния постов ---
-    let conditions = crate::commands::hmt::list_recent_conditions_inner(&db.0).await?;
-    if !conditions.is_empty() {
-        sb.push_str("\n## Текущие Состояния Постов (HMT-engine)\n\n");
-        for (slug, title, cond_ru, last_value, trend) in &conditions {
-            let val = last_value
-                .map(|v| format!("{v:.1}"))
-                .unwrap_or_else(|| "нет данных".into());
-            let trend_str = trend.as_deref().unwrap_or("—");
-            sb.push_str(&format!(
-                "- `{slug}` ({title}) — Статистика: {val} | Тренд: {trend_str} | Состояние: **{cond_ru}**\n"
-            ));
         }
     }
 
@@ -915,5 +831,32 @@ mod tests {
         assert_eq!(new_shape.len(), 2);
         assert_eq!(new_shape[0].spawned_task_id, None);
         assert_eq!(new_shape[1].spawned_task_id.as_deref(), Some("task-42"));
+    }
+
+    // Виток 1: acceptance 2a — CEO prompt source contains no LEGACY/posts block.
+    // Patterns assembled from parts to avoid self-matching.
+    #[test]
+    fn ceo_prompt_no_legacy_block() {
+        let src = include_str!("chat.rs");
+        let fn_start = src.find("pub async fn build_ceo_system_prompt").unwrap();
+        let fn_body = &src[fn_start..];
+        let fn_end = fn_body.find("\n/// ").or_else(|| fn_body.find("\nconst "))
+            .unwrap_or(fn_body.len());
+        let fn_text = &fn_body[..fn_end];
+        let legacy_marker = concat!("LEGACY", " — departments");
+        assert!(
+            !fn_text.contains(legacy_marker),
+            "CEO prompt must not contain LEGACY departments block"
+        );
+        let hmt_marker = concat!("Состояния ", "Постов");
+        assert!(
+            !fn_text.contains(hmt_marker),
+            "CEO prompt must not contain posts-based HMT block"
+        );
+        let posts_query = concat!("FROM ", "posts");
+        assert!(
+            !fn_text.contains(posts_query),
+            "CEO prompt must not query posts table"
+        );
     }
 }

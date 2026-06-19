@@ -70,6 +70,7 @@ pub async fn resolve_executor(
     }
 
     // 2. posts WHERE slug = ? AND status = 'active' (LEGACY FALLBACK)
+    // posts ретайрятся в витке 1: после retire этот путь всегда возвращает None. Полное удаление posts-runtime + posts.rs CRUD + фронт — виток 2.
     let post_row: Option<(String, String, Option<String>, Option<String>)> =
         sqlx::query_as("SELECT id, slug, system_prompt_md, preferred_model FROM posts WHERE slug = ? AND status = 'active'")
             .bind(slug)

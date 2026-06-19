@@ -293,11 +293,11 @@ pub async fn list_recent_conditions_inner(
     )
     .fetch_all(pool)
     .await
-    .map_err(|e| format!("list posts: {e}"))?;
+    .unwrap_or_default();
 
     let mut out = Vec::with_capacity(posts.len());
     for (id, slug, title) in posts {
-        let values = fetch_recent_values(pool, &id, CLASSIFY_LIMIT).await?;
+        let values = fetch_recent_values(pool, &id, CLASSIFY_LIMIT).await.unwrap_or_default();
         let cond = calculate_post_condition(&values);
         let trend = trend_direction(&values);
         out.push((slug, title, cond.label_ru().to_string(), values.last().copied(), trend));
@@ -485,5 +485,42 @@ mod tests {
             assert_eq!(Condition::from_db_str(c.as_db_str()), Some(c));
         }
         assert_eq!(Condition::from_db_str("garbage"), None);
+    }
+
+    // Виток 1: acceptance 2d — HMT graceful on empty posts
+    #[tokio::test]
+    async fn list_recent_conditions_empty_posts_returns_empty() {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE posts ( \
+                id TEXT PRIMARY KEY, \
+                department_id TEXT NOT NULL, \
+                slug TEXT NOT NULL, \
+                title TEXT NOT NULL, \
+                central_product TEXT NOT NULL, \
+                main_statistic_metric TEXT, \
+                status TEXT NOT NULL DEFAULT 'active', \
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP \
+            ); \
+            CREATE TABLE statistics ( \
+                id TEXT PRIMARY KEY, \
+                post_id TEXT NOT NULL, \
+                value REAL NOT NULL, \
+                recorded_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP \
+            ); \
+            CREATE TABLE condition_logs ( \
+                id TEXT PRIMARY KEY, \
+                post_id TEXT NOT NULL, \
+                condition TEXT NOT NULL, \
+                assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP \
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let result = list_recent_conditions_inner(&pool).await;
+        assert!(result.is_ok(), "must not error on empty posts");
+        assert!(result.unwrap().is_empty(), "must return empty list");
     }
 }
