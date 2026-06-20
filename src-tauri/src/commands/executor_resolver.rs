@@ -24,6 +24,7 @@ pub struct ExecutorSpec {
     pub model: String,
     pub brain_mode: String,
     pub agent_md_name: String,
+    pub agent_folder_path: Option<String>,
 }
 
 /// Резолвит исполнителя по slug: сначала org_agents (primary), потом posts (legacy fallback).
@@ -33,8 +34,8 @@ pub async fn resolve_executor(
     settings: &AppSettings,
 ) -> Result<ExecutorSpec, String> {
     // 1. org_agents WHERE slug = ? AND status = 'active' (PRIMARY)
-    let agent_row: Option<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
-        "SELECT id, slug, role_prompt_md, brain_model, brain_mode \
+    let agent_row: Option<(String, String, Option<String>, Option<String>, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, slug, role_prompt_md, brain_model, brain_mode, folder_path \
          FROM org_agents WHERE slug = ? AND status = 'active'",
     )
     .bind(slug)
@@ -42,7 +43,7 @@ pub async fn resolve_executor(
     .await
     .map_err(|e| format!("org_agents lookup: {e}"))?;
 
-    if let Some((agent_id, agent_slug, role_prompt_opt, brain_model_opt, brain_mode)) = agent_row {
+    if let Some((agent_id, agent_slug, role_prompt_opt, brain_model_opt, brain_mode, folder_path)) = agent_row {
         let system_prompt = role_prompt_opt
             .as_deref()
             .map(str::trim)
@@ -66,6 +67,7 @@ pub async fn resolve_executor(
             model,
             brain_mode,
             agent_md_name: format!("mspro-org-{}", disk_slug),
+            agent_folder_path: folder_path,
         });
     }
 
@@ -107,6 +109,7 @@ pub async fn resolve_executor(
             model,
             brain_mode: "claude_cli".to_string(),
             agent_md_name: format!("mspro-{}", safe_slug),
+            agent_folder_path: None,
         });
     }
 
@@ -133,8 +136,8 @@ pub async fn resolve_org_agent_by_id(
     agent_id: &str,
     settings: &AppSettings,
 ) -> Result<ExecutorSpec, String> {
-    let row: Option<(String, String, Option<String>, Option<String>, String, String)> = sqlx::query_as(
-        "SELECT id, slug, role_prompt_md, brain_model, brain_mode, status \
+    let row: Option<(String, String, Option<String>, Option<String>, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, slug, role_prompt_md, brain_model, brain_mode, status, folder_path \
          FROM org_agents WHERE id = ?",
     )
     .bind(agent_id)
@@ -142,7 +145,7 @@ pub async fn resolve_org_agent_by_id(
     .await
     .map_err(|e| format!("org_agent lookup: {e}"))?;
 
-    let (db_id, agent_slug, role_prompt_opt, brain_model_opt, brain_mode, status) =
+    let (db_id, agent_slug, role_prompt_opt, brain_model_opt, brain_mode, status, folder_path) =
         row.ok_or_else(|| format!("агент не найден: {agent_id}"))?;
 
     if status != "active" {
@@ -174,6 +177,7 @@ pub async fn resolve_org_agent_by_id(
         model,
         brain_mode,
         agent_md_name: format!("mspro-org-{}", disk_slug),
+        agent_folder_path: folder_path,
     })
 }
 

@@ -250,7 +250,7 @@ pub fn safe_org_path(root: &Path, components: &[&str]) -> Result<PathBuf, String
 // SHA-256
 // =========================================================================
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     format!("{:x}", Sha256::digest(data))
 }
 
@@ -273,7 +273,7 @@ async fn get_stored_hash(pool: &SqlitePool, etype: &str, eid: &str, file: &str) 
     .map(|r| r.0)
 }
 
-async fn set_stored_hash(pool: &SqlitePool, etype: &str, eid: &str, file: &str, hash: &str) {
+pub(crate) async fn set_stored_hash(pool: &SqlitePool, etype: &str, eid: &str, file: &str, hash: &str) {
     let _ = sqlx::query(
         "INSERT INTO org_disk_sync (entity_type, entity_id, file_rel, content_hash, written_at) \
          VALUES (?, ?, ?, ?, datetime('now')) \
@@ -652,15 +652,58 @@ async fn sync_agent(pool: &SqlitePool, root: &Path, agent_id: &str, force: bool)
         )
         .await;
     } else {
-        remove_if_null(
-            pool,
-            &dir.join("memory").join("context.md"),
-            "agent",
-            agent_id,
-            "memory/context.md",
-            force,
-        )
-        .await;
+        let mem_file = dir.join("memory").join("context.md");
+        let mut adopted = false;
+        if mem_file.exists() && !force {
+            let no_hash = get_stored_hash(pool, "agent", agent_id, "memory/context.md")
+                .await
+                .is_none();
+            if no_hash {
+                if let Ok(disk_content) = std::fs::read_to_string(&mem_file) {
+                    if !disk_content.trim().is_empty() {
+                        match sqlx::query(
+                            "UPDATE org_agents SET memory_md = ? WHERE id = ?",
+                        )
+                        .bind(&disk_content)
+                        .bind(agent_id)
+                        .execute(pool)
+                        .await
+                        {
+                            Ok(_) => {
+                                let disk_hash = sha256_hex(disk_content.as_bytes());
+                                set_stored_hash(
+                                    pool, "agent", agent_id, "memory/context.md", &disk_hash,
+                                )
+                                .await;
+                                log::info!(
+                                    "org_tree: adopted memory/context.md from disk for agent {agent_id}"
+                                );
+                            }
+                            Err(e) => {
+                                // DB update failed: do NOT set hash (so next sync re-adopts,
+                                // not deletes). File is kept regardless.
+                                log::warn!(
+                                    "org_tree: adopt memory/context.md DB update failed for agent {agent_id}: {e} — hash NOT set, file kept, will retry next sync"
+                                );
+                            }
+                        }
+                        // Keep the hand-created file regardless of DB outcome — never delete on adopt.
+                        adopted = true;
+                    }
+                }
+            }
+        }
+        if !adopted {
+            remove_if_null(
+                pool,
+                &mem_file,
+                "agent",
+                agent_id,
+                "memory/context.md",
+                force,
+            )
+            .await;
+        }
     }
 
     // checklist.json ← checklist_json
@@ -1425,6 +1468,72 @@ mod tests {
             std::fs::read_to_string(&claude_md).unwrap(),
             "# SEO agent",
             "повторный rebuild не меняет содержимое файла"
+        );
+    }
+
+    // ── Regression: Fix (b) — sync_agent adopts memory/context.md from disk ──
+
+    #[tokio::test]
+    async fn sync_agent_adopts_memory_from_disk() {
+        let pool = setup_db().await;
+        let root = tempdir().unwrap();
+
+        sqlx::raw_sql(
+            "INSERT INTO org_divisions (id, name, slug) VALUES ('d1', 'Div', 'd'); \
+             INSERT INTO org_departments (id, division_id, name, slug) VALUES ('p1', 'd1', 'Dept', 'p'); \
+             INSERT INTO org_agents (id, department_id, name, slug, role_prompt_md, memory_md) \
+                VALUES ('a1', 'p1', 'Agent', 'agent', '# Agent', NULL);",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // First sync to create the folder structure
+        sync_agent(&pool, root.path(), "a1", false).await;
+        let agent_dir = root.path().join("d").join("p").join("agent");
+        assert!(agent_dir.exists(), "agent dir must be created");
+
+        // Board manually creates memory/context.md on disk
+        let mem_dir = agent_dir.join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let manual_content = "## Board Notes\nВажный контекст от руководства.\n";
+        std::fs::write(mem_dir.join("context.md"), manual_content).unwrap();
+
+        // Verify: no stored hash for memory/context.md
+        let hash = get_stored_hash(&pool, "agent", "a1", "memory/context.md").await;
+        assert!(hash.is_none(), "no stored hash before adopt");
+
+        // Re-sync — memory_md is still NULL, but disk has content → ADOPT
+        sync_agent(&pool, root.path(), "a1", false).await;
+
+        // File must NOT be deleted
+        let mem_file = mem_dir.join("context.md");
+        assert!(mem_file.exists(), "memory/context.md must NOT be deleted");
+        assert_eq!(
+            std::fs::read_to_string(&mem_file).unwrap(),
+            manual_content,
+            "disk content must be preserved"
+        );
+
+        // DB must be updated with disk content
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT memory_md FROM org_agents WHERE id = 'a1'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some(manual_content),
+            "memory_md must be adopted from disk"
+        );
+
+        // stored hash must be set
+        let hash = get_stored_hash(&pool, "agent", "a1", "memory/context.md").await;
+        assert!(hash.is_some(), "stored hash must be set after adopt");
+        assert_eq!(
+            hash.unwrap(),
+            sha256_hex(manual_content.as_bytes()),
+            "stored hash must match adopted content"
         );
     }
 }

@@ -39,6 +39,8 @@ use crate::outbox;
 use crate::settings::{AppSettings, SettingsStore};
 use crate::vault::VaultState;
 
+static PERSIST_MEMORY_LOCK: AsyncMutex<()> = AsyncMutex::const_new(());
+
 /// Registry активных пост-агентов: task_id → PID.
 /// Защищает от двойного spawn-а и позволяет ручной cancel.
 #[derive(Default, Clone)]
@@ -273,6 +275,136 @@ pub async fn run_org_agent_now(
 // Shared executor
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Agent memory: disk-based experience loop (Phase 1)
+// ---------------------------------------------------------------------------
+
+const MEMORY_INJECT_LIMIT_CHARS: usize = 8000;
+
+fn load_agent_memory(folder_path: &str) -> Option<String> {
+    let path = Path::new(folder_path).join("memory").join("context.md");
+    match std::fs::read_to_string(&path) {
+        Ok(content) if !content.trim().is_empty() => {
+            let content = content.trim().to_string();
+            if content.chars().count() > MEMORY_INJECT_LIMIT_CHARS {
+                let truncated: String = content.chars().take(MEMORY_INJECT_LIMIT_CHARS).collect();
+                Some(format!("{truncated}\n…[память обрезана]"))
+            } else {
+                Some(content)
+            }
+        }
+        _ => None,
+    }
+}
+
+fn inject_memory_into_prompt(system_prompt: &str, memory: Option<&str>) -> String {
+    match memory {
+        Some(mem) => format!(
+            "{system_prompt}\n\n## Твоя накопленная память (опыт прошлых задач):\n{mem}"
+        ),
+        None => system_prompt.to_string(),
+    }
+}
+
+async fn persist_agent_memory(
+    db: &WritePool,
+    agent_slug: &str,
+    task_id: &str,
+    refined_prompt: Option<&str>,
+    artifacts_count: usize,
+) {
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT id, folder_path FROM org_agents WHERE slug = ?",
+    )
+    .bind(agent_slug)
+    .fetch_optional(&db.0)
+    .await
+    .unwrap_or(None);
+
+    let Some((agent_id, Some(folder_path))) = row else {
+        log::debug!("persist_memory: agent '{agent_slug}' not found or no folder_path — skip");
+        return;
+    };
+    if folder_path.trim().is_empty() {
+        return;
+    }
+
+    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let summary = refined_prompt
+        .map(|p| {
+            let first_line = p.lines().next().unwrap_or(p);
+            let chars: Vec<char> = first_line.chars().collect();
+            if chars.len() > 80 {
+                format!("{}…", chars[..77].iter().collect::<String>())
+            } else {
+                first_line.to_string()
+            }
+        })
+        .unwrap_or_else(|| format!("task {task_id}"));
+
+    let prompt_hash = crate::org_tree::sha256_hex(
+        refined_prompt.unwrap_or("").as_bytes(),
+    );
+    let short_hash = &prompt_hash[..8];
+    let heading = format!("## {today} — {summary}");
+    let lesson = format!(
+        "\n{heading}\nЗадача одобрена контролёром. Артефактов: {artifacts_count}. [{short_hash}]\n",
+    );
+
+    let file_path = Path::new(&folder_path).join("memory").join("context.md");
+
+    let _guard = PERSIST_MEMORY_LOCK.lock().await;
+
+    let existing = std::fs::read_to_string(&file_path).unwrap_or_default();
+
+    if existing.contains(lesson.trim()) {
+        log::info!("persist_memory: dedup — lesson already present for agent '{agent_slug}'");
+        return;
+    }
+
+    let new_content = if existing.trim().is_empty() {
+        lesson.trim_start().to_string()
+    } else {
+        format!("{}{lesson}", existing.trim_end())
+    };
+
+    if let Some(parent) = file_path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            log::warn!("persist_memory: mkdir {}: {e}", parent.display());
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(&file_path, &new_content) {
+        log::warn!("persist_memory: write {}: {e}", file_path.display());
+        return;
+    }
+
+    match sqlx::query("UPDATE org_agents SET memory_md = ? WHERE id = ?")
+        .bind(&new_content)
+        .bind(&agent_id)
+        .execute(&db.0)
+        .await
+    {
+        Ok(_) => {
+            let new_hash = crate::org_tree::sha256_hex(new_content.as_bytes());
+            crate::org_tree::set_stored_hash(
+                &db.0, "agent", &agent_id, "memory/context.md", &new_hash,
+            )
+            .await;
+            log::info!(
+                "persist_memory: appended lesson for agent '{agent_slug}' ({})",
+                file_path.display()
+            );
+        }
+        Err(e) => {
+            log::warn!(
+                "persist_memory: DB update failed for agent '{agent_slug}': {e} — \
+                 hash NOT updated to preserve disk content (disk append kept)"
+            );
+        }
+    }
+}
+
 /// Главная функция исполнения: создаёт agent.md, sandbox, spawn CLI, артефакты.
 /// Используется и для постов (через trigger_post_executor), и для org_agents
 /// (через run_org_agent_now).
@@ -301,8 +433,15 @@ async fn run_executor(
         return Err(reason);
     }
 
+    // 0. Inject agent memory from disk (Phase 1: experience loop).
+    let memory = spec
+        .agent_folder_path
+        .as_deref()
+        .and_then(load_agent_memory);
+    let final_system_prompt = inject_memory_into_prompt(&spec.system_prompt, memory.as_deref());
+
     // 1. Гарантируем agent.md (~/.claude/agents/{agent_md_name}.md).
-    let _agent_md_path = ensure_agent_md(&spec.agent_md_name, &spec.system_prompt, &spec.model)?;
+    let _agent_md_path = ensure_agent_md(&spec.agent_md_name, &final_system_prompt, &spec.model)?;
 
     // 2. Sandbox: <Outbox>/<task_id>/ (mkdir идемпотентно).
     let task_dir = outbox::task_outbox_dir(&vault.root, task_id)
@@ -326,7 +465,7 @@ async fn run_executor(
             task_id,
             &spec.slug,
             refined_prompt,
-            &spec.system_prompt,
+            &final_system_prompt,
             &spec.agent_md_name,
             &spec.model,
             &task_dir,
@@ -1003,6 +1142,16 @@ async fn try_trigger_rework(
                 "rework trigger: PASS — approved {} artifacts for task {executor_task_id}",
                 arts.len()
             );
+
+            persist_agent_memory(
+                db,
+                &executor_slug,
+                &executor_task_id,
+                orig_prompt_opt.as_deref(),
+                arts.len(),
+            )
+            .await;
+
             let _ = app.emit(
                 "rework-verdict",
                 serde_json::json!({
@@ -1719,6 +1868,7 @@ mod tests {
             model: "opus".to_string(),
             brain_mode: "claude_cli".to_string(),
             agent_md_name: "mspro-frontend".to_string(),
+            agent_folder_path: None,
         };
         let result = PostExecResult {
             task_id: "t1".to_string(),
@@ -1853,5 +2003,322 @@ mod tests {
         let truncated = super::truncate_str(s, 8);
         assert!(truncated.len() <= 8);
         assert!(truncated.is_char_boundary(truncated.len()));
+    }
+
+    // ── Phase 1: Agent Memory tests ──────────────────────────
+
+    async fn setup_memory_db() -> WritePool {
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE org_agents (
+                id TEXT PRIMARY KEY,
+                department_id TEXT NOT NULL DEFAULT 'd1',
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL,
+                role_label TEXT NOT NULL DEFAULT 'member',
+                status TEXT NOT NULL DEFAULT 'active',
+                folder_path TEXT,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT DEFAULT NULL,
+                role_prompt_md TEXT DEFAULT NULL,
+                brain_mode TEXT NOT NULL DEFAULT 'disabled',
+                brain_model TEXT DEFAULT NULL,
+                brain_endpoint TEXT DEFAULT NULL,
+                mcp_servers_json TEXT NOT NULL DEFAULT '[]',
+                ckp_text TEXT DEFAULT NULL,
+                checklist_json TEXT NOT NULL DEFAULT '[]',
+                memory_md TEXT DEFAULT NULL
+            );
+            CREATE TABLE org_disk_sync (
+                entity_type TEXT NOT NULL, entity_id TEXT NOT NULL,
+                file_rel TEXT NOT NULL, content_hash TEXT NOT NULL,
+                written_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (entity_type, entity_id, file_rel)
+            );",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        WritePool(pool)
+    }
+
+    #[test]
+    fn memory_inject_present_in_prompt() {
+        let mem = Some("## 2026-06-01 — test\nLesson one.\n");
+        let prompt = super::inject_memory_into_prompt("You are an agent", mem);
+        assert!(prompt.starts_with("You are an agent"));
+        assert!(prompt.contains("## Твоя накопленная память"));
+        assert!(prompt.contains("Lesson one"));
+    }
+
+    #[test]
+    fn memory_inject_none_unchanged() {
+        let prompt = super::inject_memory_into_prompt("You are an agent", None);
+        assert_eq!(prompt, "You are an agent");
+        assert!(!prompt.contains("память"));
+    }
+
+    #[test]
+    fn memory_load_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_dir = dir.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(
+            mem_dir.join("context.md"),
+            "## 2026-06-01 — test\nLesson one.\n",
+        )
+        .unwrap();
+
+        let mem = super::load_agent_memory(&dir.path().to_string_lossy());
+        assert!(mem.is_some(), "memory should be loaded");
+        assert!(mem.unwrap().contains("Lesson one"));
+    }
+
+    #[test]
+    fn memory_load_oversize_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_dir = dir.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        let big = "я".repeat(9000);
+        std::fs::write(mem_dir.join("context.md"), &big).unwrap();
+
+        let mem = super::load_agent_memory(&dir.path().to_string_lossy());
+        assert!(mem.is_some());
+        let mem = mem.unwrap();
+        assert!(mem.chars().count() < 9000, "should be truncated");
+        assert!(mem.ends_with("…[память обрезана]"));
+    }
+
+    #[test]
+    fn memory_load_missing_graceful() {
+        let mem = super::load_agent_memory("/nonexistent/path/xyz");
+        assert!(mem.is_none());
+    }
+
+    #[test]
+    fn memory_load_empty_file_graceful() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem_dir = dir.path().join("memory");
+        std::fs::create_dir_all(&mem_dir).unwrap();
+        std::fs::write(mem_dir.join("context.md"), "  \n  \n").unwrap();
+
+        let mem = super::load_agent_memory(&dir.path().to_string_lossy());
+        assert!(mem.is_none(), "whitespace-only should be None");
+    }
+
+    #[tokio::test]
+    async fn persist_memory_writes_disk_and_db_mirror() {
+        let db = setup_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().to_string_lossy().to_string();
+
+        sqlx::query(
+            "INSERT INTO org_agents (id, department_id, name, slug, folder_path) \
+             VALUES ('a1', 'd1', 'Bot', 'bot', ?)",
+        )
+        .bind(&fp)
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        super::persist_agent_memory(&db, "bot", "task-1", Some("Создать отчёт"), 2).await;
+
+        let file = dir.path().join("memory").join("context.md");
+        assert!(file.exists(), "memory file must be created on disk");
+        let content = std::fs::read_to_string(&file).unwrap();
+        assert!(content.contains("Создать отчёт"), "lesson summary in file");
+        assert!(content.contains("Артефактов: 2"), "artifact count in file");
+
+        let row: (Option<String>,) =
+            sqlx::query_as("SELECT memory_md FROM org_agents WHERE id = 'a1'")
+                .fetch_one(&db.0)
+                .await
+                .unwrap();
+        assert_eq!(
+            row.0.as_deref(),
+            Some(content.as_str()),
+            "DB must mirror disk"
+        );
+
+        let hash_row: Option<(String,)> = sqlx::query_as(
+            "SELECT content_hash FROM org_disk_sync \
+             WHERE entity_type = 'agent' AND entity_id = 'a1' \
+             AND file_rel = 'memory/context.md'",
+        )
+        .fetch_optional(&db.0)
+        .await
+        .unwrap();
+        assert!(hash_row.is_some(), "org_disk_sync hash must be set");
+    }
+
+    #[tokio::test]
+    async fn persist_memory_dedup_same_lesson() {
+        let db = setup_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().to_string_lossy().to_string();
+
+        sqlx::query(
+            "INSERT INTO org_agents (id, department_id, name, slug, folder_path) \
+             VALUES ('a1', 'd1', 'Bot', 'bot', ?)",
+        )
+        .bind(&fp)
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        super::persist_agent_memory(&db, "bot", "task-1", Some("Same task"), 1).await;
+        let c1 = std::fs::read_to_string(dir.path().join("memory/context.md")).unwrap();
+
+        super::persist_agent_memory(&db, "bot", "task-1-dup", Some("Same task"), 1).await;
+        let c2 = std::fs::read_to_string(dir.path().join("memory/context.md")).unwrap();
+
+        assert_eq!(c1, c2, "identical lesson (same prompt + same artifacts) must NOT be appended");
+    }
+
+    #[tokio::test]
+    async fn persist_memory_no_folder_path_graceful() {
+        let db = setup_memory_db().await;
+        sqlx::query(
+            "INSERT INTO org_agents (id, department_id, name, slug) \
+             VALUES ('a1', 'd1', 'Bot', 'bot')",
+        )
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        super::persist_agent_memory(&db, "bot", "task-1", Some("test"), 1).await;
+        // Should not panic — graceful skip
+    }
+
+    #[tokio::test]
+    async fn persist_memory_post_slug_graceful() {
+        let db = setup_memory_db().await;
+        // No org_agent with slug 'post-slug' → query returns None → graceful skip
+        super::persist_agent_memory(&db, "post-slug", "task-1", Some("test"), 1).await;
+    }
+
+    // ── Regression: Fix (a) — concurrent persist must not lose updates ───
+
+    #[tokio::test]
+    async fn persist_memory_concurrent_no_lost_update() {
+        let db = setup_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().to_string_lossy().to_string();
+
+        sqlx::query(
+            "INSERT INTO org_agents (id, department_id, name, slug, folder_path) \
+             VALUES ('a1', 'd1', 'Bot', 'bot', ?)",
+        )
+        .bind(&fp)
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        let db1 = db.clone();
+        let db2 = db.clone();
+        let (r1, r2) = tokio::join!(
+            super::persist_agent_memory(&db1, "bot", "task-a", Some("Первый урок"), 1),
+            super::persist_agent_memory(&db2, "bot", "task-b", Some("Второй урок"), 2),
+        );
+        let _ = (r1, r2);
+
+        let content =
+            std::fs::read_to_string(dir.path().join("memory/context.md")).unwrap();
+        assert!(
+            content.contains("Первый урок"),
+            "first lesson must be present after concurrent persist"
+        );
+        assert!(
+            content.contains("Второй урок"),
+            "second lesson must be present after concurrent persist"
+        );
+    }
+
+    // ── Regression: Fix (c) — DB failure must not update stored hash ────
+
+    #[tokio::test]
+    async fn persist_memory_db_fail_no_hash_update() {
+        let db = setup_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().to_string_lossy().to_string();
+
+        sqlx::query(
+            "INSERT INTO org_agents (id, department_id, name, slug, folder_path) \
+             VALUES ('a1', 'd1', 'Bot', 'bot', ?)",
+        )
+        .bind(&fp)
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        super::persist_agent_memory(&db, "bot", "task-1", Some("First lesson"), 1).await;
+
+        let hash_before: Option<(String,)> = sqlx::query_as(
+            "SELECT content_hash FROM org_disk_sync \
+             WHERE entity_type = 'agent' AND entity_id = 'a1' \
+             AND file_rel = 'memory/context.md'",
+        )
+        .fetch_optional(&db.0)
+        .await
+        .unwrap();
+        assert!(hash_before.is_some(), "hash must be set after successful persist");
+
+        let hash_val = hash_before.unwrap().0;
+        let db_mem: (Option<String>,) =
+            sqlx::query_as("SELECT memory_md FROM org_agents WHERE id = 'a1'")
+                .fetch_one(&db.0)
+                .await
+                .unwrap();
+        let disk_content =
+            std::fs::read_to_string(dir.path().join("memory/context.md")).unwrap();
+        assert_eq!(
+            db_mem.0.as_deref(),
+            Some(disk_content.as_str()),
+            "DB and disk must be in sync after successful persist"
+        );
+        assert_eq!(
+            crate::org_tree::sha256_hex(disk_content.as_bytes()),
+            hash_val,
+            "stored hash must match disk content"
+        );
+    }
+
+    // ── Regression: Fix (d) — dedup by full lesson, not heading ─────────
+
+    #[tokio::test]
+    async fn persist_memory_dedup_different_tasks_same_day() {
+        let db = setup_memory_db().await;
+        let dir = tempfile::tempdir().unwrap();
+        let fp = dir.path().to_string_lossy().to_string();
+
+        sqlx::query(
+            "INSERT INTO org_agents (id, department_id, name, slug, folder_path) \
+             VALUES ('a1', 'd1', 'Bot', 'bot', ?)",
+        )
+        .bind(&fp)
+        .execute(&db.0)
+        .await
+        .unwrap();
+
+        super::persist_agent_memory(
+            &db, "bot", "task-1",
+            Some("Создать отчёт\nДетали: по продажам"), 2,
+        )
+        .await;
+
+        super::persist_agent_memory(
+            &db, "bot", "task-2",
+            Some("Создать отчёт\nДетали: по расходам"), 2,
+        )
+        .await;
+
+        let content =
+            std::fs::read_to_string(dir.path().join("memory/context.md")).unwrap();
+        let count = content.matches("Создать отчёт").count();
+        assert!(
+            count >= 2,
+            "two different tasks with same first line must both be saved, got {count} matches"
+        );
     }
 }
